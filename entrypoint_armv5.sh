@@ -1,5 +1,8 @@
 #!/usr/bin/sh
+
 set -eu
+
+mkdir -p /etc/xray
 
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
@@ -54,7 +57,9 @@ cat > /etc/xray/config.json << EOF
       {
         "address": "https://dns.quad9.net/dns-query",
         "domains": [
-          "geosite:tmdb"
+          "themoviedb.org",
+          "tmdb.org",
+          "full:tmdb-image-prod.b-cdn.net"
         ],
         "skipFallback": true
       },
@@ -70,7 +75,7 @@ cat > /etc/xray/config.json << EOF
   "fakedns": {
     "ipPool": "${FAKE_IP_RANGE}",
     "poolSize": 130000
-  }
+  },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
@@ -79,10 +84,14 @@ cat > /etc/xray/config.json << EOF
         "outboundTag": "direct"
       },
       {
+        "inboundTag": ["dns-inbound"],
+        "outboundTag": "direct"
+      },
+      {
         "inboundTag": ["dns-in"],
         "outboundTag": "fakeip"
       }
-    ],  
+    ]
   },
   "inbounds": [
     {
@@ -283,12 +292,12 @@ run() {
     echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
   fi
   config_file_xray
-  echo "Starting xray $(./xray -v)"
+  echo "Starting xray $(./xray --version)"
   if lsmod | grep -q '^nft_tproxy'; then
-    exec ./xray
+    exec ./xray -config /etc/xray/config.json
   else
     ./hs5t ./hs5t.yml &   
-    exec su xray -s /bin/sh -c './xray'
+    exec su xray -s /bin/sh -c "./xray -config /etc/xray/config.json"
   fi
 }
 

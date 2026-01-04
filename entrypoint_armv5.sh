@@ -1,11 +1,41 @@
 #!/usr/bin/sh
 
 set -eu
+IPTABLES="${IPTABLES:-false}"
+
+if [ "$IPTABLES" = "false" ] && lsmod | grep -q '^nft_tproxy'; then
+  USE_NFT=true
+else
+  USE_NFT=false
+fi
+
+if [ "$USE_NFT" = "false" ]; then
+  if ! apk info -e iptables iptables-legacy >/dev/null; then
+    echo "Install iptables"
+    apk add --no-cache iptables iptables-legacy >/dev/null 2>&1
+    rm -f /usr/sbin/iptables /usr/sbin/iptables-save /usr/sbin/iptables-restore
+    ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables
+    ln -s /usr/sbin/iptables-legacy-save /usr/sbin/iptables-save
+    ln -s /usr/sbin/iptables-legacy-restore /usr/sbin/iptables-restore
+  fi
+else
+  if ! apk info -e nftables >/dev/null; then
+    echo "Install nftables"
+    apk add --no-cache nftables >/dev/null 2>&1
+  fi
+  if apk info -e iptables iptables-legacy >/dev/null; then
+    echo "Delete iptables"
+    apk del iptables iptables-legacy >/dev/null 2>&1
+  fi
+fi
 
 mkdir -p /etc/xray
 
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
+
+CIDR_MASK="${FAKE_IP_RANGE##*/}"
+FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
@@ -13,6 +43,7 @@ first_iface() {
   ip -o link show | awk -F': ' '/link\/ether/ {print $2}' | cut -d'@' -f1 | head -n1
 }
 iface=$(first_iface)
+iface_cidr=$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}')
 iface_ip=$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}' | cut -d/ -f1)
 gateway=$(ip route show default dev "$iface" | awk '{print $3; exit}')
 
@@ -20,10 +51,7 @@ config_file_xray() {
 cat > /etc/xray/config.json << EOF
 {
   "log": {
-    "access": "none",
-    "error": "none",
-    "loglevel": "${LOG_LEVEL}",
-    "dnsLog": false
+    "loglevel": "${LOG_LEVEL}"
   },
   "dns": {
     "tag": "dns-inbound",
@@ -43,6 +71,10 @@ cat > /etc/xray/config.json << EOF
     },
     "servers": [
       {
+        "tag": "fakeip",
+        "address": "fakedns"
+      },
+      {
         "tag": "ParallelQuery",
         "address": "https://dns.google/dns-query"
       },
@@ -53,20 +85,6 @@ cat > /etc/xray/config.json << EOF
       {
         "tag": "ParallelQuery",
         "address": "https://dns.quad9.net/dns-query"
-      },
-      {
-        "address": "https://dns.quad9.net/dns-query",
-        "domains": [
-          "themoviedb.org",
-          "tmdb.org",
-          "full:tmdb-image-prod.b-cdn.net"
-        ],
-        "skipFallback": true
-      },
-      {
-        "tag": "fakeip",
-        "address": "fakedns",
-        "skipFallback": true
       }
     ],
     "queryStrategy": "UseIPv4",
@@ -74,7 +92,7 @@ cat > /etc/xray/config.json << EOF
   },
   "fakedns": {
     "ipPool": "${FAKE_IP_RANGE}",
-    "poolSize": 130000
+    "poolSize": ${FAKE_POOL_SIZE}
   },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
@@ -84,46 +102,62 @@ cat > /etc/xray/config.json << EOF
         "outboundTag": "direct"
       },
       {
-        "inboundTag": ["dns-inbound"],
-        "outboundTag": "direct"
+        "inboundTag": ["dns-in"],
+        "outboundTag": "dns"
       },
       {
-        "inboundTag": ["dns-in"],
-        "outboundTag": "fakeip"
+        "inboundTag": ["all-in"],
+        "ip": ["${FAKE_IP_RANGE}"],
+        "network": "tcp",
+        "outboundTag": "block-http"
+      },
+      {
+        "inboundTag": ["all-in"],
+        "ip": ["${FAKE_IP_RANGE}"],
+        "network": "udp",
+        "outboundTag": "block"
+      },
+      {
+        "inboundTag": ["mixed-in"],
+        "ip": ["${FAKE_IP_RANGE}"],
+        "network": "tcp",
+        "outboundTag": "block-http"
+      },
+      {
+        "inboundTag": ["mixed-in"],
+        "ip": ["${FAKE_IP_RANGE}"],
+        "network": "udp",
+        "outboundTag": "block"
       }
     ]
   },
   "inbounds": [
     {
+        "tag": "dns-in",
         "port": 53,
         "protocol": "dokodemo-door",
         "settings": {
-            "address": "127.0.0.1",
-            "port": 53,
             "network": "tcp,udp"
-        },
-        "tag": "dns-in"
+        }
     },
     {
-        "listen": "0.0.0.0", 
+        "tag": "mixed-in",
         "port": 1080, 
-        "protocol": "socks",
+        "protocol": "mixed",
         "settings": {
             "udp": true
         },
         "sniffing": {
             "enabled": true,
             "destOverride": [
-                "http",
-                "tls",
-                "quic",
                 "fakedns"
             ],
+            "metadataOnly": true,
             "routeOnly": true
         }
     },
 EOF
-if lsmod | grep -q '^nft_tproxy'; then
+if [ "$USE_NFT" = "true" ]; then
 cat >> /etc/xray/config.json << EOF
     {
       "tag": "all-in",
@@ -133,20 +167,19 @@ cat >> /etc/xray/config.json << EOF
         "network": "tcp,udp",
         "followRedirect": true
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-        ]
-      },
       "streamSettings": {
         "sockopt": {
           "tproxy": "tproxy"
         }
-      }
+      },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": [
+                "fakedns"
+            ],
+            "metadataOnly": true,
+            "routeOnly": true
+        }
     }
   ],
 EOF
@@ -160,19 +193,18 @@ cat >> /etc/xray/config.json << EOF
         "network": "tcp",
         "followRedirect": true
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-        ]
-      },
       "streamSettings": {
         "sockopt": {
           "tproxy": "redirect"
         }
+      },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": [
+                "fakedns"
+            ],
+            "metadataOnly": true,
+            "routeOnly": true
       }
     }
   ],
@@ -185,12 +217,33 @@ EOF
 
 cat >> /etc/xray/config.json << EOF
       {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4"
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "UseIPv4"
+        }
+      },
+      {
+        "tag": "block-http",
+        "protocol": "blackhole",
+        "settings": {
+          "response": {
+            "type": "http"
+          }
+        }
+      },  
+      {
+        "tag": "block",
+        "protocol": "blackhole"
+      },     
+      {
+        "tag": "dns",
+        "protocol": "dns",
+        "settings": {
+          "nonIPQuery": "reject",
+          "blockTypes": [65,28]
+        }   
       }
-    }
   ]
 }
 EOF
@@ -204,8 +257,8 @@ nft_rules() {
 table inet xray {
     chain prerouting {
         type filter hook prerouting priority filter; policy accept;
-        ip daddr ${FAKE_IP_RANGE} meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
-        ip daddr { $iface_ip, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 192.0.0.0/24, 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 192.88.99.0/24, 198.18.0.0/15, 224.0.0.0/3 } return
+        ip daddr $FAKE_IP_RANGE meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
+        ip daddr { $iface_cidr, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
         meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
     }
     chain divert {
@@ -226,10 +279,12 @@ iptables_rules() {
   iptables -t nat -X
   iptables -t mangle -F
   iptables -t mangle -X
-#  iptables -t nat -i $iface -p tcp -m tcp --dport 53 -j RETURN
-#  iptables -t nat -i $iface -p tcp -m tcp --dport 1080 -j RETURN
-  iptables -t nat -m addrtype --dst-type LOCAL -j RETURN
-  iptables -t nat -i $iface -p tcp -j REDIRECT --to-ports 12345
+  iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j RETURN
+  iptables -t nat -A PREROUTING -m addrtype ! --dst-type UNICAST -j RETURN
+  iptables -t nat -A PREROUTING -i $iface -p tcp -j REDIRECT --to-ports 12345
+  iptables -t mangle -A PREROUTING -m addrtype --dst-type LOCAL -j ACCEPT
+  iptables -t mangle -A PREROUTING -m addrtype ! --dst-type UNICAST -j ACCEPT
+  iptables -t mangle -A PREROUTING -i "$iface" -p udp -j MARK --set-mark 110
 }
 
 config_file() {
@@ -252,52 +307,31 @@ EOF
 hs5t_file() {
   cat > /hs5t.sh << EOF
 #!/usr/bin/sh
-ip rule show | grep -q 'uidrange 1000-1000 lookup main' || ip rule add from all uidrange 1000-1000 lookup main
-ip rule show | grep -q 'ipproto udp lookup 110' || ip rule add ipproto udp table 110 pref 50000
-ip route replace default via 100.64.0.1 dev hs5t table 110 metric 1
-ip route replace ${FAKE_IP_RANGE} via 100.64.0.1 dev hs5t metric 10 table 110
-ip route replace 0.0.0.0/8 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 127.0.0.0/8 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 224.0.0.0/4 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 10.0.0.0/8 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 172.16.0.0/12 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 192.168.0.0/16 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 100.64.0.0/10 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 169.254.0.0/16 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 192.0.0.0/24 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 192.0.2.0/24 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 198.51.100.0/24 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 203.0.113.0/24 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 192.88.99.0/24 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 198.18.0.0/15 via "$gateway" dev "$iface" metric 20 table 110
-ip route replace 224.0.0.0/3 via "$gateway" dev "$iface" metric 20 table 110
-
+ip rule show | grep -q 'fwmark 0x6e ipproto udp lookup 110' || ip rule add fwmark 110 ipproto udp table 110
+ip route replace default via 100.64.0.1 dev hs5t table 110
 EOF
 chmod +x /hs5t.sh
 }
 
 # ------------------- RUN -------------------
 run() {
-  if lsmod | grep -q '^nft_tproxy'; then
+  if [ "$USE_NFT" = "true" ]; then
     nft_rules
   else
-    if ! id -u xray >/dev/null 2>&1; then
-      adduser -u 1000 -D -H xray
-    fi
-    iptables_rules
     config_file
     hs5t_file
+    iptables_rules
   fi
-  if ! lsmod | grep -q '^nft_tproxy'; then
+  if [ "$USE_NFT" = "false" ]; then
     echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
   fi
   config_file_xray
   echo "Starting xray $(./xray --version)"
-  if lsmod | grep -q '^nft_tproxy'; then
+  if [ "$USE_NFT" = "true" ]; then
     exec ./xray -config /etc/xray/config.json
   else
-    ./hs5t ./hs5t.yml &   
-    exec su xray -s /bin/sh -c "./xray -config /etc/xray/config.json"
+    ./hs5t ./hs5t.yml &
+    exec ./xray -config /etc/xray/config.json
   fi
 }
 

@@ -1,3 +1,5 @@
+[English](/README.md) | [Русский](/README_RU.md)
+
 # 🇷🇺 Описание на русском
 
 **xray-proxy-ros** — это Docker-контейнер на базе [**Xray**](https://github.com/XTLS/Xray-core) для Mikrotik RouterOS.

@@ -69,7 +69,7 @@ Advantages:
 
 > You can view examples of client outbounds in the [examples](https://github.com/XTLS/Xray-examples). Or create your own outbound according to the Xray [documentation](https://xtls.github.io/ru/config/).
 
-## Installation example on RouterOS 7.21 Mikrotik
+## Installation example on RouterOS Mikrotik
 
 First, make sure that the `container` package is installed and that the required device-mode features are allowed.
 ```bash
@@ -81,7 +81,7 @@ Follow the instructions after running the command below: you are given 5 minutes
 /system/device-mode/update mode=advanced container=yes
 ```
 
-Installation without routing.
+Installation without routing, using the syntax for RouterOS version 7.21; when installing on another version, the syntax of some commands may differ.
 
 ```bash
 /interface/veth/add name=XrayProxyRoS address=192.168.255.14/30 gateway=192.168.255.13

@@ -1,6 +1,18 @@
 #!/bin/sh
 set -eu
 IPTABLES="${IPTABLES:-false}"
+FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
+LOG_LEVEL="${LOG_LEVEL:-error}"
+LINK="${LINK:-}"
+MUX="${MUX:-false}"
+MUX_CONCURRENCY="${MUX_CONCURRENCY:-8}"
+MUX_XUDPCONCURRENCY="${MUX_XUDPCONCURRENCY:-$MUX_CONCURRENCY}"
+MUX_XUDPPROXYUDP443="${MUX_XUDPPROXYUDP443:-reject}"
+
+CIDR_MASK="${FAKE_IP_RANGE##*/}"
+FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
+
+mkdir -p /etc/xray/mount
 
 if [ "$IPTABLES" = "false" ] && lsmod | grep -q '^nft_tproxy'; then
   USE_NFT=true
@@ -27,15 +39,6 @@ else
     apk del iptables iptables-legacy >/dev/null 2>&1
   fi
 fi
-
-mkdir -p /etc/xray
-
-FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
-LOG_LEVEL="${LOG_LEVEL:-error}"
-LINK="${LINK:-}"
-
-CIDR_MASK="${FAKE_IP_RANGE##*/}"
-FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
@@ -82,6 +85,19 @@ json_value() {
 
 normalize_xray_numbers() {
     sed -E 's/([: ,])([0-9]+)\.0([^0-9])/ \1\2\3/g'
+}
+
+b64_normalize() {
+    s="$(printf '%s' "$1" | tr -d '\r\n ')"
+
+    mod=$(( ${#s} % 4 ))
+    if [ "$mod" -eq 2 ]; then
+        s="${s}=="
+    elif [ "$mod" -eq 3 ]; then
+        s="${s}="
+    fi
+
+    printf '%s' "$s"
 }
 
 xhttp_dsl_to_json() {
@@ -140,19 +156,32 @@ EOF
     printf '%s' "$OUT"
 }
 
-parse_vless() {
+parse() {
 
     LINK_NOPATH="$(printf '%s' "$LINK" | cut -d'#' -f1)"
-    LINK_NOPATH="${LINK_NOPATH#vless://}"
+    PROTOCOL="$(printf '%s' "$LINK_NOPATH" | cut -d':' -f1)"
+    LINK_NOPATH="${LINK_NOPATH#${PROTOCOL}://}"
+    XRAY_PROTOCOL="$PROTOCOL"
+    [ "$PROTOCOL" = "ss" ] && XRAY_PROTOCOL="shadowsocks"
 
-    UUID="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f1)"
-    REST="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f2)"
+    if [ "$PROTOCOL" != "vmess" ]; then
+        CREDS="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f1)"
+        REST="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f2)"
 
-    HOSTPORT="$(printf '%s' "$REST" | cut -d'?' -f1)"
-    QUERY="$(printf '%s' "$REST" | cut -s -d'?' -f2)"
+        HOSTPORT="$(printf '%s' "$REST" | cut -d'?' -f1)"
+        QUERY="$(printf '%s' "$REST" | cut -s -d'?' -f2)"
 
-    ADDRESS="$(printf '%s' "$HOSTPORT" | cut -d':' -f1)"
-    PORT="$(printf '%s' "$HOSTPORT" | cut -d':' -f2 | tr -cd '0-9')"
+        ADDRESS="$(printf '%s' "$HOSTPORT" | cut -d':' -f1)"
+        PORT="$(printf '%s' "$HOSTPORT" | cut -d':' -f2 | tr -cd '0-9')"
+    fi
+
+    UUID=""
+    PASSWORD=""
+    METHOD=""
+    EMAIL=""
+
+    SS_LEVEL="0"
+    TROJAN_LEVEL="0"
 
     NETWORK="raw"
     SECURITY="none"
@@ -227,6 +256,82 @@ parse_vless() {
     REALITY_MLDSA65_VERIFY=""
     REALITY_USED=false
 
+
+    VMESS_SECURITY="auto"
+    VMESS_LEVEL="0"
+
+    case "$PROTOCOL" in
+        vless)
+            UUID="$CREDS"
+            ;;
+        trojan)
+            PASSWORD="$CREDS"
+            ;;
+        ss)
+            SS_CLEAN="$(b64_normalize "$CREDS")"
+
+            SS_DECODED="$(printf '%s' "$SS_CLEAN" | base64 -d 2>/dev/null || true)"
+            [ -z "$SS_DECODED" ] && SS_DECODED="$CREDS"
+
+            METHOD="$(printf '%s' "$SS_DECODED" | cut -d':' -f1)"
+            PASSWORD="$(printf '%s' "$SS_DECODED" | cut -d':' -f2-)"
+            ;;
+    esac
+
+    if [ "$PROTOCOL" = "vmess" ]; then
+        PAYLOAD="$(printf '%s' "$LINK_NOPATH" | cut -d'?' -f1)"
+        JSON="$(printf '%s' "$PAYLOAD" | base64 -d 2>/dev/null)"
+
+        ADDRESS="$(printf '%s' "$JSON" | sed -n 's/.*"add":"\([^"]*\)".*/\1/p')"
+        PORT="$(printf '%s' "$JSON" \
+          | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*"\?\([0-9]\+\)"\?.*/\1/p')"
+        VMESS_UUID="$(printf '%s' "$JSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+
+        NETWORK="$(printf '%s' "$JSON" | sed -n 's/.*"net":"\([^"]*\)".*/\1/p')"
+        SECURITY="$(printf '%s' "$JSON" | sed -n 's/.*"tls":"\([^"]*\)".*/\1/p')"
+        [ -z "$SECURITY" ] && SECURITY="none"
+
+        VMESS_SECURITY="$(printf '%s' "$JSON" \
+          | sed -n 's/.*"scy":"\([^"]*\)".*/\1/p')"
+        [ -z "$VMESS_SECURITY" ] && VMESS_SECURITY="auto"
+
+        VMESS_HEADER_TYPE="$(printf '%s' "$JSON" \
+          | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')"
+
+        VMESS_LEVEL="$(printf '%s' "$JSON" | sed -n 's/.*"level":\([0-9]\+\).*/\1/p')"
+        [ -z "$VMESS_LEVEL" ] && VMESS_LEVEL="0"
+
+        WS_PATH="$(printf '%s' "$JSON" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')"
+        WS_HOST="$(printf '%s' "$JSON" | sed -n 's/.*"host":"\([^"]*\)".*/\1/p')"
+
+        TLS_SERVER_NAME="$(printf '%s' "$JSON" | sed -n 's/.*"sni":"\([^"]*\)".*/\1/p')"
+
+        [ -n "$WS_PATH" ] && WS_USED=true
+        [ -n "$WS_HOST" ] && WS_USED=true
+        [ -n "$TLS_SERVER_NAME" ] && TLS_USED=true
+
+        QUERY="$(printf '%s' "$LINK" | cut -s -d'?' -f2)"
+    fi
+
+    case "$NETWORK" in
+        tcp)
+            case "$VMESS_HEADER_TYPE" in
+                none|http)
+                    RAW_HEADERTYPE="$VMESS_HEADER_TYPE"
+                    RAW_USED=true
+                    ;;
+            esac
+            ;;
+        kcp)
+            case "$VMESS_HEADER_TYPE" in
+                srtp|utp|wechat-video|dtls|wireguard)
+                    KCP_HEADER_TYPE="$VMESS_HEADER_TYPE"
+                    KCP_USED=true
+                    ;;
+            esac
+            ;;
+    esac
+
     IFS='&'
     for kv in $QUERY; do
         key="$(printf '%s' "$kv" | cut -d'=' -f1)"
@@ -247,7 +352,12 @@ parse_vless() {
                 ;;
             level)
                 VLESS_LEVEL="$val"
-                ;;            
+                SS_LEVEL="$val"
+                TROJAN_LEVEL="$val"
+                ;;
+            email)
+                EMAIL="$(urldecode "$val")"
+                ;;  
             host)
                 DECODED_HOST="$(urldecode "$val")"
                 XHTTP_HOST="$DECODED_HOST"
@@ -489,14 +599,75 @@ parse_vless() {
 
     cat > /etc/xray/outbound.json <<EOF
 {
-  "protocol": "vless",
+  "protocol": "$XRAY_PROTOCOL",
   "settings": {
+EOF
+
+case "$PROTOCOL" in
+    vless)
+cat >> /etc/xray/outbound.json <<EOF
+    "vnext": [
+      {
+        "address": "$ADDRESS",
+        "port": $PORT,
+        "users": [
+          {
+            "id": "$UUID",
+            "encryption": "$VLESS_ENCRYPTION",
+            "flow": "$VLESS_FLOW",
+            "level": $VLESS_LEVEL
+          }
+        ]
+      }
+    ]
+EOF
+        ;;
+    vmess)
+cat >> /etc/xray/outbound.json <<EOF
+    "vnext": [
+      {
+        "address": "$ADDRESS",
+        "port": $PORT,
+        "users": [
+          {
+            "id": "$VMESS_UUID",
+            "security": "$VMESS_SECURITY",
+            "level": $VMESS_LEVEL
+          }
+        ]
+      }
+    ]
+EOF
+    ;;
+    trojan)
+cat >> /etc/xray/outbound.json <<EOF
     "address": "$ADDRESS",
     "port": $PORT,
-    "id": "$UUID",
-    "encryption": "$VLESS_ENCRYPTION",
-    "flow": "$VLESS_FLOW",
-    "level": $VLESS_LEVEL
+    "password": "$PASSWORD",
+    "level": $TROJAN_LEVEL
+EOF
+
+    if [ -n "$EMAIL" ]; then
+        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/outbound.json
+    fi
+    ;;
+    ss)
+cat >> /etc/xray/outbound.json <<EOF
+    "address": "$ADDRESS",
+    "port": $PORT,
+    "method": "$METHOD",
+    "password": "$PASSWORD",
+    "uot": true,
+    "UoTVersion": 2,
+    "level": $SS_LEVEL
+EOF
+
+    if [ -n "$EMAIL" ]; then
+        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/outbound.json
+    fi
+    ;;
+esac
+cat >> /etc/xray/outbound.json <<EOF
   },
 EOF
 
@@ -750,19 +921,29 @@ fi
 
     cat >> /etc/xray/outbound.json <<EOF
 
+  },
+  "mux": {
+    "enabled": $MUX,
+    "concurrency": $MUX_CONCURRENCY,
+    "xudpConcurrency": $MUX_XUDPCONCURRENCY,
+    "xudpProxyUDP443": "$MUX_XUDPPROXYUDP443"
   }
 }
 EOF
 }
 
+rm -f "/etc/xray/outbound.json"
+
 LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(printf '%s' "$LINK" | cut -d':' -f1)"
 
 case "$SCHEME" in
-    vless) parse_vless "$LINK" ;;
-    vmess) parse_vmess "$LINK" ;;
-    trojan) parse_trojan "$LINK" ;;
-    *) echo "Unsupported link type: $SCHEME" >&2 ;;
+    vless|vmess|trojan|ss)
+        parse "$LINK"
+        ;;
+    *)
+        echo "Invalid or unsupported link: $SCHEME" >&2
+        ;;
 esac
 
 config_file_xray() {
@@ -931,6 +1112,10 @@ fi
 cat >> /etc/xray/config.json << EOF
   "outbounds": [
 EOF
+if [ -f /etc/xray/mount/outbound.json ]; then
+    sed 's/^/    /' /etc/xray/mount/outbound.json >> /etc/xray/config.json
+    printf ',\n' >> /etc/xray/config.json
+fi
 if [ -f /etc/xray/outbound.json ]; then
     sed 's/^/    /' /etc/xray/outbound.json >> /etc/xray/config.json
     printf ',\n' >> /etc/xray/config.json
@@ -951,18 +1136,18 @@ cat >> /etc/xray/config.json << EOF
             "type": "http"
           }
         }
-      },  
+      },
       {
         "tag": "block",
         "protocol": "blackhole"
-      },     
+      },
       {
         "tag": "dns",
         "protocol": "dns",
         "settings": {
           "nonIPQuery": "reject",
           "blockTypes": [65,28]
-        }   
+        }
       }
   ]
 }

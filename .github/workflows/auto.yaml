@@ -1,8 +1,8 @@
 name: Build and Publish
 
 on:
-#  schedule:
-#    - cron: "0 18 * * *" # 18:00 UTC
+  schedule:
+    - cron: "0 20 * * *" # 20:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -83,11 +83,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # - name: Login to Docker Hub
-      #   uses: docker/login-action@v3
-      #   with:
-      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
-      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push multi-arch
         if: steps.check_versions.outputs.build_needed == 'true'
@@ -101,9 +101,9 @@ jobs:
             ghcr.io/medium1992/xray-proxy-ros:${{ env.xray }}-${{ env.hev_socks5_tunnel }}
             ghcr.io/medium1992/xray-proxy-ros:${{ env.xray }}
             ghcr.io/medium1992/xray-proxy-ros:latest
-#            medium1992/xray-proxy-ros:${{ env.xray }}-${{ env.hev_socks5_tunnel }}
-#            medium1992/xray-proxy-ros:${{ env.xray }}
-#            medium1992/xray-proxy-ros:latest
+            medium1992/xray-proxy-ros:${{ env.xray }}-${{ env.hev_socks5_tunnel }}
+            medium1992/xray-proxy-ros:${{ env.xray }}
+            medium1992/xray-proxy-ros:latest
           
       - name: Commit and push VERSIONS
         if: steps.check_versions.outputs.build_needed == 'true'

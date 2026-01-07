@@ -25,6 +25,7 @@ Advantages:
 | `MUX_XUDPCONCURRENCY`  | `MUX_CONCURRENCY`                      | Maximum number of concurrent UDP connections [DOCs](https://xtls.github.io/en/config/outbound.html#muxobject) |
 | `MUX_XUDPPROXYUDP443`  | `reject`                               | Control handling of proxied UDP/443 (QUIC) traffic [DOCs](https://xtls.github.io/en/config/outbound.html#muxobject) |
 | `IPTABLES`             | `false`                                | IPtables is always used in RoS<7.21 and in RoS>=7.21 with `arm32` architecture. In RoS>=7.21 with `arm64` and `adm64` architectures, `NFTables` is used by default inside the container unless the `IPTABLES` ENV is set to `true`. |
+| `QUIC_DROP`            | `false`                                | `true` adds a rule to drop QUIC (443/UDP) in Xray routing rules. |
 
 > For suggestions and comments, write in [Telegram](https://t.me/Medium_csgo).
 
@@ -98,6 +99,7 @@ Installation without routing, using the syntax for RouterOS version 7.21; when i
 /container/envs/add key=MUX_XUDPCONCURRENCY list=XrayProxyRoS value=""
 /container/envs/add key=MUX_XUDPPROXYUDP443 list=XrayProxyRoS value=reject
 /container/envs/add key=IPTABLES list=XrayProxyRoS value=false
+/container/envs/add key=QUIC_DROP list=XrayProxyRoS value=true
 /file/add name=xray_outbound type=directory
 /container/mounts/add src=/xray_outbound/ dst=/etc/xray/mount/ list=xray_outbound comment="XrayProxyRoS"
 /container/add remote-image="ghcr.io/medium1992/xray-proxy-ros" envlists=XrayProxyRoS mountlists=xray_outbound interface=XrayProxyRoS root-dir=/Containers/XrayProxyRoS start-on-boot=yes comment="XrayProxyRoS"

@@ -9,6 +9,7 @@ MUX="${MUX:-false}"
 MUX_CONCURRENCY="${MUX_CONCURRENCY:-8}"
 MUX_XUDPCONCURRENCY="${MUX_XUDPCONCURRENCY:-$MUX_CONCURRENCY}"
 MUX_XUDPPROXYUDP443="${MUX_XUDPPROXYUDP443:-reject}"
+QUIC_DROP="${QUIC_DROP:-false}"
 
 CIDR_MASK="${FAKE_IP_RANGE##*/}"
 FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
@@ -985,6 +986,17 @@ cat > /etc/xray/config.json << EOF
         "inboundTag": ["dns-in"],
         "outboundTag": "dns"
       },
+EOF
+if [ "$QUIC_DROP" = "true" ]; then
+cat >> /etc/xray/config.json << EOF
+      {
+        "network": "udp",
+        "port": "443",        
+        "outboundTag": "block"
+      },
+EOF
+fi
+cat >> /etc/xray/config.json << EOF
       {
         "inboundTag": ["all-in"],
         "ip": ["${FAKE_IP_RANGE}"],

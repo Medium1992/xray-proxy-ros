@@ -25,6 +25,7 @@
 | `MUX_XUDPCONCURRENCY`  | `MUX_CONCURRENCY`                     | Максимальное количество одновременных UDP соединений [DOCs](https://xtls.github.io/ru/config/outbound.html#muxobject) |
 | `MUX_XUDPPROXYUDP443`  | `reject`                              | Управление обработкой проксируемого трафика UDP/443 (QUIC) [DOCs](https://xtls.github.io/ru/config/outbound.html#muxobject) |
 | `IPTABLES`             | `false`                               | IPtables используется всегда в RoS<7.21 и в RoS>=7.21 архитектуры `arm32`. В RoS>=7.21 архитектуры `arm64` и `adm64` по умолчанию в контейнере используется `NFTables`, если ENV `IPTABLES` не задан `true` |
+| `QUIC_DROP`            | `false`                               | `true` добавляет правило дропа QUIC(443/UDP) в правилах routing Xray. |
 
 > По предложениям и замечаниям пишите в [Telegram](https://t.me/Medium_csgo).
 
@@ -97,6 +98,7 @@
 /container/envs/add key=MUX_XUDPCONCURRENCY list=XrayProxyRoS value=""
 /container/envs/add key=MUX_XUDPPROXYUDP443 list=XrayProxyRoS value=reject
 /container/envs/add key=IPTABLES list=XrayProxyRoS value=false
+/container/envs/add key=QUIC_DROP list=XrayProxyRoS value=true
 /file/add name=xray_outbound type=directory
 /container/mounts/add src=/xray_outbound/ dst=/etc/xray/mount/ list=xray_outbound comment="XrayProxyRoS"
 /container/add remote-image="ghcr.io/medium1992/xray-proxy-ros" envlists=XrayProxyRoS mountlists=xray_outbound interface=XrayProxyRoS root-dir=/Containers/XrayProxyRoS start-on-boot=yes comment="XrayProxyRoS"

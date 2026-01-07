@@ -1187,9 +1187,6 @@ iptables_rules() {
   iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j RETURN
   iptables -t nat -A PREROUTING -m addrtype ! --dst-type UNICAST -j RETURN
   iptables -t nat -A PREROUTING -i $iface -p tcp -j REDIRECT --to-ports 12345
-  iptables -t mangle -A PREROUTING -m addrtype --dst-type LOCAL -j ACCEPT
-  iptables -t mangle -A PREROUTING -m addrtype ! --dst-type UNICAST -j ACCEPT
-  iptables -t mangle -A PREROUTING -i "$iface" -p udp -j MARK --set-mark 110
 }
 
 config_file() {
@@ -1212,7 +1209,12 @@ EOF
 hs5t_file() {
   cat > /hs5t.sh << EOF
 #!/bin/sh
-ip rule show | grep -q 'fwmark 0x6e ipproto udp lookup 110' || ip rule add fwmark 110 ipproto udp table 110
+ip rule show | grep -q 'iif $iface ipproto tcp lookup main' || ip rule add iif $iface ipproto tcp lookup main priority 10000
+ip rule show | grep -q 'to $iface_cidr lookup main' || ip rule add to $iface_cidr lookup main priority 10001
+ip rule show | grep -q 'to 127.0.0.0/8 lookup main' || ip rule add to 127.0.0.0/8 lookup main priority 10002
+ip rule show | grep -q 'to 224.0.0.0/4 lookup main' || ip rule add to 224.0.0.0/4 lookup main priority 10003
+ip rule show | grep -q 'to 255.255.255.255 lookup main' || ip rule add to 255.255.255.255 lookup main priority 10004
+ip rule show | grep -q 'iif $iface ipproto udp lookup 110' || ip rule add iif $iface ipproto udp lookup 110 priority 10005
 ip route replace default via 100.64.0.1 dev hs5t table 110
 EOF
 chmod +x /hs5t.sh

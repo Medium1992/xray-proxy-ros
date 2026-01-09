@@ -26,7 +26,7 @@ Advantages:
 | `MUX_CONCURRENCY`      | `8`                                    | Maximum number of concurrent TCP connections [DOCs](https://xtls.github.io/en/config/outbound.html#muxobject) |
 | `MUX_XUDPCONCURRENCY`  | `MUX_CONCURRENCY`                      | Maximum number of concurrent UDP connections [DOCs](https://xtls.github.io/en/config/outbound.html#muxobject) |
 | `MUX_XUDPPROXYUDP443`  | `reject`                               | Control handling of proxied UDP/443 (QUIC) traffic [DOCs](https://xtls.github.io/en/config/outbound.html#muxobject) |
-| `TPROXY`               | `true`                                 | In RoS>=7.21 on arm64 and adm64 architectures, NFTables is used by default in the container. If the TPROXY ENV is set to `true`, inbound TProxy (tcp, udp) will be used; if set to `false`, inbound Redirect (tcp) + TUN (udp) will be used |
+| `TPROXY`               | `true`                                 | In RoS>=7.21 on `arm64` and `adm64` architectures, `NFTables` is used by default in the container. If the `TPROXY` ENV is set to `true`, inbound TProxy (tcp, udp) will be used; if set to `false`, inbound Redirect (tcp) + TUN (udp) will be used |
 | `QUIC_DROP`            | `false`                                | `true` adds a rule to drop QUIC (443/UDP) in Xray routing rules. |
 
 > For suggestions and comments, write in [Telegram](https://t.me/Medium_csgo).

@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-IPTABLES="${IPTABLES:-false}"
+TPROXY="${TPROXY:-true}"
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
 LINK="${LINK:-}"
@@ -15,7 +15,7 @@ FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
 
 mkdir -p /etc/xray/mount
 
-if [ "$IPTABLES" = "false" ] && lsmod | grep -q '^nft_tproxy'; then
+if lsmod | grep -q '^nft_tproxy'; then
   USE_NFT=true
 else
   USE_NFT=false
@@ -1068,7 +1068,7 @@ cat >> /etc/xray/config.json << EOF
         }
     },
 EOF
-if [ "$USE_NFT" = "true" ]; then
+if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
 cat >> /etc/xray/config.json << EOF
     {
       "tag": "all-in",
@@ -1170,22 +1170,28 @@ EOF
 nft_rules() {
   echo "Applying nftables..."
   nft flush ruleset || true
-  nft -f - <<EOF
-table inet xray {
-    chain prerouting {
-        type filter hook prerouting priority filter; policy accept;
-        ip daddr $FAKE_IP_RANGE meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
-        ip daddr { $iface_cidr, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
-        meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
-    }
-    chain divert {
-        type filter hook prerouting priority mangle; policy accept;
-        meta l4proto tcp socket transparent 1 meta mark set 0x00000001 accept
-    }
-}
-EOF
-  ip rule show | grep -q 'fwmark 0x00000001 lookup 100' || ip rule add fwmark 1 table 100
-  ip route replace local 0.0.0.0/0 dev lo table 100
+  if [ "${TPROXY}" = "true" ]; then
+    nft create table inet xray
+    nft add chain inet xray pre "{type filter hook prerouting priority filter; policy accept;}"
+    nft add rule inet xray pre tcp option mptcp exists drop
+    nft add rule inet xray pre ip daddr ${FAKE_IP_RANGE} meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
+    nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
+    nft add rule inet xray pre meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
+    nft add chain inet xray divert "{type filter hook prerouting priority mangle; policy accept;}"
+    nft add rule inet xray divert meta l4proto tcp socket transparent 1 meta mark set 0x00000001 accept
+    ip rule show | grep -q 'fwmark 0x00000001 lookup 100' || ip rule add fwmark 1 table 100
+    ip route replace local 0.0.0.0/0 dev lo table 100
+    echo "Mode inbound TProxy(tcp,udp) interface $iface"
+  else
+    nft create table inet xray
+    nft add chain inet xray pre "{type nat hook prerouting priority -99; policy accept;}"
+    nft add rule inet xray pre meta iifname != "$iface" return 
+    nft add rule inet xray pre meta l4proto { tcp, udp } th dport 53 iifname "$iface" return
+    nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 100.64.0.1, 224.0.0.0/4, 255.255.255.255 } return
+    nft add rule inet xray pre tcp option mptcp exists drop
+    nft add rule inet xray pre meta nfproto ipv4 meta l4proto tcp redirect to 12345
+    echo "Mode inbound Redirect(tcp)+TUN(udp) interface $iface"
+  fi
 }
 
 iptables_rules() {
@@ -1236,17 +1242,21 @@ chmod +x /hs5t.sh
 run() {
   if [ "$USE_NFT" = "true" ]; then
     nft_rules
+    if [ "${TPROXY}" = "false" ]; then
+      config_file
+      hs5t_file
+    fi
   else
     config_file
     hs5t_file
     iptables_rules
   fi
-  if [ "$USE_NFT" = "false" ]; then
+  if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then
     echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
   fi
   config_file_xray
   echo "Starting xray $(./xray --version)"
-  if [ "$USE_NFT" = "true" ]; then
+  if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
     exec ./xray -config /etc/xray/config.json
   else
     ./hs5t ./hs5t.yml &

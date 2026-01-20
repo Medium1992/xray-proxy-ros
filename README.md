@@ -2,7 +2,7 @@
 
 [Telegram group](https://t.me/+96HVPF3Ww6o3YTNi)
 
-# 🇷🇺 Description in Russian
+# 🇬🇧 Description in Russian
 
 **xray-proxy-ros** is a Docker container based on [**Xray**](https://github.com/XTLS/Xray-core) for Mikrotik RouterOS.
 

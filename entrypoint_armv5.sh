@@ -1,6 +1,7 @@
 #!/usr/bin/sh
 set -eu
 TPROXY="${TPROXY:-true}"
+DNS_MODE="${DNS_MODE:-fake-ip}"
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
 LINK="${LINK:-}"
@@ -13,12 +14,30 @@ QUIC_DROP="${QUIC_DROP:-false}"
 CIDR_MASK="${FAKE_IP_RANGE##*/}"
 FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
 
-mkdir -p /etc/xray/mount
-
 if lsmod | grep -q '^nft_tproxy'; then
   USE_NFT=true
 else
   USE_NFT=false
+fi
+
+if [ "$USE_NFT" = "false" ]; then
+  if ! apk info -e iptables iptables-legacy >/dev/null; then
+    echo "Install iptables"
+    apk add --no-cache iptables iptables-legacy >/dev/null 2>&1
+    rm -f /usr/sbin/iptables /usr/sbin/iptables-save /usr/sbin/iptables-restore
+    ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables
+    ln -s /usr/sbin/iptables-legacy-save /usr/sbin/iptables-save
+    ln -s /usr/sbin/iptables-legacy-restore /usr/sbin/iptables-restore
+  fi
+else
+  if ! apk info -e nftables >/dev/null; then
+    echo "Install nftables"
+    apk add --no-cache nftables >/dev/null 2>&1
+  fi
+  if apk info -e iptables iptables-legacy >/dev/null; then
+    echo "Delete iptables"
+    apk del iptables iptables-legacy >/dev/null 2>&1
+  fi
 fi
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
@@ -170,7 +189,7 @@ parse() {
     VLESS_FLOW=""
     VLESS_LEVEL="0"
 
-    RAW_HEADERTYPE=""
+    RAW_HEADERTYPE="none"
     RAW_USED=false
 
     XHTTP_HOST=""
@@ -578,15 +597,18 @@ parse() {
             ;;
     esac
 
-    cat > /etc/xray/outbound.json <<EOF
+    cat > /etc/xray/25_outbound.json <<EOF
 {
+  "outbounds": [
+{
+  "tag": "XrayProxyRoS",
   "protocol": "$XRAY_PROTOCOL",
   "settings": {
 EOF
 
 case "$PROTOCOL" in
     vless)
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
     "vnext": [
       {
         "address": "$ADDRESS",
@@ -604,7 +626,7 @@ cat >> /etc/xray/outbound.json <<EOF
 EOF
         ;;
     vmess)
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
     "vnext": [
       {
         "address": "$ADDRESS",
@@ -621,7 +643,7 @@ cat >> /etc/xray/outbound.json <<EOF
 EOF
     ;;
     trojan)
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
     "address": "$ADDRESS",
     "port": $PORT,
     "password": "$PASSWORD",
@@ -629,11 +651,11 @@ cat >> /etc/xray/outbound.json <<EOF
 EOF
 
     if [ -n "$EMAIL" ]; then
-        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/outbound.json
+        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/25_outbound.json
     fi
     ;;
     ss)
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
     "address": "$ADDRESS",
     "port": $PORT,
     "method": "$METHOD",
@@ -644,266 +666,259 @@ cat >> /etc/xray/outbound.json <<EOF
 EOF
 
     if [ -n "$EMAIL" ]; then
-        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/outbound.json
+        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/25_outbound.json
     fi
     ;;
 esac
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
   },
 EOF
 
-STREAM_HAS_EXTRA=false
-
-cat >> /etc/xray/outbound.json <<EOF
+cat >> /etc/xray/25_outbound.json <<EOF
   "streamSettings": {
     "network": "$NETWORK",
+    "security": "$SECURITY",
 EOF
-    printf '    "security": "%s"' "$SECURITY" >> /etc/xray/outbound.json
-
-
-STREAM_HAS_EXTRA=true
-
-if [ "$NETWORK" = "xhttp" ] && [ "$XHTTP_USED" = "true" ]; then
-    printf ',\n    "xhttpSettings": {\n' >> /etc/xray/outbound.json
-
-    FIRST=true
-
-    if [ -n "$XHTTP_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "host": "%s"' "$XHTTP_HOST" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_PATH" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "path": "%s"' "$XHTTP_PATH" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_MODE" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "mode": "%s"' "$XHTTP_MODE" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_EXTRA" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "extra": %s' "$XHTTP_EXTRA" >> /etc/xray/outbound.json
-    fi
-
-    printf '\n    }' >> /etc/xray/outbound.json
-fi
-
-if [ "$NETWORK" = "raw" ] && [ "$RAW_USED" = "true" ]; then
-    printf ',\n    "rawSettings": {\n' >> /etc/xray/outbound.json
-    printf '      "header": {\n' >> /etc/xray/outbound.json
-    printf '        "type": "%s"\n' "$RAW_HEADERTYPE" >> /etc/xray/outbound.json
-    printf '      }\n' >> /etc/xray/outbound.json
-    printf '    }' >> /etc/xray/outbound.json
-fi
-
-if [ "$NETWORK" = "ws" ] && [ "$WS_USED" = "true" ]; then
-    printf ',\n    "wsSettings": {\n' >> /etc/xray/outbound.json
-
-    FIRST=true
-
-    if [ -n "$WS_PATH" ]; then
-        printf '      "path": "%s"' "$WS_PATH" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "host": "%s"' "$WS_HOST" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HEADERS" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "headers": %s' "$WS_HEADERS" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HEARTBEAT" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "heartbeatPeriod": %s' "$WS_HEARTBEAT" >> /etc/xray/outbound.json
-    fi
-
-    printf '\n    }' >> /etc/xray/outbound.json
-fi
-
-if [ "$NETWORK" = "grpc" ] && [ "$GRPC_USED" = "true" ]; then
-    printf ',\n    "grpcSettings": {\n' >> /etc/xray/outbound.json
-
-    FIRST=true
-
-    add_grpc() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        FIRST=false
-    }
-
-    [ -n "$GRPC_SERVICE_NAME" ] && add_grpc && printf '      "serviceName": "%s"' "$GRPC_SERVICE_NAME" >> /etc/xray/outbound.json
-    [ -n "$GRPC_AUTHORITY" ] && add_grpc && printf '      "authority": "%s"' "$GRPC_AUTHORITY" >> /etc/xray/outbound.json
-    [ -n "$GRPC_USER_AGENT" ] && add_grpc && printf '      "user_agent": "%s"' "$GRPC_USER_AGENT" >> /etc/xray/outbound.json
-    [ -n "$GRPC_MULTI_MODE" ] && add_grpc && printf '      "multiMode": %s' "$GRPC_MULTI_MODE" >> /etc/xray/outbound.json
-    [ -n "$GRPC_IDLE_TIMEOUT" ] && add_grpc && printf '      "idle_timeout": %s' "$GRPC_IDLE_TIMEOUT" >> /etc/xray/outbound.json
-    [ -n "$GRPC_HEALTH_CHECK_TIMEOUT" ] && add_grpc && printf '      "health_check_timeout": %s' "$GRPC_HEALTH_CHECK_TIMEOUT" >> /etc/xray/outbound.json
-    [ -n "$GRPC_PERMIT_WITHOUT_STREAM" ] && add_grpc && printf '      "permit_without_stream": %s' "$GRPC_PERMIT_WITHOUT_STREAM" >> /etc/xray/outbound.json
-    [ -n "$GRPC_INITIAL_WINDOWS_SIZE" ] && add_grpc && printf '      "initial_windows_size": %s' "$GRPC_INITIAL_WINDOWS_SIZE" >> /etc/xray/outbound.json
-
-    printf '\n    }' >> /etc/xray/outbound.json
-fi
-
-if [ "$NETWORK" = "kcp" ] && [ "$KCP_USED" = "true" ]; then
-    printf ',\n    "kcpSettings": {\n' >> /etc/xray/outbound.json
-
-    FIRST=true
-    add_kcp() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        FIRST=false
-    }
-
-    [ -n "$KCP_MTU" ] && add_kcp && printf '      "mtu": %s' "$KCP_MTU" >> /etc/xray/outbound.json
-    [ -n "$KCP_TTI" ] && add_kcp && printf '      "tti": %s' "$KCP_TTI" >> /etc/xray/outbound.json
-    [ -n "$KCP_UPLINK" ] && add_kcp && printf '      "uplinkCapacity": %s' "$KCP_UPLINK" >> /etc/xray/outbound.json
-    [ -n "$KCP_DOWNLINK" ] && add_kcp && printf '      "downlinkCapacity": %s' "$KCP_DOWNLINK" >> /etc/xray/outbound.json
-    [ -n "$KCP_CONGESTION" ] && add_kcp && printf '      "congestion": %s' "$KCP_CONGESTION" >> /etc/xray/outbound.json
-    [ -n "$KCP_READ_BUF" ] && add_kcp && printf '      "readBufferSize": %s' "$KCP_READ_BUF" >> /etc/xray/outbound.json
-    [ -n "$KCP_WRITE_BUF" ] && add_kcp && printf '      "writeBufferSize": %s' "$KCP_WRITE_BUF" >> /etc/xray/outbound.json
-    [ -n "$KCP_SEED" ] && add_kcp && printf '      "seed": "%s"' "$KCP_SEED" >> /etc/xray/outbound.json
-
-    if [ -n "$KCP_HEADER_TYPE" ] || [ -n "$KCP_HEADER_DOMAIN" ]; then
-        add_kcp
-        printf '      "header": {' >> /etc/xray/outbound.json
-
-        H_FIRST=true
-        if [ -n "$KCP_HEADER_TYPE" ]; then
-            printf '"type": "%s"' "$KCP_HEADER_TYPE" >> /etc/xray/outbound.json
-            H_FIRST=false
-        fi
-        if [ -n "$KCP_HEADER_DOMAIN" ]; then
-            [ "$H_FIRST" = false ] && printf ', ' >> /etc/xray/outbound.json
-            printf '"domain": "%s"' "$KCP_HEADER_DOMAIN" >> /etc/xray/outbound.json
-        fi
-
-        printf '}' >> /etc/xray/outbound.json
-    fi
-
-    printf '\n    }' >> /etc/xray/outbound.json
-fi
-
-if [ "$NETWORK" = "httpupgrade" ] && [ "$HTTPUP_USED" = "true" ]; then
-    printf ',\n    "httpupgradeSettings": {\n' >> /etc/xray/outbound.json
-
-    FIRST=true
-
-    if [ -n "$HTTPUP_PATH" ]; then
-        printf '      "path": "%s"' "$HTTPUP_PATH" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$HTTPUP_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "host": "%s"' "$HTTPUP_HOST" >> /etc/xray/outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$HTTPUP_HEADERS" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "headers": %s' "$HTTPUP_HEADERS" >> /etc/xray/outbound.json
-    fi
-
-    printf '\n    }' >> /etc/xray/outbound.json
-fi
-
 if [ "$SECURITY" = "tls" ] && [ "$TLS_USED" = "true" ]; then
-    printf ',\n    "tlsSettings": {\n' >> /etc/xray/outbound.json
+    printf '\n    "tlsSettings": {\n' >> /etc/xray/25_outbound.json
     FIRST=true
 
     add_tls() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
         FIRST=false
     }
 
-    [ -n "$TLS_SERVER_NAME" ] && add_tls && printf '      "serverName": "%s"' "$TLS_SERVER_NAME" >> /etc/xray/outbound.json
+    [ -n "$TLS_SERVER_NAME" ] && add_tls && printf '      "serverName": "%s"' "$TLS_SERVER_NAME" >> /etc/xray/25_outbound.json
 
     if [ -n "$TLS_ALPN" ]; then
         add_tls
-        printf '      "alpn": [' >> /etc/xray/outbound.json
+        printf '      "alpn": [' >> /etc/xray/25_outbound.json
         IFS=','; set -- $TLS_ALPN; unset IFS
         ALPN_FIRST=true
         for a in "$@"; do
-            [ "$ALPN_FIRST" = false ] && printf ', ' >> /etc/xray/outbound.json
-            printf '"%s"' "$a" >> /etc/xray/outbound.json
+            [ "$ALPN_FIRST" = false ] && printf ', ' >> /etc/xray/25_outbound.json
+            printf '"%s"' "$a" >> /etc/xray/25_outbound.json
             ALPN_FIRST=false
         done
-        printf ']' >> /etc/xray/outbound.json
+        printf ']' >> /etc/xray/25_outbound.json
     fi
 
-    [ -n "$TLS_FINGERPRINT" ] && add_tls && printf '      "fingerprint": "%s"' "$TLS_FINGERPRINT" >> /etc/xray/outbound.json
-    [ -n "$TLS_ALLOW_INSECURE" ] && add_tls && printf '      "allowInsecure": %s' "$TLS_ALLOW_INSECURE" >> /etc/xray/outbound.json
-    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertInNames": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/outbound.json
-    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertificateChainSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/outbound.json
-    [ -n "$TLS_DISABLE_SYSTEM_ROOT" ] && add_tls && printf '      "disableSystemRoot": %s' "$TLS_DISABLE_SYSTEM_ROOT" >> /etc/xray/outbound.json
-    [ -n "$TLS_SESSION_RESUME" ] && add_tls && printf '      "enableSessionResumption": %s' "$TLS_SESSION_RESUME" >> /etc/xray/outbound.json
-    [ -n "$TLS_MIN_VERSION" ] && add_tls && printf '      "minVersion": "%s"' "$TLS_MIN_VERSION" >> /etc/xray/outbound.json
-    [ -n "$TLS_MAX_VERSION" ] && add_tls && printf '      "maxVersion": "%s"' "$TLS_MAX_VERSION" >> /etc/xray/outbound.json
-    [ -n "$TLS_CIPHER_SUITES" ] && add_tls && printf '      "cipherSuites": "%s"' "$TLS_CIPHER_SUITES" >> /etc/xray/outbound.json
-    [ -n "$TLS_CURVE_PREFS" ] && add_tls && printf '      "curvePreferences": ["%s"]' "$TLS_CURVE_PREFS" >> /etc/xray/outbound.json
-    [ -n "$TLS_MASTER_KEY_LOG" ] && add_tls && printf '      "masterKeyLog": "%s"' "$TLS_MASTER_KEY_LOG" >> /etc/xray/outbound.json
-    [ -n "$TLS_ECH_CONFIG" ] && add_tls && printf '      "echConfigList": "%s"' "$TLS_ECH_CONFIG" >> /etc/xray/outbound.json
-    [ -n "$TLS_ECH_FORCE_QUERY" ] && add_tls && printf '      "echForceQuery": "%s"' "$TLS_ECH_FORCE_QUERY" >> /etc/xray/outbound.json
+    [ -n "$TLS_FINGERPRINT" ] && add_tls && printf '      "fingerprint": "%s"' "$TLS_FINGERPRINT" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_ALLOW_INSECURE" ] && add_tls && printf '      "allowInsecure": %s' "$TLS_ALLOW_INSECURE" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertInNames": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertificateChainSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_DISABLE_SYSTEM_ROOT" ] && add_tls && printf '      "disableSystemRoot": %s' "$TLS_DISABLE_SYSTEM_ROOT" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_SESSION_RESUME" ] && add_tls && printf '      "enableSessionResumption": %s' "$TLS_SESSION_RESUME" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_MIN_VERSION" ] && add_tls && printf '      "minVersion": "%s"' "$TLS_MIN_VERSION" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_MAX_VERSION" ] && add_tls && printf '      "maxVersion": "%s"' "$TLS_MAX_VERSION" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_CIPHER_SUITES" ] && add_tls && printf '      "cipherSuites": "%s"' "$TLS_CIPHER_SUITES" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_CURVE_PREFS" ] && add_tls && printf '      "curvePreferences": ["%s"]' "$TLS_CURVE_PREFS" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_MASTER_KEY_LOG" ] && add_tls && printf '      "masterKeyLog": "%s"' "$TLS_MASTER_KEY_LOG" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_ECH_CONFIG" ] && add_tls && printf '      "echConfigList": "%s"' "$TLS_ECH_CONFIG" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_ECH_FORCE_QUERY" ] && add_tls && printf '      "echForceQuery": "%s"' "$TLS_ECH_FORCE_QUERY" >> /etc/xray/25_outbound.json
 
-    printf '\n    }' >> /etc/xray/outbound.json
+    printf '\n    },' >> /etc/xray/25_outbound.json
 fi
 
 if [ "$SECURITY" = "reality" ] && [ "$REALITY_USED" = "true" ]; then
-    printf ',\n    "realitySettings": {\n' >> /etc/xray/outbound.json
+    printf '\n    "realitySettings": {\n' >> /etc/xray/25_outbound.json
 
     FIRST=true
 
     if [ -n "$REALITY_SERVER_NAME" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "serverName": "%s"' "$REALITY_SERVER_NAME" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "serverName": "%s"' "$REALITY_SERVER_NAME" >> /etc/xray/25_outbound.json
         FIRST=false
     fi
 
     if [ -n "$REALITY_FINGERPRINT" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "fingerprint": "%s"' "$REALITY_FINGERPRINT" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "fingerprint": "%s"' "$REALITY_FINGERPRINT" >> /etc/xray/25_outbound.json
         FIRST=false
     fi
 
     if [ -n "$REALITY_SHORT_ID" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "shortId": "%s"' "$REALITY_SHORT_ID" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "shortId": "%s"' "$REALITY_SHORT_ID" >> /etc/xray/25_outbound.json
         FIRST=false
     fi
 
     if [ -n "$REALITY_PASSWORD" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "password": "%s"' "$REALITY_PASSWORD" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "password": "%s"' "$REALITY_PASSWORD" >> /etc/xray/25_outbound.json
         FIRST=false
     fi
 
     if [ -n "$REALITY_MLDSA65_VERIFY" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "mldsa65Verify": "%s"' "$REALITY_MLDSA65_VERIFY" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "mldsa65Verify": "%s"' "$REALITY_MLDSA65_VERIFY" >> /etc/xray/25_outbound.json
         FIRST=false
     fi
 
     if [ -n "$REALITY_SPIDER_X" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/outbound.json
-        printf '      "spiderX": "%s"' "$REALITY_SPIDER_X" >> /etc/xray/outbound.json
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "spiderX": "%s"' "$REALITY_SPIDER_X" >> /etc/xray/25_outbound.json
     fi
 
-    printf '\n' >> /etc/xray/outbound.json
+    printf '\n    },' >> /etc/xray/25_outbound.json
 fi
 
-    cat >> /etc/xray/outbound.json <<EOF
-    },
+if [ "$NETWORK" = "xhttp" ] && [ "$XHTTP_USED" = "true" ]; then
+    printf '\n    "xhttpSettings": {\n' >> /etc/xray/25_outbound.json
+
+    FIRST=true
+
+    if [ -n "$XHTTP_HOST" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "host": "%s"' "$XHTTP_HOST" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$XHTTP_PATH" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "path": "%s"' "$XHTTP_PATH" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$XHTTP_MODE" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "mode": "%s"' "$XHTTP_MODE" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$XHTTP_EXTRA" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "extra": %s' "$XHTTP_EXTRA" >> /etc/xray/25_outbound.json
+    fi
+
+    printf '\n    },' >> /etc/xray/25_outbound.json
+fi
+
+if [ "$NETWORK" = "raw" ] && [ "$RAW_USED" = "true" ]; then
+    printf '\n    "rawSettings": {\n' >> /etc/xray/25_outbound.json
+    printf '      "header": {\n' >> /etc/xray/25_outbound.json
+    printf '        "type": "%s"\n' "$RAW_HEADERTYPE" >> /etc/xray/25_outbound.json
+    printf '      }\n' >> /etc/xray/25_outbound.json
+    printf '    },' >> /etc/xray/25_outbound.json
+fi
+
+if [ "$NETWORK" = "ws" ] && [ "$WS_USED" = "true" ]; then
+    printf '\n    "wsSettings": {\n' >> /etc/xray/25_outbound.json
+
+    FIRST=true
+
+    if [ -n "$WS_PATH" ]; then
+        printf '      "path": "%s"' "$WS_PATH" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$WS_HOST" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "host": "%s"' "$WS_HOST" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$WS_HEADERS" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "headers": %s' "$WS_HEADERS" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$WS_HEARTBEAT" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "heartbeatPeriod": %s' "$WS_HEARTBEAT" >> /etc/xray/25_outbound.json
+    fi
+
+    printf '\n    },' >> /etc/xray/25_outbound.json
+fi
+
+if [ "$NETWORK" = "grpc" ] && [ "$GRPC_USED" = "true" ]; then
+    printf '\n    "grpcSettings": {\n' >> /etc/xray/25_outbound.json
+
+    FIRST=true
+
+    add_grpc() {
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        FIRST=false
+    }
+
+    [ -n "$GRPC_SERVICE_NAME" ] && add_grpc && printf '      "serviceName": "%s"' "$GRPC_SERVICE_NAME" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_AUTHORITY" ] && add_grpc && printf '      "authority": "%s"' "$GRPC_AUTHORITY" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_USER_AGENT" ] && add_grpc && printf '      "user_agent": "%s"' "$GRPC_USER_AGENT" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_MULTI_MODE" ] && add_grpc && printf '      "multiMode": %s' "$GRPC_MULTI_MODE" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_IDLE_TIMEOUT" ] && add_grpc && printf '      "idle_timeout": %s' "$GRPC_IDLE_TIMEOUT" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_HEALTH_CHECK_TIMEOUT" ] && add_grpc && printf '      "health_check_timeout": %s' "$GRPC_HEALTH_CHECK_TIMEOUT" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_PERMIT_WITHOUT_STREAM" ] && add_grpc && printf '      "permit_without_stream": %s' "$GRPC_PERMIT_WITHOUT_STREAM" >> /etc/xray/25_outbound.json
+    [ -n "$GRPC_INITIAL_WINDOWS_SIZE" ] && add_grpc && printf '      "initial_windows_size": %s' "$GRPC_INITIAL_WINDOWS_SIZE" >> /etc/xray/25_outbound.json
+
+    printf '\n    },' >> /etc/xray/25_outbound.json
+fi
+
+if [ "$NETWORK" = "kcp" ] && [ "$KCP_USED" = "true" ]; then
+    printf '\n    "kcpSettings": {\n' >> /etc/xray/25_outbound.json
+
+    FIRST=true
+    add_kcp() {
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        FIRST=false
+    }
+
+    [ -n "$KCP_MTU" ] && add_kcp && printf '      "mtu": %s' "$KCP_MTU" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_TTI" ] && add_kcp && printf '      "tti": %s' "$KCP_TTI" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_UPLINK" ] && add_kcp && printf '      "uplinkCapacity": %s' "$KCP_UPLINK" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_DOWNLINK" ] && add_kcp && printf '      "downlinkCapacity": %s' "$KCP_DOWNLINK" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_CONGESTION" ] && add_kcp && printf '      "congestion": %s' "$KCP_CONGESTION" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_READ_BUF" ] && add_kcp && printf '      "readBufferSize": %s' "$KCP_READ_BUF" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_WRITE_BUF" ] && add_kcp && printf '      "writeBufferSize": %s' "$KCP_WRITE_BUF" >> /etc/xray/25_outbound.json
+    [ -n "$KCP_SEED" ] && add_kcp && printf '      "seed": "%s"' "$KCP_SEED" >> /etc/xray/25_outbound.json
+
+    if [ -n "$KCP_HEADER_TYPE" ] || [ -n "$KCP_HEADER_DOMAIN" ]; then
+        add_kcp
+        printf '      "header": {' >> /etc/xray/25_outbound.json
+
+        H_FIRST=true
+        if [ -n "$KCP_HEADER_TYPE" ]; then
+            printf '"type": "%s"' "$KCP_HEADER_TYPE" >> /etc/xray/25_outbound.json
+            H_FIRST=false
+        fi
+        if [ -n "$KCP_HEADER_DOMAIN" ]; then
+            [ "$H_FIRST" = false ] && printf ', ' >> /etc/xray/25_outbound.json
+            printf '"domain": "%s"' "$KCP_HEADER_DOMAIN" >> /etc/xray/25_outbound.json
+        fi
+
+        printf '}' >> /etc/xray/25_outbound.json
+    fi
+
+    printf '\n    },' >> /etc/xray/25_outbound.json
+fi
+
+if [ "$NETWORK" = "httpupgrade" ] && [ "$HTTPUP_USED" = "true" ]; then
+    printf '\n    "httpupgradeSettings": {\n' >> /etc/xray/25_outbound.json
+
+    FIRST=true
+
+    if [ -n "$HTTPUP_PATH" ]; then
+        printf '      "path": "%s"' "$HTTPUP_PATH" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$HTTPUP_HOST" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "host": "%s"' "$HTTPUP_HOST" >> /etc/xray/25_outbound.json
+        FIRST=false
+    fi
+
+    if [ -n "$HTTPUP_HEADERS" ]; then
+        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
+        printf '      "headers": %s' "$HTTPUP_HEADERS" >> /etc/xray/25_outbound.json
+    fi
+
+    printf '\n    },' >> /etc/xray/25_outbound.json
+fi
+    printf '\n' >> /etc/xray/25_outbound.json
+    cat >> /etc/xray/25_outbound.json <<EOF
     "sockopt": {
-        "domainStrategy": "UseIPv4"
+        "domainStrategy": "ForceIPv4"
     }
   },
   "mux": {
@@ -913,10 +928,12 @@ fi
     "xudpProxyUDP443": "$MUX_XUDPPROXYUDP443"
   }
 }
+]
+}
 EOF
 }
 
-rm -f "/etc/xray/outbound.json"
+rm -f "/etc/xray/25_outbound.json"
 
 LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(printf '%s' "$LINK" | cut -d':' -f1)"
@@ -931,11 +948,15 @@ case "$SCHEME" in
 esac
 
 config_file_xray() {
-cat > /etc/xray/config.json << EOF
+cat > /etc/xray/20_log.json << EOF
 {
   "log": {
     "loglevel": "${LOG_LEVEL}"
-  },
+  }
+}
+EOF
+cat > /etc/xray/21_dns.json << EOF
+{
   "dns": {
     "tag": "dns-inbound",
     "hosts": {
@@ -953,10 +974,16 @@ cat > /etc/xray/config.json << EOF
       ]
     },
     "servers": [
+EOF
+if [ "$DNS_MODE" = "fake-ip" ]; then
+cat >> /etc/xray/21_dns.json << EOF
       {
         "tag": "fakeip",
         "address": "fakedns"
       },
+EOF
+fi
+cat >> /etc/xray/21_dns.json << EOF
       {
         "tag": "ParallelQuery",
         "address": "https://dns.google/dns-query"
@@ -976,7 +1003,12 @@ cat > /etc/xray/config.json << EOF
   "fakedns": {
     "ipPool": "${FAKE_IP_RANGE}",
     "poolSize": ${FAKE_POOL_SIZE}
-  },
+  }
+}
+EOF
+
+cat > /etc/xray/22_routing.json << EOF
+{
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
@@ -987,18 +1019,23 @@ cat > /etc/xray/config.json << EOF
       {
         "inboundTag": ["dns-in"],
         "outboundTag": "dns"
-      },
+      }
 EOF
+
 if [ "$QUIC_DROP" = "true" ]; then
-cat >> /etc/xray/config.json << EOF
+cat >> /etc/xray/22_routing.json << EOF
+      ,
       {
         "network": "udp",
         "port": "443",        
         "outboundTag": "block"
-      },
+      }
 EOF
+
 fi
-cat >> /etc/xray/config.json << EOF
+if [ "$DNS_MODE" = "fake-ip" ]; then
+cat >> /etc/xray/22_routing.json << EOF
+      ,
       {
         "inboundTag": ["all-in"],
         "ip": ["${FAKE_IP_RANGE}"],
@@ -1023,8 +1060,15 @@ cat >> /etc/xray/config.json << EOF
         "network": "udp",
         "outboundTag": "block"
       }
+EOF
+fi
+cat >> /etc/xray/22_routing.json << EOF
     ]
-  },
+  }
+}
+EOF
+cat > /etc/xray/23_inbounds.json << EOF
+{
   "inbounds": [
     {
         "tag": "dns-in",
@@ -1044,15 +1088,18 @@ cat >> /etc/xray/config.json << EOF
         "sniffing": {
             "enabled": true,
             "destOverride": [
+                "http",
+                "tls",
+                "quic",
                 "fakedns"
             ],
-            "metadataOnly": true,
+            "metadataOnly": false,
             "routeOnly": true
         }
     },
 EOF
 if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
-cat >> /etc/xray/config.json << EOF
+cat >> /etc/xray/23_inbounds.json << EOF
     {
       "tag": "all-in",
       "port": 12345,
@@ -1069,16 +1116,20 @@ cat >> /etc/xray/config.json << EOF
         "sniffing": {
             "enabled": true,
             "destOverride": [
+                "http",
+                "tls",
+                "quic",
                 "fakedns"
             ],
-            "metadataOnly": true,
+            "metadataOnly": false,
             "routeOnly": true
         }
     }
-  ],
+  ]
+}
 EOF
 else
-cat >> /etc/xray/config.json << EOF
+cat >> /etc/xray/23_inbounds.json << EOF
     {
       "tag": "all-in",
       "port": 12345,
@@ -1095,27 +1146,22 @@ cat >> /etc/xray/config.json << EOF
         "sniffing": {
             "enabled": true,
             "destOverride": [
+                "http",
+                "tls",
+                "quic",
                 "fakedns"
             ],
-            "metadataOnly": true,
+            "metadataOnly": false,
             "routeOnly": true
       }
     }
-  ],
+  ]
+}
 EOF
 fi
-cat >> /etc/xray/config.json << EOF
+cat >> /etc/xray/24_outbounds.json << EOF
+{
   "outbounds": [
-EOF
-if [ -f /etc/xray/mount/outbound.json ]; then
-    sed 's/^/    /' /etc/xray/mount/outbound.json >> /etc/xray/config.json
-    printf ',\n' >> /etc/xray/config.json
-fi
-if [ -f /etc/xray/outbound.json ]; then
-    sed 's/^/    /' /etc/xray/outbound.json >> /etc/xray/config.json
-    printf ',\n' >> /etc/xray/config.json
-fi
-cat >> /etc/xray/config.json << EOF
       {
         "tag": "direct",
         "protocol": "freedom",
@@ -1234,17 +1280,13 @@ run() {
     hs5t_file
     iptables_rules
   fi
-  if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then
-    echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
-  fi
   config_file_xray
   echo "Starting xray $(./xray --version)"
-  if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
-    exec ./xray -config /etc/xray/config.json
-  else
+  if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then
+    echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
     ./hs5t ./hs5t.yml &
-    exec ./xray -config /etc/xray/config.json
   fi
+    exec ./xray run -confdir /etc/xray
 }
 
 run || exit 1

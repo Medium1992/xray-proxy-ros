@@ -897,11 +897,14 @@ if [ "$SECURITY" = "reality" ] && [ "$REALITY_USED" = "true" ]; then
         printf '      "spiderX": "%s"' "$REALITY_SPIDER_X" >> /etc/xray/outbound.json
     fi
 
-    printf '\n    }' >> /etc/xray/outbound.json
+    printf '\n' >> /etc/xray/outbound.json
 fi
 
     cat >> /etc/xray/outbound.json <<EOF
-
+    },
+    "sockopt": {
+        "domainStrategy": "UseIPv4"
+    }
   },
   "mux": {
     "enabled": $MUX,

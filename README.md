@@ -16,7 +16,7 @@ Advantages:
 ## Description of ENVs
 
 | Variable             | Default                         | Description |
-|------------------------|-------------------------------------- -|---------|
+|------------------------|---------------------------------------|---------|
 | `LINK`                 | —                                     | Proxy link `vless://` or `vmess://` or `ss://` or `trojan://`. |
 | `LOG_LEVEL`            | `error`                               | `Xray` log level [DOCs](https://xtls.github.io/en/config/log.html#logobject). |
 | `DNS_MODE`             | `fake-ip`                             | If fake-ip is set, fakeip will be returned for each DNS request. Any value other than `fake-ip` will disable them and enable parallel DoH requests to Google, CloudFlare, and Quad9 with real IP domains returned. |

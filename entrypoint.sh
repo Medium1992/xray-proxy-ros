@@ -45,6 +45,8 @@ fi
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
+mkdir -p /etc/xray/
+
 first_iface() {
   ip -o link show | awk -F': ' '/link\/ether/ {print $2}' | cut -d'@' -f1 | head -n1
 }

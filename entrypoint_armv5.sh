@@ -456,10 +456,19 @@ parse() {
                 KCP_USED=true
                 ;;
             headerType)
-                KCP_HEADER_TYPE="$val"
-                RAW_HEADERTYPE="$val"
-                KCP_USED=true
+                case "$val" in
+                    ""|"\"\""|"none")
+                        RAW_HEADERTYPE="none"
+                        ;;
+                    *)
+                        RAW_HEADERTYPE="$val"
+                        ;;
+                esac
                 RAW_USED=true
+                if [ "$NETWORK" = "kcp" ]; then
+                    KCP_HEADER_TYPE="$RAW_HEADERTYPE"
+                    KCP_USED=true
+                fi
                 ;;
             headerDomain)
                 KCP_HEADER_DOMAIN="$(urldecode "$val")"

@@ -1,5 +1,6 @@
 #!/usr/bin/sh
 
+sleep 1
 echo 180  > /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream
 
 set -eu

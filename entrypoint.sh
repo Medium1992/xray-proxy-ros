@@ -240,7 +240,6 @@ parse() {
     TLS_SERVER_NAME=""
     TLS_ALPN=""
     TLS_FINGERPRINT=""
-    TLS_ALLOW_INSECURE=""
     TLS_VERIFY_NAMES=""
     TLS_PINNED_CERT=""
     TLS_DISABLE_SYSTEM_ROOT=""
@@ -528,21 +527,7 @@ parse() {
                 esac
                 [ -n "$TLS_ALLOW_INSECURE" ] && TLS_USED=true
                 ;;
-            allowInsecure)
-                case "$val" in
-                    1|true)
-                        TLS_ALLOW_INSECURE="true"
-                        ;;
-                    0|false)
-                        TLS_ALLOW_INSECURE="false"
-                        ;;
-                    *)
-                        TLS_ALLOW_INSECURE=""
-                        ;;
-                esac
-                [ -n "$TLS_ALLOW_INSECURE" ] && TLS_USED=true
-                ;;
-            verifyPeerCertInNames)
+            verifyPeerCertByName)
                 TLS_VERIFY_NAMES="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
@@ -719,9 +704,8 @@ if [ "$SECURITY" = "tls" ] && [ "$TLS_USED" = "true" ]; then
     fi
 
     [ -n "$TLS_FINGERPRINT" ] && add_tls && printf '      "fingerprint": "%s"' "$TLS_FINGERPRINT" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_ALLOW_INSECURE" ] && add_tls && printf '      "allowInsecure": %s' "$TLS_ALLOW_INSECURE" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertInNames": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertificateChainSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertByName": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
     [ -n "$TLS_DISABLE_SYSTEM_ROOT" ] && add_tls && printf '      "disableSystemRoot": %s' "$TLS_DISABLE_SYSTEM_ROOT" >> /etc/xray/25_outbound.json
     [ -n "$TLS_SESSION_RESUME" ] && add_tls && printf '      "enableSessionResumption": %s' "$TLS_SESSION_RESUME" >> /etc/xray/25_outbound.json
     [ -n "$TLS_MIN_VERSION" ] && add_tls && printf '      "minVersion": "%s"' "$TLS_MIN_VERSION" >> /etc/xray/25_outbound.json

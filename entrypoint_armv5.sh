@@ -11,7 +11,11 @@ set -eu
 TPROXY="${TPROXY:-true}"
 DNS_MODE="${DNS_MODE:-fake-ip}"
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
+LOG_ACCESS="${LOG_ACCESS:-}"
+LOG_ERROR="${LOG_ERROR:-}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
+LOG_DNS="${LOG_DNS:-false}"
+LOG_MASK="${LOG_MASK:-}"
 LINK="${LINK:-}"
 MUX="${MUX:-false}"
 MUX_CONCURRENCY="${MUX_CONCURRENCY:-8}"
@@ -153,7 +157,7 @@ parse() {
     LINK_NOPATH="${LINK_NOPATH#${PROTOCOL}://}"
     XRAY_PROTOCOL="$PROTOCOL"
     [ "$PROTOCOL" = "ss" ] && XRAY_PROTOCOL="shadowsocks"
-
+    [ "$PROTOCOL" = "hy2" ] && XRAY_PROTOCOL="hysteria"
     if [ "$PROTOCOL" != "vmess" ]; then
         CREDS="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f1)"
         REST="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f2)"
@@ -221,10 +225,14 @@ parse() {
     HTTPUP_HEADERS=""
     HTTPUP_USED=false
 
+    HY2_AUTH=""
+    HY2_OBFS=""
+    HY2_OBFS_PASSWORD=""
+    HY2_USED=false
+
     TLS_SERVER_NAME=""
     TLS_ALPN=""
     TLS_FINGERPRINT=""
-    TLS_ALLOW_INSECURE=""
     TLS_VERIFY_NAMES=""
     TLS_PINNED_CERT=""
     TLS_DISABLE_SYSTEM_ROOT=""
@@ -265,6 +273,10 @@ parse() {
 
             METHOD="$(printf '%s' "$SS_DECODED" | cut -d':' -f1)"
             PASSWORD="$(printf '%s' "$SS_DECODED" | cut -d':' -f2-)"
+            ;;
+        hy2)
+            HY2_AUTH="$CREDS"
+            HY2_USED=true
             ;;
     esac
 
@@ -481,10 +493,19 @@ parse() {
                 KCP_HEADER_DOMAIN="$(urldecode "$val")"
                 KCP_USED=true
                 ;;
+            obfs)
+                HY2_OBFS="$val"
+                ;;
+            obfs-password)
+                HY2_OBFS_PASSWORD="$(urldecode "$val")"
+                ;;
             sni)
                 DECODED_SNI="$(urldecode "$val")"
                 TLS_SERVER_NAME="$DECODED_SNI"
-                REALITY_SERVER_NAME="$DECODED_SNI"                
+                REALITY_SERVER_NAME="$DECODED_SNI"
+                if [ "$HY2_USED" = "true" ]; then
+                SECURITY="tls"
+                fi         
                 TLS_USED=true
                 REALITY_USED=true
                 ;;
@@ -512,21 +533,7 @@ parse() {
                 esac
                 [ -n "$TLS_ALLOW_INSECURE" ] && TLS_USED=true
                 ;;
-            allowInsecure)
-                case "$val" in
-                    1|true)
-                        TLS_ALLOW_INSECURE="true"
-                        ;;
-                    0|false)
-                        TLS_ALLOW_INSECURE="false"
-                        ;;
-                    *)
-                        TLS_ALLOW_INSECURE=""
-                        ;;
-                esac
-                [ -n "$TLS_ALLOW_INSECURE" ] && TLS_USED=true
-                ;;
-            verifyPeerCertInNames)
+            verifyPeerCertByName)
                 TLS_VERIFY_NAMES="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
@@ -593,6 +600,9 @@ parse() {
     case "$NETWORK" in
         tcp|"")
             NETWORK="raw"
+            ;;
+        hy2)
+            NETWORK="hysteria"
             ;;
     esac
 
@@ -663,10 +673,16 @@ cat >> /etc/xray/25_outbound.json <<EOF
     "UoTVersion": 2,
     "level": $SS_LEVEL
 EOF
-
     if [ -n "$EMAIL" ]; then
         printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/25_outbound.json
     fi
+    ;;
+    hy2)
+cat >> /etc/xray/25_outbound.json <<EOF
+    "version": 2,
+    "address": "$ADDRESS",
+    "port": $PORT
+EOF
     ;;
 esac
 cat >> /etc/xray/25_outbound.json <<EOF
@@ -678,6 +694,7 @@ cat >> /etc/xray/25_outbound.json <<EOF
     "network": "$NETWORK",
     "security": "$SECURITY",
 EOF
+
 if [ "$SECURITY" = "tls" ] && [ "$TLS_USED" = "true" ]; then
     printf '\n    "tlsSettings": {\n' >> /etc/xray/25_outbound.json
     FIRST=true
@@ -703,9 +720,8 @@ if [ "$SECURITY" = "tls" ] && [ "$TLS_USED" = "true" ]; then
     fi
 
     [ -n "$TLS_FINGERPRINT" ] && add_tls && printf '      "fingerprint": "%s"' "$TLS_FINGERPRINT" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_ALLOW_INSECURE" ] && add_tls && printf '      "allowInsecure": %s' "$TLS_ALLOW_INSECURE" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertInNames": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertificateChainSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertByName": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
+    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
     [ -n "$TLS_DISABLE_SYSTEM_ROOT" ] && add_tls && printf '      "disableSystemRoot": %s' "$TLS_DISABLE_SYSTEM_ROOT" >> /etc/xray/25_outbound.json
     [ -n "$TLS_SESSION_RESUME" ] && add_tls && printf '      "enableSessionResumption": %s' "$TLS_SESSION_RESUME" >> /etc/xray/25_outbound.json
     [ -n "$TLS_MIN_VERSION" ] && add_tls && printf '      "minVersion": "%s"' "$TLS_MIN_VERSION" >> /etc/xray/25_outbound.json
@@ -914,6 +930,33 @@ if [ "$NETWORK" = "httpupgrade" ] && [ "$HTTPUP_USED" = "true" ]; then
 
     printf '\n    },' >> /etc/xray/25_outbound.json
 fi
+
+if [ "$PROTOCOL" = "hy2" ]; then
+printf '\n' >> /etc/xray/25_outbound.json
+cat >> /etc/xray/25_outbound.json <<EOF
+    "hysteriaSettings": {
+      "version": 2,
+      "auth": "$HY2_AUTH"
+    }
+EOF
+
+if [ -n "$HY2_OBFS" ]; then
+cat >> /etc/xray/25_outbound.json <<EOF
+    ,
+    "finalmask": {
+      "udp": [
+        {
+          "type": "$HY2_OBFS",
+          "settings": {
+            "password": "$HY2_OBFS_PASSWORD"
+          }
+        }
+      ]
+    },
+EOF
+fi
+fi
+
     printf '\n' >> /etc/xray/25_outbound.json
     cat >> /etc/xray/25_outbound.json <<EOF
     "sockopt": {
@@ -938,7 +981,7 @@ LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(printf '%s' "$LINK" | cut -d':' -f1)"
 
 case "$SCHEME" in
-    vless|vmess|trojan|ss)
+    vless|vmess|trojan|ss|hy2)
         parse "$LINK"
         ;;
     *)
@@ -950,7 +993,11 @@ config_file_xray() {
 cat > /etc/xray/20_log.json << EOF
 {
   "log": {
-    "loglevel": "${LOG_LEVEL}"
+    "access": "${LOG_ACCESS}",
+    "error": "${LOG_ERROR}",
+    "loglevel": "${LOG_LEVEL}",
+    "dnsLog": ${LOG_DNS},
+    "maskAddress": "${LOG_MASK}"
   }
 }
 EOF
@@ -1095,16 +1142,16 @@ cat > /etc/xray/23_inbounds.json << EOF
             "metadataOnly": false,
             "routeOnly": true
         }
-    },
+    },   
 EOF
 if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
 cat >> /etc/xray/23_inbounds.json << EOF
     {
-      "tag": "all-in",
-      "port": 12345,
+      "tag": "all-in-udp",
+      "port": 12346,
       "protocol": "dokodemo-door",
       "settings": {
-        "network": "tcp,udp",
+        "network": "udp",
         "followRedirect": true
       },
       "streamSettings": {
@@ -1123,14 +1170,35 @@ cat >> /etc/xray/23_inbounds.json << EOF
             "metadataOnly": false,
             "routeOnly": true
         }
-    }
-  ]
-}
+    },
 EOF
 else
 cat >> /etc/xray/23_inbounds.json << EOF
     {
-      "tag": "all-in",
+      "tag": "XrayTUN",
+      "port": 0,
+      "protocol": "tun",
+      "settings": {
+        "name": "Xray",
+        "MTU": 1500
+      },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": [
+                "http",
+                "tls",
+                "quic",
+                "fakedns"
+            ],
+            "metadataOnly": false,
+            "routeOnly": true
+        }
+    },
+EOF
+fi
+cat >> /etc/xray/23_inbounds.json << EOF
+    {
+      "tag": "all-in-tcp",
       "port": 12345,
       "protocol": "dokodemo-door",
       "settings": {
@@ -1157,8 +1225,8 @@ cat >> /etc/xray/23_inbounds.json << EOF
   ]
 }
 EOF
-fi
-cat >> /etc/xray/24_outbounds.json << EOF
+
+cat > /etc/xray/24_outbounds.json << EOF
 {
   "outbounds": [
       {
@@ -1198,28 +1266,43 @@ EOF
 nft_rules() {
   echo "Applying nftables..."
   nft flush ruleset || true
-  if [ "${TPROXY}" = "true" ]; then
-    nft create table inet xray
-    nft add chain inet xray pre "{type filter hook prerouting priority filter; policy accept;}"
-    nft add rule inet xray pre tcp option mptcp exists drop
-    nft add rule inet xray pre ip daddr ${FAKE_IP_RANGE} meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
-    nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
-    nft add rule inet xray pre meta l4proto { tcp, udp } iifname "$iface" meta mark set 0x00000001 tproxy ip to 127.0.0.1:12345 accept
-    nft add chain inet xray divert "{type filter hook prerouting priority mangle; policy accept;}"
-    nft add rule inet xray divert meta l4proto tcp socket transparent 1 meta mark set 0x00000001 accept
-    ip rule show | grep -q 'fwmark 0x00000001 lookup 100' || ip rule add fwmark 1 table 100
-    ip route replace local 0.0.0.0/0 dev lo table 100
-    echo "Mode inbound TProxy(tcp,udp) interface $iface"
-  else
-    nft create table inet xray
-    nft add chain inet xray pre "{type nat hook prerouting priority -99; policy accept;}"
-    nft add rule inet xray pre meta iifname != "$iface" return 
-    nft add rule inet xray pre meta l4proto { tcp, udp } th dport 53 iifname "$iface" return
-    nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 100.64.0.1, 224.0.0.0/4, 255.255.255.255 } return
-    nft add rule inet xray pre tcp option mptcp exists drop
-    nft add rule inet xray pre meta nfproto ipv4 meta l4proto tcp redirect to 12345
-    echo "Mode inbound Redirect(tcp)+TUN(udp) interface $iface"
-  fi
+if [ "${TPROXY}" = "true" ]; then
+  nft create table inet xray
+  nft add chain inet xray pre_nat "{type nat hook prerouting priority dstnat + 1; policy accept;}"
+  nft add rule inet xray pre_nat meta iifname != "$iface" return
+  nft add rule inet xray pre_nat tcp option mptcp exists drop
+  nft add rule inet xray pre_nat ip daddr ${FAKE_IP_RANGE} meta l4proto tcp redirect to 12345
+  nft add rule inet xray pre_nat ip daddr { $iface_cidr, 127.0.0.0/8, 100.64.0.1/32, 224.0.0.0/4, 255.255.255.255 } return
+  nft add rule inet xray pre_nat meta l4proto tcp redirect to 12345
+  nft add chain inet xray pre_filter "{type filter hook prerouting priority filter + 1; policy accept;}"
+  nft add rule inet xray pre_filter meta iifname != "$iface" return 
+  nft add rule inet xray pre_filter tcp option mptcp exists drop
+  nft add rule inet xray pre_filter ip daddr ${FAKE_IP_RANGE} meta l4proto udp meta mark set 0x00000001 tproxy ip to 127.0.0.1:12346 accept
+  nft add rule inet xray pre_filter ip daddr { $iface_cidr, 127.0.0.0/8, 224.0.0.0/4, 255.255.255.255 } return
+  nft add rule inet xray pre_filter meta l4proto udp meta mark set 0x00000001 tproxy ip to 127.0.0.1:12346 accept
+  ip rule show | grep -q 'fwmark 0x00000001 lookup 100' || ip rule add fwmark 1 table 100
+  ip route replace local 0.0.0.0/0 dev lo table 100
+  echo "Mode inbound Redirect(tcp)+TProxy(udp) interface $iface"
+else
+  nft create table inet xray
+  nft add chain inet xray pre "{type nat hook prerouting priority dstnat + 1; policy accept;}"
+  nft add rule inet xray pre meta iifname != "$iface" return
+  nft add rule inet xray pre tcp option mptcp exists drop
+  nft add rule inet xray pre ip daddr ${FAKE_IP_RANGE} meta l4proto tcp redirect to 12345
+  nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 100.64.0.1/32, 224.0.0.0/4, 255.255.255.255 } return
+  nft add rule inet xray pre meta l4proto tcp redirect to 12345
+  nft add table nat
+  nft add chain nat output '{ type nat hook output priority dstnat + 1; policy accept;}'
+  nft add rule nat output meta l4proto tcp oifname "Xray" redirect to 12345
+  ip rule show | grep -q 'iif $iface ipproto tcp lookup main' || ip rule add iif $iface ipproto tcp lookup main priority 10000
+  ip rule show | grep -q 'to $iface_cidr lookup main' || ip rule add to $iface_cidr lookup main priority 10001
+  ip rule show | grep -q 'to 127.0.0.0/8 lookup main' || ip rule add to 127.0.0.0/8 lookup main priority 10002
+  ip rule show | grep -q 'to 224.0.0.0/4 lookup main' || ip rule add to 224.0.0.0/4 lookup main priority 10003
+  ip rule show | grep -q 'to 255.255.255.255 lookup main' || ip rule add to 255.255.255.255 lookup main priority 10004
+  ip rule show | grep -q 'iif $iface ipproto udp lookup 110' || ip rule add iif $iface ipproto udp lookup 110 priority 10005
+  ip route replace default via 100.64.0.1 dev Xray table 110
+  echo "Mode inbound Redirect(tcp)+TUN(udp) interface $iface"
+fi
 }
 
 iptables_rules() {
@@ -1233,59 +1316,65 @@ iptables_rules() {
   iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j RETURN
   iptables -t nat -A PREROUTING -m addrtype ! --dst-type UNICAST -j RETURN
   iptables -t nat -A PREROUTING -i $iface -p tcp -j REDIRECT --to-ports 12345
-}
-
-config_file() {
-  cat > /hs5t.yml << EOF
-misc:
-  log-level: 'error'
-tunnel:
-  name: hs5t
-  mtu: 1500
-  ipv4: 100.64.0.1
-  multi-queue: true
-  post-up-script: '/hs5t.sh'
-socks5:
-  address: '127.0.0.1'
-  port: 1080
-  udp: 'udp'
-EOF
-}
-
-hs5t_file() {
-  cat > /hs5t.sh << EOF
-#!/usr/bin/sh
-ip rule show | grep -q 'iif $iface ipproto tcp lookup main' || ip rule add iif $iface ipproto tcp lookup main priority 10000
-ip rule show | grep -q 'to $iface_cidr lookup main' || ip rule add to $iface_cidr lookup main priority 10001
-ip rule show | grep -q 'to 127.0.0.0/8 lookup main' || ip rule add to 127.0.0.0/8 lookup main priority 10002
-ip rule show | grep -q 'to 224.0.0.0/4 lookup main' || ip rule add to 224.0.0.0/4 lookup main priority 10003
-ip rule show | grep -q 'to 255.255.255.255 lookup main' || ip rule add to 255.255.255.255 lookup main priority 10004
-ip rule show | grep -q 'iif $iface ipproto udp lookup 110' || ip rule add iif $iface ipproto udp lookup 110 priority 10005
-ip route replace default via 100.64.0.1 dev hs5t table 110
-EOF
-chmod +x /hs5t.sh
+  ip rule show | grep -q 'iif $iface ipproto tcp lookup main' || ip rule add iif $iface ipproto tcp lookup main priority 10000
+  ip rule show | grep -q 'to $iface_cidr lookup main' || ip rule add to $iface_cidr lookup main priority 10001
+  ip rule show | grep -q 'to 127.0.0.0/8 lookup main' || ip rule add to 127.0.0.0/8 lookup main priority 10002
+  ip rule show | grep -q 'to 224.0.0.0/4 lookup main' || ip rule add to 224.0.0.0/4 lookup main priority 10003
+  ip rule show | grep -q 'to 255.255.255.255 lookup main' || ip rule add to 255.255.255.255 lookup main priority 10004
+  ip rule show | grep -q 'iif $iface ipproto udp lookup 110' || ip rule add iif $iface ipproto udp lookup 110 priority 10005
+  ip route replace default via 100.64.0.1 dev Xray table 110
+  echo "Mode inbound Redirect(tcp)+TUN(udp) interface $iface"  
 }
 
 # ------------------- RUN -------------------
-run() {
-  if [ "$USE_NFT" = "true" ]; then
-    nft_rules
-    if [ "${TPROXY}" = "false" ]; then
-      config_file
-      hs5t_file
+wait_for_tun() {
+  for i in $(seq 1 50); do
+    if ip link show Xray >/dev/null 2>&1; then
+      return 0
     fi
-  else
-    config_file
-    hs5t_file
-    iptables_rules
-  fi
+    sleep 0.1
+  done
+
+  echo "tun interface not created"
+  return 1
+}
+
+run() {
+
+  UNSPEC_PREF=$(ip rule show | awk '/lookup unspec/ {print $1}' | tr -d :)
+  LOCAL_PREF=$(ip rule show | awk '/lookup local/ {print $1}' | tr -d :)
+  MAIN_PREF=$(ip rule show | awk '/lookup main/ {print $1}' | tr -d :)
+  DEFAULT_PREF=$(ip rule show | awk '/lookup default/ {print $1}' | tr -d :)
+
+  [ -n "$UNSPEC_PREF" ] && ip rule del pref $UNSPEC_PREF
+  ip rule del pref $LOCAL_PREF 2>/dev/null || true
+  ip rule del pref $MAIN_PREF 2>/dev/null || true
+  ip rule del pref $DEFAULT_PREF 2>/dev/null || true
+
+  ip rule add pref 0 lookup local
+  ip rule add pref 32766 lookup main
+  ip rule add pref 32767 lookup default
+
   config_file_xray
+
   echo "Starting xray $(./xray --version)"
+
+  ./xray run -confdir /etc/xray &
+  XRAY_PID=$!
+
   if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then
-    echo "Starting hev-socks5-tunnel $(./hs5t --version | head -n 2 | tail -n 1)"
-    ./hs5t ./hs5t.yml &
+  wait_for_tun
+  ip addr add 100.64.0.1/32 dev Xray
+  ip link set Xray up
   fi
-    exec ./xray run -confdir /etc/xray
+
+  if [ "$USE_NFT" = "true" ]; then
+      nft_rules
+  else
+      iptables_rules
+  fi
+
+  wait $XRAY_PID
 }
 
 run || exit 1

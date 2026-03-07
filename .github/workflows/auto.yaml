@@ -35,9 +35,7 @@ jobs:
         id: latest_versions
         run: |
           XRAY=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')
-          HS5T=$(curl -s https://api.github.com/repos/heiher/hev-socks5-tunnel/releases/latest | jq -r '.tag_name')
           echo "xray=$XRAY" >> $GITHUB_ENV
-          echo "hev_socks5_tunnel=$HS5T" >> $GITHUB_ENV
       
       - name: Compare with VERSIONS
         id: check_versions
@@ -66,7 +64,6 @@ jobs:
         if: steps.check_versions.outputs.build_needed == 'true'
         run: |
           echo "xray=${{ env.xray }}" > VERSIONS
-          echo "hev_socks5_tunnel=${{ env.hev_socks5_tunnel }}" >> VERSIONS
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -103,10 +100,8 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
           push: true
           tags: |
-            ghcr.io/medium1992/xray-proxy-ros:${{ env.xray }}-${{ env.hev_socks5_tunnel }}
             ghcr.io/medium1992/xray-proxy-ros:${{ env.xray }}
             ghcr.io/medium1992/xray-proxy-ros:latest
-            medium1992/xray-proxy-ros:${{ env.xray }}-${{ env.hev_socks5_tunnel }}
             medium1992/xray-proxy-ros:${{ env.xray }}
             medium1992/xray-proxy-ros:latest
           

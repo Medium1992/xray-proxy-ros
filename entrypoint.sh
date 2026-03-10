@@ -1362,11 +1362,13 @@ wait_for_tun() {
 run() {
 
   UNSPEC_PREF=$(ip rule show | awk '/lookup unspec/ {print $1}' | tr -d :)
+  MASQUERADE_PREF=$(ip rule show | awk '/lookup masquerade/ {print $1}' | tr -d :)
   LOCAL_PREF=$(ip rule show | awk '/lookup local/ {print $1}' | tr -d :)
   MAIN_PREF=$(ip rule show | awk '/lookup main/ {print $1}' | tr -d :)
   DEFAULT_PREF=$(ip rule show | awk '/lookup default/ {print $1}' | tr -d :)
 
   [ -n "$UNSPEC_PREF" ] && ip rule del pref $UNSPEC_PREF
+  [ -n "$MASQUERADE_PREF" ] && ip rule del pref $MASQUERADE_PREF
   ip rule del pref $LOCAL_PREF 2>/dev/null || true
   ip rule del pref $MAIN_PREF 2>/dev/null || true
   ip rule del pref $DEFAULT_PREF 2>/dev/null || true

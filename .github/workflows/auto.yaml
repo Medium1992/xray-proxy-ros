@@ -29,7 +29,7 @@ jobs:
           crane version || { echo "Crane failed to install"; exit 1; }
 
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         
       - name: Get latest versions
         id: latest_versions
@@ -66,11 +66,11 @@ jobs:
           echo "xray=${{ env.xray }}" > VERSIONS
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         if: steps.check_versions.outputs.build_needed == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           driver-opts: |
@@ -79,21 +79,21 @@ jobs:
 
       - name: Login to GitHub Container Registry
         if: steps.check_versions.outputs.build_needed == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push multi-arch
         if: steps.check_versions.outputs.build_needed == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./
           file: ./Dockerfile

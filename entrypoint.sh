@@ -1275,13 +1275,16 @@ cat > /etc/xray/24_outbounds.json << EOF
         "settings": {
           "rules": [
             {
-              "action": "hijack",
-              "qType": 1
+              "qType": 1,
+              "action": "hijack"
             },
             {
-              "action": "return",
-              "qType": 65,28
-              "rCode": 5
+              "qType": [
+                65,
+                28
+              ],
+              "rCode": 5,
+              "action": "return"
             }
           ]
         }

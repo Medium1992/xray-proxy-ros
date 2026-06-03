@@ -1253,8 +1253,17 @@ cat > /etc/xray/24_outbounds.json << EOF
         "tag": "dns",
         "protocol": "dns",
         "settings": {
-          "nonIPQuery": "reject",
-          "blockTypes": [65,28]
+          "rules": [
+            {
+              "action": "hijack",
+              "qType": 1
+            },
+            {
+              "action": "return",
+              "qType": 65,28
+              "rCode": 5
+            }
+          ]
         }
       }
   ]

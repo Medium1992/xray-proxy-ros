@@ -133,30 +133,6 @@ jobs:
             medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
             medium1992/xray-proxy-ros:alpha
 
-      - name: Replace alpha release
-        run: |
-          mkdir -p release
-          echo "${{ needs.alpha-check.outputs.tag }}" > release/version.txt
-
-          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/alpha --jq '.id' 2>/dev/null || true)
-          if [ -n "$RELEASE_ID" ]; then
-            gh api -X DELETE repos/${{ github.repository }}/releases/$RELEASE_ID
-          fi
-
-          TAG_REF=$(gh api repos/${{ github.repository }}/git/refs/tags/alpha --jq '.ref' 2>/dev/null || true)
-          if [ -n "$TAG_REF" ]; then
-            gh api -X DELETE repos/${{ github.repository }}/git/refs/tags/alpha
-          fi
-
-      - name: Create alpha release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: alpha
-          name: Xray Proxy ROS Alpha ${{ needs.alpha-check.outputs.tag }}
-          prerelease: true
-          make_latest: false
-          files: release/*
-
       - name: Commit and push VERSIONS_ALPHA
         run: |
           git config --global user.name 'github-actions[bot]'

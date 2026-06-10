@@ -16,7 +16,22 @@ graceful_shutdown() {
 trap graceful_shutdown TERM INT
 
 sleep 1
-echo 180  > /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream >/dev/null 2>&1;
+
+set_kernel_param() {
+  [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null || true
+}
+
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 86400
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent 5
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv 5
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_unacknowledged 300
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream 180
+
 for iface in $(ip -o link show up | awk -F': ' '/link\/ether/ {gsub(/@.*$/,"",$2); if($2!="lo") print $2}'); do
 tc qdisc add dev $iface root fq_codel >/dev/null 2>&1;
 ip link set dev $iface multicast off >/dev/null 2>&1;
@@ -67,7 +82,22 @@ else
   fi
 fi
 
-mkdir -p /etc/xray/
+mkdir -p /etc/xray/ /dev/shm
+
+install_config_if_changed() {
+    src="$1"
+    dest="$2"
+
+    if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+        rm -f "$src"
+    else
+        mv "$src" "$dest"
+    fi
+}
+
+remove_config_if_exists() {
+    [ -e "$1" ] && rm -f "$1"
+}
 
 first_iface() {
   ip -o link show | awk -F': ' '/link\/ether/ {print $2}' | cut -d'@' -f1 | head -n1
@@ -893,6 +923,7 @@ parse() {
     WG_KEEPALIVE="$(int_or_default "$WG_KEEPALIVE" 0)"
     WG_WORKERS="$(int_or_default "$WG_WORKERS" 0)"
 
+    tmp="$(mktemp /dev/shm/xray-25_outbound.XXXXXX)"
     jq -n \
       --arg protocol "$PROTOCOL" \
       --arg xray_protocol "$XRAY_PROTOCOL" \
@@ -1044,10 +1075,9 @@ parse() {
           | if ($protocol == "hy2" or $protocol == "hysteria2") then . + {hysteriaSettings:{version:2, auth:$hy2_auth}} else . end
           | . + {sockopt:{domainStrategy:"ForceIPv4"}});
       {outbounds:[{tag:"XrayProxyRoS", protocol:$xray_protocol, settings:base_settings, streamSettings:stream_settings, mux:{enabled:$mux_enabled, concurrency:$mux_concurrency, xudpConcurrency:$mux_xudp_concurrency, xudpProxyUDP443:$mux_xudp_proxy_udp443}}]}
-      ' > /etc/xray/25_outbound.json
+      ' > "$tmp"
+    install_config_if_changed "$tmp" /etc/xray/25_outbound.json
 }
-
-rm -f "/etc/xray/25_outbound.json"
 
 LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(tolower "$(printf '%s' "$LINK" | cut -d':' -f1)")"
@@ -1056,7 +1086,11 @@ case "$SCHEME" in
     vless|vmess|trojan|ss|hy2|hysteria2|wireguard|wg)
         parse "$LINK"
         ;;
+    "")
+        remove_config_if_exists /etc/xray/25_outbound.json
+        ;;
     *)
+        remove_config_if_exists /etc/xray/25_outbound.json
         echo "Invalid or unsupported link: $SCHEME" >&2
         ;;
 esac
@@ -1071,6 +1105,7 @@ config_file_xray() {
   UDP_TPROXY_ENABLED=false
   [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ] && UDP_TPROXY_ENABLED=true
 
+  tmp="$(mktemp /dev/shm/xray-20_log.XXXXXX)"
   jq -n \
     --arg access "$LOG_ACCESS" \
     --arg error "$LOG_ERROR" \
@@ -1078,8 +1113,10 @@ config_file_xray() {
     --arg mask "$LOG_MASK" \
     --argjson dns_log "$LOG_DNS_JSON" \
     '{log:{access:$access,error:$error,loglevel:$level,dnsLog:$dns_log,maskAddress:$mask}}' \
-    > /etc/xray/20_log.json
+    > "$tmp"
+  install_config_if_changed "$tmp" /etc/xray/20_log.json
 
+  tmp="$(mktemp /dev/shm/xray-21_dns.XXXXXX)"
   jq -n \
     --arg fake_ip_range "$FAKE_IP_RANGE" \
     --argjson fake_pool_size "$FAKE_POOL_SIZE" \
@@ -1105,8 +1142,10 @@ config_file_xray() {
       },
       fakedns:{ipPool:$fake_ip_range,poolSize:$fake_pool_size}
     }' \
-    > /etc/xray/21_dns.json
+    > "$tmp"
+  install_config_if_changed "$tmp" /etc/xray/21_dns.json
 
+  tmp="$(mktemp /dev/shm/xray-22_routing.XXXXXX)"
   jq -n \
     --arg fake_ip_range "$FAKE_IP_RANGE" \
     --argjson fake_ip_enabled "$FAKE_IP_ENABLED" \
@@ -1134,8 +1173,10 @@ config_file_xray() {
         )
       }
     }' \
-    > /etc/xray/22_routing.json
+    > "$tmp"
+  install_config_if_changed "$tmp" /etc/xray/22_routing.json
 
+  tmp="$(mktemp /dev/shm/xray-23_inbounds.XXXXXX)"
   jq -n \
     --argjson udp_tproxy_enabled "$UDP_TPROXY_ENABLED" '
     def sniffing: {
@@ -1187,8 +1228,10 @@ config_file_xray() {
         }
       ]
     }' \
-    > /etc/xray/23_inbounds.json
+    > "$tmp"
+  install_config_if_changed "$tmp" /etc/xray/23_inbounds.json
 
+  tmp="$(mktemp /dev/shm/xray-24_outbounds.XXXXXX)"
   jq -n '
     {
       outbounds:[
@@ -1198,7 +1241,8 @@ config_file_xray() {
         {tag:"dns",protocol:"dns",settings:{rules:[{qType:[65,28],rCode:5,action:"return"}]}}
       ]
     }' \
-    > /etc/xray/24_outbounds.json
+    > "$tmp"
+  install_config_if_changed "$tmp" /etc/xray/24_outbounds.json
 }
 
 # ------------------- NFT -------------------

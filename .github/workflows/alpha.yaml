@@ -1,8 +1,8 @@
-name: Build and Publish
+name: Build and Publish Alpha
 
 on:
   schedule:
-    - cron: "0 20 * * *" # 20:00 UTC
+    - cron: "0 18 * * *" # 18:00 UTC
   workflow_dispatch:
 
 concurrency:
@@ -10,7 +10,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check-and-build:
+  alpha-check:
+    runs-on: ubuntu-latest
+    outputs:
+      build_needed: ${{ steps.compare.outputs.build_needed }}
+      tag: ${{ steps.upstream.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get latest Xray prerelease
+        id: upstream
+        run: |
+          RELEASES_JSON=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100)
+          TAG=$(echo "$RELEASES_JSON" | jq -r '[.[] | select(.prerelease == true and .draft == false)][0].tag_name // empty')
+
+          if [ -z "$TAG" ]; then
+            echo "No Xray-core prerelease found"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest Xray prerelease: $TAG"
+
+      - name: Compare with VERSIONS_ALPHA
+        id: compare
+        run: |
+          TARGET="${{ steps.upstream.outputs.tag }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run -> force build"
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -f VERSIONS_ALPHA ]; then
+            echo "No VERSIONS_ALPHA file, need build"
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(sed -n 's/^xray=//p' VERSIONS_ALPHA | head -n1)
+          echo "target: $TARGET"
+          echo "current: ${CURRENT:-none}"
+
+          if [ "$TARGET" = "$CURRENT" ]; then
+            echo "Already latest alpha"
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New alpha detected"
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  alpha-build:
+    needs: alpha-check
+    if: needs.alpha-check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -24,6 +78,8 @@ jobs:
       DELETE_UNTAGGED: "true"
 
     steps:
+      - uses: actions/checkout@v6
+
       - name: Install jq and crane
         run: |
           sudo apt-get update
@@ -32,42 +88,9 @@ jobs:
           chmod +x /usr/local/bin/crane
           crane version || { echo "Crane failed to install"; exit 1; }
 
-      - name: Checkout code
-        uses: actions/checkout@v6
-        
-      - name: Get latest versions
-        id: latest_versions
+      - name: Update VERSIONS_ALPHA
         run: |
-          XRAY=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')
-          echo "xray=$XRAY" >> $GITHUB_ENV
-      
-      - name: Compare with VERSIONS
-        id: check_versions
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run → force build"
-            echo "build_needed=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          if [ ! -f VERSIONS ]; then
-            echo "No VERSIONS file, need build"
-            echo "build_needed=true" >> $GITHUB_OUTPUT
-          else
-            NEED_BUILD=false
-            while IFS='=' read -r name version; do
-              LATEST=${!name}
-              if [ "$LATEST" != "$version" ]; then
-                NEED_BUILD=true
-                break
-              fi
-            done < VERSIONS
-            echo "build_needed=$NEED_BUILD" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Update VERSIONS
-        if: steps.check_versions.outputs.build_needed == 'true'
-        run: |
-          echo "xray=${{ env.xray }}" > VERSIONS
+          echo "xray=${{ needs.alpha-check.outputs.tag }}" > VERSIONS_ALPHA
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -75,7 +98,6 @@ jobs:
           cache-image: false
 
       - name: Set up Docker Buildx
-        if: steps.check_versions.outputs.build_needed == 'true'
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
@@ -84,7 +106,6 @@ jobs:
             network=host
 
       - name: Login to GitHub Container Registry
-        if: steps.check_versions.outputs.build_needed == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -97,8 +118,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push multi-arch
-        if: steps.check_versions.outputs.build_needed == 'true'
+      - name: Build and push alpha multi-arch
         uses: docker/build-push-action@v7
         with:
           context: ./
@@ -106,117 +126,49 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
           push: true
           build-args: |
-            XRAY_RELEASE_TAG=${{ env.xray }}
+            XRAY_RELEASE_TAG=${{ needs.alpha-check.outputs.tag }}
           tags: |
-            ghcr.io/medium1992/xray-proxy-ros:${{ env.xray }}
-            ghcr.io/medium1992/xray-proxy-ros:latest
-            medium1992/xray-proxy-ros:${{ env.xray }}
-            medium1992/xray-proxy-ros:latest
+            ghcr.io/medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
+            ghcr.io/medium1992/xray-proxy-ros:alpha
+            medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
+            medium1992/xray-proxy-ros:alpha
 
-      - name: Publish container archives to Telegram
-        if: steps.check_versions.outputs.build_needed == 'true'
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-          IMAGE_REPO: medium1992/xray-proxy-ros
+      - name: Replace alpha release
         run: |
-          set -euo pipefail
+          mkdir -p release
+          echo "${{ needs.alpha-check.outputs.tag }}" > release/version.txt
 
-          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
-            echo "Telegram secrets are not configured, skipping Telegram publish."
-            exit 0
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/alpha --jq '.id' 2>/dev/null || true)
+          if [ -n "$RELEASE_ID" ]; then
+            gh api -X DELETE repos/${{ github.repository }}/releases/$RELEASE_ID
           fi
 
-          telegram_api() {
-            local method="$1"
-            shift
-
-            response=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}" "$@")
-            echo "$response" | grep -q '"ok":true' || {
-              echo "Telegram API call failed:"
-              echo "$response"
-              exit 1
-            }
-          }
-
-          retry() {
-            local attempt
-            for attempt in 1 2 3 4 5; do
-              "$@" && return 0
-              echo "Attempt ${attempt} failed, retrying..."
-              sleep 10
-            done
-            "$@"
-          }
-
-          thread_data_args=()
-          thread_form_args=()
-          if [ -n "${TELEGRAM_THREAD_ID}" ]; then
-            thread_data_args=(-d "message_thread_id=${TELEGRAM_THREAD_ID}")
-            thread_form_args=(-F "message_thread_id=${TELEGRAM_THREAD_ID}")
+          TAG_REF=$(gh api repos/${{ github.repository }}/git/refs/tags/alpha --jq '.ref' 2>/dev/null || true)
+          if [ -n "$TAG_REF" ]; then
+            gh api -X DELETE repos/${{ github.repository }}/git/refs/tags/alpha
           fi
 
-          mkdir -p telegram-images
+      - name: Create alpha release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: alpha
+          name: Xray Proxy ROS Alpha ${{ needs.alpha-check.outputs.tag }}
+          prerelease: true
+          make_latest: false
+          files: release/*
 
-          export_image() {
-            local name="$1"
-            local platform="$2"
-            local image="$3"
-            local file="telegram-images/xray-proxy-ros-${name}-${xray}.tar.gz"
-
-            retry docker pull --platform "${platform}" "${image}"
-            docker save "${image}" | gzip -9 > "${file}"
-            docker image rm "${image}" || true
-          }
-
-          export_image "amd64" "linux/amd64" "${IMAGE_REPO}:${xray}"
-          export_image "arm64" "linux/arm64" "${IMAGE_REPO}:${xray}"
-          export_image "armv7" "linux/arm/v7" "${IMAGE_REPO}:${xray}"
-          export_image "armv5" "linux/arm/v5" "${IMAGE_REPO}:${xray}"
-
-          sha256sum telegram-images/*.tar.gz > telegram-images/sha256sums.txt
-
-          files_list=$(find telegram-images -maxdepth 1 -name '*.tar.gz' -type f -printf '%f\n' | sort)
-          message=$(printf 'Xray Proxy ROS container images\n\nxray: %s\n\nDocker Hub: https://hub.docker.com/r/%s\n\nFiles:\n%s\n\nChecksums: sha256sums.txt' \
-            "${xray}" \
-            "${IMAGE_REPO}" \
-            "${files_list}")
-
-          telegram_api sendMessage \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            "${thread_data_args[@]}" \
-            --data-urlencode "text=${message}"
-
-          while IFS= read -r file; do
-            telegram_api sendDocument \
-              -F "chat_id=${TELEGRAM_CHAT_ID}" \
-              "${thread_form_args[@]}" \
-              -F "document=@${file}" \
-              -F "caption=$(basename "$file")"
-          done < <(find telegram-images -maxdepth 1 -name '*.tar.gz' -type f | sort)
-
-          telegram_api sendDocument \
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \
-            "${thread_form_args[@]}" \
-            -F "document=@telegram-images/sha256sums.txt" \
-            -F "caption=sha256sums.txt"
-          
-      - name: Commit and push VERSIONS
-        if: steps.check_versions.outputs.build_needed == 'true'
+      - name: Commit and push VERSIONS_ALPHA
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add VERSIONS
-          git commit -m "Auto-update: VERSIONS" || exit 0
+          git add VERSIONS_ALPHA
+          git commit -m "Auto-update: VERSIONS_ALPHA" || exit 0
           git push
 
       - name: Log in to GHCR with crane
-        if: steps.check_versions.outputs.build_needed == 'true'
         run: echo "${GITHUB_TOKEN}" | crane auth login ghcr.io -u ${PACKAGE_OWNER} --password-stdin
 
       - name: Analyze GHCR packages (dry-run)
-        if: steps.check_versions.outputs.build_needed == 'true'
         id: analyze
         run: |
           set -e

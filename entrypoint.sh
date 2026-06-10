@@ -1,5 +1,20 @@
 #!/bin/sh
 
+log() { echo "[$(date +'%H:%M:%S')] $*"; }
+
+SHUTTING_DOWN=0
+XRAY_PID=""
+
+graceful_shutdown() {
+  trap - TERM INT
+  [ "$SHUTTING_DOWN" = 1 ] && exit 0
+  SHUTTING_DOWN=1
+  log "Stop signal received, exiting..."
+  [ -n "${XRAY_PID:-}" ] && kill -TERM "$XRAY_PID" >/dev/null 2>&1 || true
+  exit 0
+}
+trap graceful_shutdown TERM INT
+
 sleep 1
 echo 180  > /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream >/dev/null 2>&1;
 for iface in $(ip -o link show up | awk -F': ' '/link\/ether/ {gsub(/@.*$/,"",$2); if($2!="lo") print $2}'); do
@@ -52,8 +67,6 @@ else
   fi
 fi
 
-log() { echo "[$(date +'%H:%M:%S')] $*"; }
-
 mkdir -p /etc/xray/
 
 first_iface() {
@@ -66,6 +79,48 @@ gateway=$(ip route show default dev "$iface" | awk '{print $3; exit}')
 
 urldecode() {
     printf '%b' "$(printf '%s' "$1" | sed 's/%/\\x/g')"
+}
+
+tolower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+json_object_or_empty() {
+    if printf '%s' "$1" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        printf '%s' "$1"
+    else
+        printf '{}'
+    fi
+}
+
+json_value_or_empty_object() {
+    if printf '%s' "$1" | jq -e . >/dev/null 2>&1; then
+        printf '%s' "$1"
+    else
+        printf '{}'
+    fi
+}
+
+json_object_or_empty_string() {
+    if printf '%s' "$1" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        printf '%s' "$1"
+    else
+        printf ''
+    fi
+}
+
+bool_or_empty() {
+    case "$1" in
+        1|true|TRUE|True|yes|YES|Yes) printf 'true' ;;
+        0|false|FALSE|False|no|NO|No) printf 'false' ;;
+    esac
+}
+
+int_or_default() {
+    case "$1" in
+        ''|*[!0-9]*) printf '%s' "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 trim() {
@@ -102,7 +157,7 @@ normalize_xray_numbers() {
 }
 
 b64_normalize() {
-    s="$(printf '%s' "$1" | tr -d '\r\n ')"
+    s="$(printf '%s' "$1" | tr -d '\r\n ' | tr '_-' '/+')"
 
     mod=$(( ${#s} % 4 ))
     if [ "$mod" -eq 2 ]; then
@@ -173,20 +228,48 @@ EOF
 parse() {
 
     LINK_NOPATH="$(printf '%s' "$LINK" | cut -d'#' -f1)"
-    PROTOCOL="$(printf '%s' "$LINK_NOPATH" | cut -d':' -f1)"
-    LINK_NOPATH="${LINK_NOPATH#${PROTOCOL}://}"
+    PROTOCOL="$(tolower "$(printf '%s' "$LINK_NOPATH" | cut -d':' -f1)")"
+    LINK_NOPATH="${LINK_NOPATH#*://}"
     XRAY_PROTOCOL="$PROTOCOL"
     [ "$PROTOCOL" = "ss" ] && XRAY_PROTOCOL="shadowsocks"
     [ "$PROTOCOL" = "hy2" ] && XRAY_PROTOCOL="hysteria"
+    [ "$PROTOCOL" = "hysteria2" ] && XRAY_PROTOCOL="hysteria"
+    [ "$PROTOCOL" = "wg" ] && XRAY_PROTOCOL="wireguard"
     if [ "$PROTOCOL" != "vmess" ]; then
-        CREDS="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f1)"
-        REST="$(printf '%s' "$LINK_NOPATH" | cut -d'@' -f2)"
+        CREDS="${LINK_NOPATH%@*}"
+        REST="${LINK_NOPATH##*@}"
 
-        HOSTPORT="$(printf '%s' "$REST" | cut -d'?' -f1)"
+        if [ "$PROTOCOL" = "ss" ] && [ "$CREDS" = "$REST" ]; then
+            ORIG_QUERY="$(printf '%s' "$LINK_NOPATH" | cut -s -d'?' -f2)"
+            SS_BODY="$(printf '%s' "$LINK_NOPATH" | cut -d'?' -f1)"
+            SS_FULL_DECODED="$(printf '%s' "$(b64_normalize "$SS_BODY")" | base64 -d 2>/dev/null || true)"
+            if printf '%s' "$SS_FULL_DECODED" | grep -q '@'; then
+                CREDS="${SS_FULL_DECODED%@*}"
+                REST="${SS_FULL_DECODED##*@}"
+                [ -n "$ORIG_QUERY" ] && REST="${REST}?${ORIG_QUERY}"
+            fi
+        fi
+
+        HOSTPORT="$(printf '%s' "$REST" | cut -d'?' -f1 | cut -d'/' -f1)"
         QUERY="$(printf '%s' "$REST" | cut -s -d'?' -f2)"
+        QUERY="$(printf '%s' "$QUERY" | cut -d'#' -f1)"
 
-        ADDRESS="$(printf '%s' "$HOSTPORT" | cut -d':' -f1)"
-        PORT="$(printf '%s' "$HOSTPORT" | cut -d':' -f2 | tr -cd '0-9')"
+        case "$HOSTPORT" in
+            \[*\]*)
+                ADDRESS="${HOSTPORT%%]*}"
+                ADDRESS="${ADDRESS#\[}"
+                PORT="${HOSTPORT##*:}"
+                ;;
+            *:*)
+                ADDRESS="${HOSTPORT%:*}"
+                PORT="${HOSTPORT##*:}"
+                ;;
+            *)
+                ADDRESS="$HOSTPORT"
+                PORT=""
+                ;;
+        esac
+        PORT="$(printf '%s' "$PORT" | tr -cd '0-9')"
     fi
 
     UUID=""
@@ -240,6 +323,9 @@ parse() {
     KCP_HEADER_DOMAIN=""
     KCP_USED=false
 
+    FINALMASK_JSON=""
+    FINALMASK_USED=false
+
     HTTPUP_PATH=""
     HTTPUP_HOST=""
     HTTPUP_HEADERS=""
@@ -255,6 +341,7 @@ parse() {
     TLS_FINGERPRINT=""
     TLS_VERIFY_NAMES=""
     TLS_PINNED_CERT=""
+    HY2_PIN_SHA256=""
     TLS_DISABLE_SYSTEM_ROOT=""
     TLS_SESSION_RESUME=""
     TLS_MIN_VERSION=""
@@ -263,7 +350,6 @@ parse() {
     TLS_CURVE_PREFS=""
     TLS_MASTER_KEY_LOG=""
     TLS_ECH_CONFIG=""
-    TLS_ECH_FORCE_QUERY=""
     TLS_USED=false
 
     REALITY_SERVER_NAME=""
@@ -276,7 +362,18 @@ parse() {
 
 
     VMESS_SECURITY="auto"
+    VMESS_UUID=""
     VMESS_LEVEL="0"
+
+    WG_SECRET_KEY=""
+    WG_PUBLIC_KEY=""
+    WG_ADDRESS=""
+    WG_ALLOWED_IPS=""
+    WG_PRESHARED_KEY=""
+    WG_KEEPALIVE=""
+    WG_MTU=""
+    WG_WORKERS=""
+    WG_RESERVED=""
 
     case "$PROTOCOL" in
         vless)
@@ -294,43 +391,76 @@ parse() {
             METHOD="$(printf '%s' "$SS_DECODED" | cut -d':' -f1)"
             PASSWORD="$(printf '%s' "$SS_DECODED" | cut -d':' -f2-)"
             ;;
-        hy2)
+        hy2|hysteria2)
             HY2_AUTH="$CREDS"
             HY2_USED=true
+            ;;
+        wireguard|wg)
+            WG_SECRET_KEY="$(urldecode "$CREDS")"
             ;;
     esac
 
     if [ "$PROTOCOL" = "vmess" ]; then
         PAYLOAD="$(printf '%s' "$LINK_NOPATH" | cut -d'?' -f1)"
-        JSON="$(printf '%s' "$PAYLOAD" | base64 -d 2>/dev/null)"
+        JSON="$(printf '%s' "$(b64_normalize "$PAYLOAD")" | base64 -d 2>/dev/null || true)"
 
-        ADDRESS="$(printf '%s' "$JSON" | sed -n 's/.*"add":"\([^"]*\)".*/\1/p')"
-        PORT="$(printf '%s' "$JSON" \
-          | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*"\?\([0-9]\+\)"\?.*/\1/p')"
-        VMESS_UUID="$(printf '%s' "$JSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+        ADDRESS="$(printf '%s' "$JSON" | jq -r '.add // empty' 2>/dev/null || true)"
+        PORT="$(printf '%s' "$JSON" | jq -r '.port // empty' 2>/dev/null | tr -cd '0-9' || true)"
+        VMESS_UUID="$(printf '%s' "$JSON" | jq -r '.id // empty' 2>/dev/null || true)"
 
-        NETWORK="$(printf '%s' "$JSON" | sed -n 's/.*"net":"\([^"]*\)".*/\1/p')"
-        SECURITY="$(printf '%s' "$JSON" | sed -n 's/.*"tls":"\([^"]*\)".*/\1/p')"
+        NETWORK="$(printf '%s' "$JSON" | jq -r '.net // empty' 2>/dev/null || true)"
+        SECURITY="$(printf '%s' "$JSON" | jq -r '.tls // empty' 2>/dev/null || true)"
         [ -z "$SECURITY" ] && SECURITY="none"
 
-        VMESS_SECURITY="$(printf '%s' "$JSON" \
-          | sed -n 's/.*"scy":"\([^"]*\)".*/\1/p')"
+        VMESS_SECURITY="$(printf '%s' "$JSON" | jq -r '.scy // empty' 2>/dev/null || true)"
         [ -z "$VMESS_SECURITY" ] && VMESS_SECURITY="auto"
 
-        VMESS_HEADER_TYPE="$(printf '%s' "$JSON" \
-          | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')"
+        VMESS_HEADER_TYPE="$(printf '%s' "$JSON" | jq -r '.type // empty' 2>/dev/null || true)"
 
-        VMESS_LEVEL="$(printf '%s' "$JSON" | sed -n 's/.*"level":\([0-9]\+\).*/\1/p')"
+        VMESS_LEVEL="$(printf '%s' "$JSON" | jq -r '.level // empty' 2>/dev/null | tr -cd '0-9' || true)"
         [ -z "$VMESS_LEVEL" ] && VMESS_LEVEL="0"
 
-        WS_PATH="$(printf '%s' "$JSON" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')"
-        WS_HOST="$(printf '%s' "$JSON" | sed -n 's/.*"host":"\([^"]*\)".*/\1/p')"
+        WS_PATH="$(printf '%s' "$JSON" | jq -r '.path // empty' 2>/dev/null || true)"
+        WS_HOST="$(printf '%s' "$JSON" | jq -r '.host // empty' 2>/dev/null || true)"
 
-        TLS_SERVER_NAME="$(printf '%s' "$JSON" | sed -n 's/.*"sni":"\([^"]*\)".*/\1/p')"
+        TLS_SERVER_NAME="$(printf '%s' "$JSON" | jq -r '.sni // empty' 2>/dev/null || true)"
+        TLS_FINGERPRINT="$(printf '%s' "$JSON" | jq -r '.fp // empty' 2>/dev/null || true)"
+        TLS_ALPN="$(printf '%s' "$JSON" | jq -r '.alpn // empty' 2>/dev/null || true)"
+        TLS_ECH_CONFIG="$(printf '%s' "$JSON" | jq -r '.ech // .echConfigList // empty' 2>/dev/null || true)"
+        TLS_PINNED_CERT="$(printf '%s' "$JSON" | jq -r '.pcs // .pinnedPeerCert // .pinnedPeerCertSha256 // empty' 2>/dev/null || true)"
+
+        REALITY_SERVER_NAME="$TLS_SERVER_NAME"
+        REALITY_FINGERPRINT="$TLS_FINGERPRINT"
+        REALITY_PASSWORD="$(printf '%s' "$JSON" | jq -r '.pbk // empty' 2>/dev/null || true)"
+        REALITY_SHORT_ID="$(printf '%s' "$JSON" | jq -r '.sid // empty' 2>/dev/null || true)"
+        REALITY_SPIDER_X="$(printf '%s' "$JSON" | jq -r '.spx // empty' 2>/dev/null || true)"
+        REALITY_MLDSA65_VERIFY="$(printf '%s' "$JSON" | jq -r '.pqv // .mldsa65Verify // empty' 2>/dev/null || true)"
+
+        VMESS_MODE="$(printf '%s' "$JSON" | jq -r '.mode // empty' 2>/dev/null || true)"
+        VMESS_EXTRA="$(printf '%s' "$JSON" | jq -c '.extra // empty' 2>/dev/null || true)"
+        VMESS_FM="$(printf '%s' "$JSON" | jq -r '.fm // empty' 2>/dev/null || true)"
+        [ -n "$VMESS_FM" ] && FINALMASK_JSON="$(json_object_or_empty_string "$VMESS_FM")" && [ -n "$FINALMASK_JSON" ] && FINALMASK_USED=true
 
         [ -n "$WS_PATH" ] && WS_USED=true
         [ -n "$WS_HOST" ] && WS_USED=true
-        [ -n "$TLS_SERVER_NAME" ] && TLS_USED=true
+        [ -n "$TLS_SERVER_NAME$TLS_FINGERPRINT$TLS_ALPN$TLS_ECH_CONFIG$TLS_PINNED_CERT" ] && TLS_USED=true
+        [ -n "$REALITY_SERVER_NAME$REALITY_FINGERPRINT$REALITY_PASSWORD$REALITY_SHORT_ID$REALITY_SPIDER_X$REALITY_MLDSA65_VERIFY" ] && REALITY_USED=true
+
+        if [ "$NETWORK" = "grpc" ]; then
+            GRPC_SERVICE_NAME="$WS_PATH"
+            GRPC_AUTHORITY="$WS_HOST"
+            case "$VMESS_MODE:$VMESS_HEADER_TYPE" in
+                multi:*|*:multi) GRPC_MULTI_MODE="true" ;;
+                gun:*|*:gun) GRPC_MULTI_MODE="false" ;;
+            esac
+            GRPC_USED=true
+        elif [ "$NETWORK" = "xhttp" ] || [ "$NETWORK" = "splithttp" ]; then
+            XHTTP_PATH="$WS_PATH"
+            XHTTP_HOST="$WS_HOST"
+            XHTTP_MODE="${VMESS_MODE:-$VMESS_HEADER_TYPE}"
+            XHTTP_EXTRA="$(json_value_or_empty_object "$VMESS_EXTRA")"
+            XHTTP_USED=true
+        fi
 
         QUERY="$(printf '%s' "$LINK" | cut -s -d'?' -f2)"
     fi
@@ -377,6 +507,27 @@ parse() {
                 SS_LEVEL="$val"
                 TROJAN_LEVEL="$val"
                 ;;
+            publickey|publicKey|public_key|peerPublicKey)
+                WG_PUBLIC_KEY="$(urldecode "$val")"
+                ;;
+            address|ip)
+                WG_ADDRESS="$(urldecode "$val")"
+                ;;
+            allowedips|allowed_ips)
+                WG_ALLOWED_IPS="$(urldecode "$val")"
+                ;;
+            presharedkey|preshared_key|pre-shared-key|psk)
+                WG_PRESHARED_KEY="$(urldecode "$val")"
+                ;;
+            keepalive|persistentkeepalive|persistent_keepalive)
+                WG_KEEPALIVE="$val"
+                ;;
+            workers)
+                WG_WORKERS="$val"
+                ;;
+            reserved)
+                WG_RESERVED="$(urldecode "$val")"
+                ;;
             email)
                 EMAIL="$(urldecode "$val")"
                 ;;  
@@ -385,18 +536,22 @@ parse() {
                 XHTTP_HOST="$DECODED_HOST"
                 WS_HOST="$DECODED_HOST"
                 HTTPUP_HOST="$DECODED_HOST"
+                GRPC_AUTHORITY="$DECODED_HOST"
                 XHTTP_USED=true
                 WS_USED=true
                 HTTPUP_USED=true
+                GRPC_USED=true
                 ;;
             path)
                 DECODED_PATH="$(urldecode "$val")"
                 XHTTP_PATH="$DECODED_PATH"
                 WS_PATH="$DECODED_PATH"
                 HTTPUP_PATH="$DECODED_PATH"
+                GRPC_SERVICE_NAME="$DECODED_PATH"
                 XHTTP_USED=true
                 WS_USED=true
                 HTTPUP_USED=true
+                GRPC_USED=true
                 ;;
             heartbeatPeriod)
                 WS_HEARTBEAT="$val"
@@ -412,6 +567,17 @@ parse() {
             mode)
                 XHTTP_MODE="$val"
                 XHTTP_USED=true
+                if [ "$NETWORK" = "grpc" ]; then
+                    case "$val" in
+                        multi) GRPC_MULTI_MODE="true" ;;
+                        gun) GRPC_MULTI_MODE="false" ;;
+                    esac
+                    GRPC_USED=true
+                fi
+                ;;
+            x_padding_bytes)
+                XHTTP_EXTRA="$(jq -cn --arg v "$(urldecode "$val")" '{xPaddingBytes:$v}')"
+                XHTTP_USED=true
                 ;;
             extra)
                 DECODED="$(urldecode "$val")"
@@ -425,6 +591,11 @@ parse() {
                         XHTTP_USED=true
                         ;;
                 esac
+                ;;
+            fm)
+                DECODED_FM="$(urldecode "$val")"
+                FINALMASK_JSON="$(json_object_or_empty_string "$DECODED_FM")"
+                [ -n "$FINALMASK_JSON" ] && FINALMASK_USED=true
                 ;;
             serviceName)
                 GRPC_SERVICE_NAME="$(urldecode "$val")"
@@ -460,6 +631,7 @@ parse() {
                 ;;
             mtu)
                 KCP_MTU="$val"
+                WG_MTU="$val"
                 KCP_USED=true
                 ;;
             tti)
@@ -519,6 +691,16 @@ parse() {
             obfs-password)
                 HY2_OBFS_PASSWORD="$(urldecode "$val")"
                 ;;
+            mport)
+                DECODED_MPORT="$(urldecode "$val")"
+                if [ -n "$DECODED_MPORT" ]; then
+                    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg ports "$DECODED_MPORT" '
+                      if type != "object" then {} else . end
+                      | .quicParams.udpHop.ports = $ports
+                    ' 2>/dev/null || printf '{}')"
+                    FINALMASK_USED=true
+                fi
+                ;;
             sni)
                 DECODED_SNI="$(urldecode "$val")"
                 TLS_SERVER_NAME="$DECODED_SNI"
@@ -540,25 +722,19 @@ parse() {
                 REALITY_USED=true
                 ;;
             insecure)
-                case "$val" in
-                    1|true)
-                        TLS_ALLOW_INSECURE="true"
-                        ;;
-                    0|false)
-                        TLS_ALLOW_INSECURE="false"
-                        ;;
-                    *)
-                        TLS_ALLOW_INSECURE=""
-                        ;;
-                esac
-                [ -n "$TLS_ALLOW_INSECURE" ] && TLS_USED=true
+                # Removed from current Xray; ignore old panel links instead of emitting invalid JSON.
                 ;;
             verifyPeerCertByName)
                 TLS_VERIFY_NAMES="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
-            pinnedPeerCert)
+            pinnedPeerCert|pinnedPeerCertSha256|pcs)
                 TLS_PINNED_CERT="$(urldecode "$val")"
+                TLS_USED=true
+                ;;
+            pinSHA256)
+                HY2_PIN_SHA256="$(urldecode "$val")"
+                TLS_PINNED_CERT="$HY2_PIN_SHA256"
                 TLS_USED=true
                 ;;
             disableSystemRoot)
@@ -593,8 +769,8 @@ parse() {
                 TLS_ECH_CONFIG="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
-            echForceQuery)
-                TLS_ECH_FORCE_QUERY="$val"
+            ech)
+                TLS_ECH_CONFIG="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
             sid)
@@ -613,6 +789,20 @@ parse() {
                 REALITY_MLDSA65_VERIFY="$val"
                 REALITY_USED=true
                 ;;
+            pqv)
+                REALITY_MLDSA65_VERIFY="$(urldecode "$val")"
+                REALITY_USED=true
+                ;;
+            fragment)
+                DECODED_FRAGMENT="$(urldecode "$val")"
+                if [ -n "$DECODED_FRAGMENT" ]; then
+                    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg packets "$DECODED_FRAGMENT" '
+                      if type != "object" then {} else . end
+                      | .tcp = ((.tcp // []) + [{"type":"fragment","settings":{"packets":$packets,"length":"100-200","delay":"1-1"}}])
+                    ' 2>/dev/null || printf '{}')"
+                    FINALMASK_USED=true
+                fi
+                ;;
         esac
     done
     unset IFS
@@ -621,387 +811,249 @@ parse() {
         tcp|"")
             NETWORK="raw"
             ;;
-        hy2)
+        http|h2)
+            NETWORK="xhttp"
+            [ -z "$XHTTP_MODE" ] && XHTTP_MODE="stream-one"
+            XHTTP_USED=true
+            ;;
+        websocket)
+            NETWORK="ws"
+            ;;
+        splithttp)
+            NETWORK="xhttp"
+            XHTTP_USED=true
+            ;;
+        mkcp)
+            NETWORK="kcp"
+            ;;
+        hy2|hysteria2)
             NETWORK="hysteria"
             ;;
     esac
 
-    cat > /etc/xray/25_outbound.json <<EOF
-{
-  "outbounds": [
-{
-  "tag": "XrayProxyRoS",
-  "protocol": "$XRAY_PROTOCOL",
-  "settings": {
-EOF
+    case "$(tolower "$KCP_HEADER_TYPE")" in
+        none)
+            KCP_HEADER_TYPE=""
+            ;;
+        wechat-video)
+            KCP_HEADER_TYPE="wechat"
+            ;;
+        *)
+            KCP_HEADER_TYPE="$(tolower "$KCP_HEADER_TYPE")"
+            ;;
+    esac
 
-case "$PROTOCOL" in
-    vless)
-cat >> /etc/xray/25_outbound.json <<EOF
-    "vnext": [
-      {
-        "address": "$ADDRESS",
-        "port": $PORT,
-        "users": [
-          {
-            "id": "$UUID",
-            "encryption": "$VLESS_ENCRYPTION",
-            "flow": "$VLESS_FLOW",
-            "level": $VLESS_LEVEL
-          }
-        ]
-      }
-    ]
-EOF
-        ;;
-    vmess)
-cat >> /etc/xray/25_outbound.json <<EOF
-    "vnext": [
-      {
-        "address": "$ADDRESS",
-        "port": $PORT,
-        "users": [
-          {
-            "id": "$VMESS_UUID",
-            "security": "$VMESS_SECURITY",
-            "level": $VMESS_LEVEL
-          }
-        ]
-      }
-    ]
-EOF
-    ;;
-    trojan)
-cat >> /etc/xray/25_outbound.json <<EOF
-    "address": "$ADDRESS",
-    "port": $PORT,
-    "password": "$PASSWORD",
-    "level": $TROJAN_LEVEL
-EOF
-
-    if [ -n "$EMAIL" ]; then
-        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/25_outbound.json
-    fi
-    ;;
-    ss)
-cat >> /etc/xray/25_outbound.json <<EOF
-    "address": "$ADDRESS",
-    "port": $PORT,
-    "method": "$METHOD",
-    "password": "$PASSWORD",
-    "uot": true,
-    "UoTVersion": 2,
-    "level": $SS_LEVEL
-EOF
-    if [ -n "$EMAIL" ]; then
-        printf ',\n      "email": "%s"' "$EMAIL" >> /etc/xray/25_outbound.json
-    fi
-    ;;
-    hy2)
-cat >> /etc/xray/25_outbound.json <<EOF
-    "version": 2,
-    "address": "$ADDRESS",
-    "port": $PORT
-EOF
-    ;;
-esac
-cat >> /etc/xray/25_outbound.json <<EOF
-  },
-EOF
-
-cat >> /etc/xray/25_outbound.json <<EOF
-  "streamSettings": {
-    "network": "$NETWORK",
-    "security": "$SECURITY",
-EOF
-
-if [ "$SECURITY" = "tls" ] && [ "$TLS_USED" = "true" ]; then
-    printf '\n    "tlsSettings": {\n' >> /etc/xray/25_outbound.json
-    FIRST=true
-
-    add_tls() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        FIRST=false
-    }
-
-    [ -n "$TLS_SERVER_NAME" ] && add_tls && printf '      "serverName": "%s"' "$TLS_SERVER_NAME" >> /etc/xray/25_outbound.json
-
-    if [ -n "$TLS_ALPN" ]; then
-        add_tls
-        printf '      "alpn": [' >> /etc/xray/25_outbound.json
-        IFS=','; set -- $TLS_ALPN; unset IFS
-        ALPN_FIRST=true
-        for a in "$@"; do
-            [ "$ALPN_FIRST" = false ] && printf ', ' >> /etc/xray/25_outbound.json
-            printf '"%s"' "$a" >> /etc/xray/25_outbound.json
-            ALPN_FIRST=false
-        done
-        printf ']' >> /etc/xray/25_outbound.json
+    if [ -z "$FINALMASK_JSON" ] && { [ -n "$KCP_HEADER_TYPE" ] || [ -n "$KCP_SEED" ]; }; then
+        KCP_LEGACY_VALUE="$KCP_SEED"
+        [ "$KCP_HEADER_TYPE" = "dns" ] && [ -n "$KCP_HEADER_DOMAIN" ] && KCP_LEGACY_VALUE="$KCP_HEADER_DOMAIN"
+        FINALMASK_JSON="$(jq -cn \
+          --arg header "$KCP_HEADER_TYPE" \
+          --arg value "$KCP_LEGACY_VALUE" \
+          '{udp:[{type:"mkcp-legacy",settings:({} | if $header != "" then . + {header:$header} else . end | if $value != "" then . + {value:$value} else . end)}]}' \
+        )"
+        FINALMASK_USED=true
     fi
 
-    [ -n "$TLS_FINGERPRINT" ] && add_tls && printf '      "fingerprint": "%s"' "$TLS_FINGERPRINT" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_VERIFY_NAMES" ] && add_tls && printf '      "verifyPeerCertByName": ["%s"]' "$TLS_VERIFY_NAMES" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_PINNED_CERT" ] && add_tls && printf '      "pinnedPeerCertSha256": ["%s"]' "$TLS_PINNED_CERT" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_DISABLE_SYSTEM_ROOT" ] && add_tls && printf '      "disableSystemRoot": %s' "$TLS_DISABLE_SYSTEM_ROOT" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_SESSION_RESUME" ] && add_tls && printf '      "enableSessionResumption": %s' "$TLS_SESSION_RESUME" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_MIN_VERSION" ] && add_tls && printf '      "minVersion": "%s"' "$TLS_MIN_VERSION" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_MAX_VERSION" ] && add_tls && printf '      "maxVersion": "%s"' "$TLS_MAX_VERSION" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_CIPHER_SUITES" ] && add_tls && printf '      "cipherSuites": "%s"' "$TLS_CIPHER_SUITES" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_CURVE_PREFS" ] && add_tls && printf '      "curvePreferences": ["%s"]' "$TLS_CURVE_PREFS" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_MASTER_KEY_LOG" ] && add_tls && printf '      "masterKeyLog": "%s"' "$TLS_MASTER_KEY_LOG" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_ECH_CONFIG" ] && add_tls && printf '      "echConfigList": "%s"' "$TLS_ECH_CONFIG" >> /etc/xray/25_outbound.json
-    [ -n "$TLS_ECH_FORCE_QUERY" ] && add_tls && printf '      "echForceQuery": "%s"' "$TLS_ECH_FORCE_QUERY" >> /etc/xray/25_outbound.json
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$SECURITY" = "reality" ] && [ "$REALITY_USED" = "true" ]; then
-    printf '\n    "realitySettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-
-    if [ -n "$REALITY_SERVER_NAME" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "serverName": "%s"' "$REALITY_SERVER_NAME" >> /etc/xray/25_outbound.json
-        FIRST=false
+    if [ "$NETWORK" = "grpc" ]; then
+        case "$XHTTP_MODE" in
+            multi) GRPC_MULTI_MODE="true" ;;
+            gun) GRPC_MULTI_MODE="false" ;;
+        esac
     fi
 
-    if [ -n "$REALITY_FINGERPRINT" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "fingerprint": "%s"' "$REALITY_FINGERPRINT" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
+    PORT="$(int_or_default "$PORT" 0)"
+    VLESS_LEVEL="$(int_or_default "$VLESS_LEVEL" 0)"
+    VMESS_LEVEL="$(int_or_default "$VMESS_LEVEL" 0)"
+    TROJAN_LEVEL="$(int_or_default "$TROJAN_LEVEL" 0)"
+    SS_LEVEL="$(int_or_default "$SS_LEVEL" 0)"
+    MUX_ENABLED="$(bool_or_empty "$MUX")"
+    [ -z "$MUX_ENABLED" ] && MUX_ENABLED=false
+    MUX_CONCURRENCY="$(int_or_default "$MUX_CONCURRENCY" 8)"
+    MUX_XUDPCONCURRENCY="$(int_or_default "$MUX_XUDPCONCURRENCY" "$MUX_CONCURRENCY")"
 
-    if [ -n "$REALITY_SHORT_ID" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "shortId": "%s"' "$REALITY_SHORT_ID" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
+    WS_HEADERS_JSON="$(json_object_or_empty "$WS_HEADERS")"
+    HTTPUP_HEADERS_JSON="$(json_object_or_empty "$HTTPUP_HEADERS")"
+    XHTTP_EXTRA_JSON="$(json_value_or_empty_object "$XHTTP_EXTRA")"
+    FINALMASK_JSON="$(json_object_or_empty "$FINALMASK_JSON")"
+    TLS_DISABLE_SYSTEM_ROOT="$(bool_or_empty "$TLS_DISABLE_SYSTEM_ROOT")"
+    TLS_SESSION_RESUME="$(bool_or_empty "$TLS_SESSION_RESUME")"
+    GRPC_MULTI_MODE="$(bool_or_empty "$GRPC_MULTI_MODE")"
+    GRPC_PERMIT_WITHOUT_STREAM="$(bool_or_empty "$GRPC_PERMIT_WITHOUT_STREAM")"
+    GRPC_IDLE_TIMEOUT="$(int_or_default "$GRPC_IDLE_TIMEOUT" 0)"
+    GRPC_HEALTH_CHECK_TIMEOUT="$(int_or_default "$GRPC_HEALTH_CHECK_TIMEOUT" 0)"
+    GRPC_INITIAL_WINDOWS_SIZE="$(int_or_default "$GRPC_INITIAL_WINDOWS_SIZE" 0)"
+    WS_HEARTBEAT="$(int_or_default "$WS_HEARTBEAT" 0)"
+    KCP_MTU="$(int_or_default "$KCP_MTU" 0)"
+    KCP_TTI="$(int_or_default "$KCP_TTI" 0)"
+    KCP_UPLINK="$(int_or_default "$KCP_UPLINK" 0)"
+    KCP_DOWNLINK="$(int_or_default "$KCP_DOWNLINK" 0)"
+    KCP_READ_BUF="$(int_or_default "$KCP_READ_BUF" 0)"
+    KCP_WRITE_BUF="$(int_or_default "$KCP_WRITE_BUF" 0)"
+    WG_MTU="$(int_or_default "$WG_MTU" 0)"
+    WG_KEEPALIVE="$(int_or_default "$WG_KEEPALIVE" 0)"
+    WG_WORKERS="$(int_or_default "$WG_WORKERS" 0)"
 
-    if [ -n "$REALITY_PASSWORD" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "password": "%s"' "$REALITY_PASSWORD" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$REALITY_MLDSA65_VERIFY" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "mldsa65Verify": "%s"' "$REALITY_MLDSA65_VERIFY" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$REALITY_SPIDER_X" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "spiderX": "%s"' "$REALITY_SPIDER_X" >> /etc/xray/25_outbound.json
-    fi
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "xhttp" ] && [ "$XHTTP_USED" = "true" ]; then
-    printf '\n    "xhttpSettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-
-    if [ -n "$XHTTP_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "host": "%s"' "$XHTTP_HOST" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_PATH" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "path": "%s"' "$XHTTP_PATH" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_MODE" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "mode": "%s"' "$XHTTP_MODE" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$XHTTP_EXTRA" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "extra": %s' "$XHTTP_EXTRA" >> /etc/xray/25_outbound.json
-    fi
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "raw" ] && [ "$RAW_USED" = "true" ]; then
-    printf '\n    "rawSettings": {\n' >> /etc/xray/25_outbound.json
-    printf '      "header": {\n' >> /etc/xray/25_outbound.json
-    printf '        "type": "%s"\n' "$RAW_HEADERTYPE" >> /etc/xray/25_outbound.json
-    printf '      }\n' >> /etc/xray/25_outbound.json
-    printf '    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "ws" ] && [ "$WS_USED" = "true" ]; then
-    printf '\n    "wsSettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-
-    if [ -n "$WS_PATH" ]; then
-        printf '      "path": "%s"' "$WS_PATH" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "host": "%s"' "$WS_HOST" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HEADERS" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "headers": %s' "$WS_HEADERS" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$WS_HEARTBEAT" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "heartbeatPeriod": %s' "$WS_HEARTBEAT" >> /etc/xray/25_outbound.json
-    fi
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "grpc" ] && [ "$GRPC_USED" = "true" ]; then
-    printf '\n    "grpcSettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-
-    add_grpc() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        FIRST=false
-    }
-
-    [ -n "$GRPC_SERVICE_NAME" ] && add_grpc && printf '      "serviceName": "%s"' "$GRPC_SERVICE_NAME" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_AUTHORITY" ] && add_grpc && printf '      "authority": "%s"' "$GRPC_AUTHORITY" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_USER_AGENT" ] && add_grpc && printf '      "user_agent": "%s"' "$GRPC_USER_AGENT" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_MULTI_MODE" ] && add_grpc && printf '      "multiMode": %s' "$GRPC_MULTI_MODE" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_IDLE_TIMEOUT" ] && add_grpc && printf '      "idle_timeout": %s' "$GRPC_IDLE_TIMEOUT" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_HEALTH_CHECK_TIMEOUT" ] && add_grpc && printf '      "health_check_timeout": %s' "$GRPC_HEALTH_CHECK_TIMEOUT" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_PERMIT_WITHOUT_STREAM" ] && add_grpc && printf '      "permit_without_stream": %s' "$GRPC_PERMIT_WITHOUT_STREAM" >> /etc/xray/25_outbound.json
-    [ -n "$GRPC_INITIAL_WINDOWS_SIZE" ] && add_grpc && printf '      "initial_windows_size": %s' "$GRPC_INITIAL_WINDOWS_SIZE" >> /etc/xray/25_outbound.json
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "kcp" ] && [ "$KCP_USED" = "true" ]; then
-    printf '\n    "kcpSettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-    add_kcp() {
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        FIRST=false
-    }
-
-    [ -n "$KCP_MTU" ] && add_kcp && printf '      "mtu": %s' "$KCP_MTU" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_TTI" ] && add_kcp && printf '      "tti": %s' "$KCP_TTI" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_UPLINK" ] && add_kcp && printf '      "uplinkCapacity": %s' "$KCP_UPLINK" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_DOWNLINK" ] && add_kcp && printf '      "downlinkCapacity": %s' "$KCP_DOWNLINK" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_CONGESTION" ] && add_kcp && printf '      "congestion": %s' "$KCP_CONGESTION" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_READ_BUF" ] && add_kcp && printf '      "readBufferSize": %s' "$KCP_READ_BUF" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_WRITE_BUF" ] && add_kcp && printf '      "writeBufferSize": %s' "$KCP_WRITE_BUF" >> /etc/xray/25_outbound.json
-    [ -n "$KCP_SEED" ] && add_kcp && printf '      "seed": "%s"' "$KCP_SEED" >> /etc/xray/25_outbound.json
-
-    if [ -n "$KCP_HEADER_TYPE" ] || [ -n "$KCP_HEADER_DOMAIN" ]; then
-        add_kcp
-        printf '      "header": {' >> /etc/xray/25_outbound.json
-
-        H_FIRST=true
-        if [ -n "$KCP_HEADER_TYPE" ]; then
-            printf '"type": "%s"' "$KCP_HEADER_TYPE" >> /etc/xray/25_outbound.json
-            H_FIRST=false
-        fi
-        if [ -n "$KCP_HEADER_DOMAIN" ]; then
-            [ "$H_FIRST" = false ] && printf ', ' >> /etc/xray/25_outbound.json
-            printf '"domain": "%s"' "$KCP_HEADER_DOMAIN" >> /etc/xray/25_outbound.json
-        fi
-
-        printf '}' >> /etc/xray/25_outbound.json
-    fi
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$NETWORK" = "httpupgrade" ] && [ "$HTTPUP_USED" = "true" ]; then
-    printf '\n    "httpupgradeSettings": {\n' >> /etc/xray/25_outbound.json
-
-    FIRST=true
-
-    if [ -n "$HTTPUP_PATH" ]; then
-        printf '      "path": "%s"' "$HTTPUP_PATH" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$HTTPUP_HOST" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "host": "%s"' "$HTTPUP_HOST" >> /etc/xray/25_outbound.json
-        FIRST=false
-    fi
-
-    if [ -n "$HTTPUP_HEADERS" ]; then
-        [ "$FIRST" = false ] && printf ',\n' >> /etc/xray/25_outbound.json
-        printf '      "headers": %s' "$HTTPUP_HEADERS" >> /etc/xray/25_outbound.json
-    fi
-
-    printf '\n    },' >> /etc/xray/25_outbound.json
-fi
-
-if [ "$PROTOCOL" = "hy2" ]; then
-printf '\n' >> /etc/xray/25_outbound.json
-cat >> /etc/xray/25_outbound.json <<EOF
-    "hysteriaSettings": {
-      "version": 2,
-      "auth": "$HY2_AUTH"
-    }
-EOF
-
-if [ -n "$HY2_OBFS" ]; then
-cat >> /etc/xray/25_outbound.json <<EOF
-    ,
-    "finalmask": {
-      "udp": [
-        {
-          "type": "$HY2_OBFS",
-          "settings": {
-            "password": "$HY2_OBFS_PASSWORD"
-          }
-        }
-      ]
-    },
-EOF
-fi
-fi
-
-    printf '\n' >> /etc/xray/25_outbound.json
-    cat >> /etc/xray/25_outbound.json <<EOF
-    "sockopt": {
-        "domainStrategy": "ForceIPv4"
-    }
-  },
-  "mux": {
-    "enabled": $MUX,
-    "concurrency": $MUX_CONCURRENCY,
-    "xudpConcurrency": $MUX_XUDPCONCURRENCY,
-    "xudpProxyUDP443": "$MUX_XUDPPROXYUDP443"
-  }
-}
-]
-}
-EOF
+    jq -n \
+      --arg protocol "$PROTOCOL" \
+      --arg xray_protocol "$XRAY_PROTOCOL" \
+      --arg address "$ADDRESS" \
+      --arg uuid "$UUID" \
+      --arg vmess_uuid "$VMESS_UUID" \
+      --arg password "$PASSWORD" \
+      --arg method "$METHOD" \
+      --arg email "$EMAIL" \
+      --arg vless_encryption "$VLESS_ENCRYPTION" \
+      --arg vless_flow "$VLESS_FLOW" \
+      --arg vmess_security "$VMESS_SECURITY" \
+      --arg network "$NETWORK" \
+      --arg security "$SECURITY" \
+      --arg raw_header_type "$RAW_HEADERTYPE" \
+      --arg xhttp_host "$XHTTP_HOST" \
+      --arg xhttp_path "$XHTTP_PATH" \
+      --arg xhttp_mode "$XHTTP_MODE" \
+      --arg ws_path "$WS_PATH" \
+      --arg ws_host "$WS_HOST" \
+      --arg grpc_service_name "$GRPC_SERVICE_NAME" \
+      --arg grpc_authority "$GRPC_AUTHORITY" \
+      --arg grpc_user_agent "$GRPC_USER_AGENT" \
+      --arg httpup_path "$HTTPUP_PATH" \
+      --arg httpup_host "$HTTPUP_HOST" \
+      --arg hy2_auth "$HY2_AUTH" \
+      --arg hy2_obfs "$HY2_OBFS" \
+      --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
+      --arg tls_server_name "$TLS_SERVER_NAME" \
+      --arg tls_fingerprint "$TLS_FINGERPRINT" \
+      --arg tls_min_version "$TLS_MIN_VERSION" \
+      --arg tls_max_version "$TLS_MAX_VERSION" \
+      --arg tls_cipher_suites "$TLS_CIPHER_SUITES" \
+      --arg tls_master_key_log "$TLS_MASTER_KEY_LOG" \
+      --arg tls_ech_config "$TLS_ECH_CONFIG" \
+      --arg reality_server_name "$REALITY_SERVER_NAME" \
+      --arg reality_fingerprint "$REALITY_FINGERPRINT" \
+      --arg reality_short_id "$REALITY_SHORT_ID" \
+      --arg reality_password "$REALITY_PASSWORD" \
+      --arg reality_spider_x "$REALITY_SPIDER_X" \
+      --arg reality_mldsa65_verify "$REALITY_MLDSA65_VERIFY" \
+      --arg mux_xudp_proxy_udp443 "$MUX_XUDPPROXYUDP443" \
+      --arg tls_alpn "$TLS_ALPN" \
+      --arg tls_verify_names "$TLS_VERIFY_NAMES" \
+      --arg tls_pinned_cert "$TLS_PINNED_CERT" \
+      --arg tls_curve_prefs "$TLS_CURVE_PREFS" \
+      --arg tls_disable_system_root "$TLS_DISABLE_SYSTEM_ROOT" \
+      --arg tls_session_resume "$TLS_SESSION_RESUME" \
+      --arg grpc_multi_mode "$GRPC_MULTI_MODE" \
+      --arg grpc_permit_without_stream "$GRPC_PERMIT_WITHOUT_STREAM" \
+      --arg kcp_congestion "$KCP_CONGESTION" \
+      --arg wg_secret_key "$WG_SECRET_KEY" \
+      --arg wg_public_key "$WG_PUBLIC_KEY" \
+      --arg wg_address "$WG_ADDRESS" \
+      --arg wg_allowed_ips "$WG_ALLOWED_IPS" \
+      --arg wg_preshared_key "$WG_PRESHARED_KEY" \
+      --arg wg_reserved "$WG_RESERVED" \
+      --argjson port "$PORT" \
+      --argjson vless_level "$VLESS_LEVEL" \
+      --argjson vmess_level "$VMESS_LEVEL" \
+      --argjson trojan_level "$TROJAN_LEVEL" \
+      --argjson ss_level "$SS_LEVEL" \
+      --argjson mux_enabled "$MUX_ENABLED" \
+      --argjson mux_concurrency "$MUX_CONCURRENCY" \
+      --argjson mux_xudp_concurrency "$MUX_XUDPCONCURRENCY" \
+      --argjson ws_headers "$WS_HEADERS_JSON" \
+      --argjson httpup_headers "$HTTPUP_HEADERS_JSON" \
+      --argjson xhttp_extra "$XHTTP_EXTRA_JSON" \
+      --argjson finalmask "$FINALMASK_JSON" \
+      --argjson ws_heartbeat "$WS_HEARTBEAT" \
+      --argjson grpc_idle_timeout "$GRPC_IDLE_TIMEOUT" \
+      --argjson grpc_health_check_timeout "$GRPC_HEALTH_CHECK_TIMEOUT" \
+      --argjson grpc_initial_windows_size "$GRPC_INITIAL_WINDOWS_SIZE" \
+      --argjson kcp_mtu "$KCP_MTU" \
+      --argjson kcp_tti "$KCP_TTI" \
+      --argjson kcp_uplink "$KCP_UPLINK" \
+      --argjson kcp_downlink "$KCP_DOWNLINK" \
+      --argjson kcp_read_buf "$KCP_READ_BUF" \
+      --argjson kcp_write_buf "$KCP_WRITE_BUF" \
+      --argjson wg_mtu "$WG_MTU" \
+      --argjson wg_keepalive "$WG_KEEPALIVE" \
+      --argjson wg_workers "$WG_WORKERS" '
+      def nonempty($v): ($v != null and $v != "");
+      def csv($v): $v | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0));
+      def putstr($k; $v): if nonempty($v) then . + {($k): $v} else . end;
+      def putnum($k; $v): if $v > 0 then . + {($k): $v} else . end;
+      def putbool($k; $v): if nonempty($v) then . + {($k): ($v == "true")} else . end;
+      def base_settings:
+        if $protocol == "vless" then
+          {vnext:[{address:$address, port:$port, users:[({id:$uuid, encryption:$vless_encryption, level:$vless_level} | putstr("flow"; $vless_flow))]}]}
+        elif $protocol == "vmess" then
+          {vnext:[{address:$address, port:$port, users:[{id:$vmess_uuid, security:$vmess_security, level:$vmess_level}]}]}
+        elif $protocol == "trojan" then
+          ({address:$address, port:$port, password:$password, level:$trojan_level} | putstr("email"; $email) | putstr("flow"; $vless_flow))
+        elif $protocol == "ss" then
+          ({address:$address, port:$port, method:$method, password:$password, uot:true, UoTVersion:2, level:$ss_level} | putstr("email"; $email))
+        elif ($protocol == "hy2" or $protocol == "hysteria2") then
+          {version:2, address:$address, port:$port}
+        elif ($protocol == "wireguard" or $protocol == "wg") then
+          ({secretKey:$wg_secret_key,
+            address:(if nonempty($wg_address) then csv($wg_address) else [] end),
+            peers:[({publicKey:$wg_public_key, endpoint:($address + ":" + ($port|tostring))}
+              | putstr("preSharedKey"; $wg_preshared_key)
+              | putnum("keepAlive"; $wg_keepalive)
+              | if nonempty($wg_allowed_ips) then . + {allowedIPs:csv($wg_allowed_ips)} else . end)]}
+            | putnum("mtu"; $wg_mtu)
+            | putnum("workers"; $wg_workers)
+            | if nonempty($wg_reserved) then . + {reserved:(try ($wg_reserved | split(",") | map(tonumber)) catch [])} else . end)
+        else
+          {}
+        end;
+      def tls_settings:
+        ({} | putstr("serverName"; $tls_server_name)
+            | (if (csv($tls_alpn)|length) > 0 then . + {alpn: csv($tls_alpn)} else . end)
+            | putstr("fingerprint"; $tls_fingerprint)
+            | (if (csv($tls_verify_names)|length) > 0 then . + {verifyPeerCertByName: csv($tls_verify_names)} else . end)
+            | (if (csv($tls_pinned_cert)|length) > 0 then . + {pinnedPeerCertSha256: csv($tls_pinned_cert)} else . end)
+            | putbool("disableSystemRoot"; $tls_disable_system_root)
+            | putbool("enableSessionResumption"; $tls_session_resume)
+            | putstr("minVersion"; $tls_min_version)
+            | putstr("maxVersion"; $tls_max_version)
+            | putstr("cipherSuites"; $tls_cipher_suites)
+            | (if (csv($tls_curve_prefs)|length) > 0 then . + {curvePreferences: csv($tls_curve_prefs)} else . end)
+            | putstr("masterKeyLog"; $tls_master_key_log)
+            | putstr("echConfigList"; $tls_ech_config));
+      def reality_settings:
+        ({} | putstr("serverName"; $reality_server_name)
+            | putstr("fingerprint"; $reality_fingerprint)
+            | putstr("shortId"; $reality_short_id)
+            | putstr("password"; $reality_password)
+            | putstr("mldsa65Verify"; $reality_mldsa65_verify)
+            | putstr("spiderX"; $reality_spider_x));
+      def finalmask_settings:
+        (($finalmask // {})
+          | if nonempty($hy2_obfs) then
+              .udp = ((.udp // []) + [{type:$hy2_obfs, settings:({} | putstr("password"; $hy2_obfs_password))}])
+            else . end);
+      def stream_settings:
+        ({network:$network, security:$security}
+          | if $security == "tls" and (tls_settings | length) > 0 then . + {tlsSettings: tls_settings} else . end
+          | if $security == "reality" and (reality_settings | length) > 0 then . + {realitySettings: reality_settings} else . end
+          | if (finalmask_settings | length) > 0 then . + {finalmask: finalmask_settings} else . end
+          | if $network == "xhttp" then . + {xhttpSettings: ({} | putstr("host"; $xhttp_host) | putstr("path"; $xhttp_path) | putstr("mode"; $xhttp_mode) | if ($xhttp_extra|length) > 0 then . + {extra:$xhttp_extra} else . end)} else . end
+          | if $network == "raw" and nonempty($raw_header_type) then . + {rawSettings:{header:{type:$raw_header_type}}} else . end
+          | if $network == "ws" then . + {wsSettings: ({} | putstr("path"; $ws_path) | putstr("host"; $ws_host) | if ($ws_headers|length) > 0 then . + {headers:$ws_headers} else . end | putnum("heartbeatPeriod"; $ws_heartbeat))} else . end
+          | if $network == "grpc" then . + {grpcSettings: ({} | putstr("serviceName"; $grpc_service_name) | putstr("authority"; $grpc_authority) | putstr("user_agent"; $grpc_user_agent) | putbool("multiMode"; $grpc_multi_mode) | putnum("idle_timeout"; $grpc_idle_timeout) | putnum("health_check_timeout"; $grpc_health_check_timeout) | putbool("permit_without_stream"; $grpc_permit_without_stream) | putnum("initial_windows_size"; $grpc_initial_windows_size))} else . end
+          | if $network == "kcp" then . + {kcpSettings: ({} | putnum("mtu"; $kcp_mtu) | putnum("tti"; $kcp_tti) | putnum("uplinkCapacity"; $kcp_uplink) | putnum("downlinkCapacity"; $kcp_downlink) | putbool("congestion"; $kcp_congestion) | putnum("readBufferSize"; $kcp_read_buf) | putnum("writeBufferSize"; $kcp_write_buf))} else . end
+          | if $network == "httpupgrade" then . + {httpupgradeSettings: ({} | putstr("path"; $httpup_path) | putstr("host"; $httpup_host) | if ($httpup_headers|length) > 0 then . + {headers:$httpup_headers} else . end)} else . end
+          | if ($protocol == "hy2" or $protocol == "hysteria2") then . + {hysteriaSettings:{version:2, auth:$hy2_auth}} else . end
+          | . + {sockopt:{domainStrategy:"ForceIPv4"}});
+      {outbounds:[{tag:"XrayProxyRoS", protocol:$xray_protocol, settings:base_settings, streamSettings:stream_settings, mux:{enabled:$mux_enabled, concurrency:$mux_concurrency, xudpConcurrency:$mux_xudp_concurrency, xudpProxyUDP443:$mux_xudp_proxy_udp443}}]}
+      ' > /etc/xray/25_outbound.json
 }
 
 rm -f "/etc/xray/25_outbound.json"
 
 LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
-SCHEME="$(printf '%s' "$LINK" | cut -d':' -f1)"
+SCHEME="$(tolower "$(printf '%s' "$LINK" | cut -d':' -f1)")"
 
 case "$SCHEME" in
-    vless|vmess|trojan|ss|hy2)
+    vless|vmess|trojan|ss|hy2|hysteria2|wireguard|wg)
         parse "$LINK"
         ;;
     *)
@@ -1010,294 +1062,166 @@ case "$SCHEME" in
 esac
 
 config_file_xray() {
-cat > /etc/xray/20_log.json << EOF
-{
-  "log": {
-    "access": "${LOG_ACCESS}",
-    "error": "${LOG_ERROR}",
-    "loglevel": "${LOG_LEVEL}",
-    "dnsLog": ${LOG_DNS},
-    "maskAddress": "${LOG_MASK}"
-  }
-}
-EOF
-cat > /etc/xray/21_dns.json << EOF
-{
-  "dns": {
-    "tag": "dns-inbound",
-    "hosts": {
-      "dns.google": [
-        "8.8.8.8",
-        "8.8.4.4"
-      ],
-      "dns.quad9.net": [
-        "9.9.9.9",
-        "149.112.112.112"
-      ],
-      "cloudflare-dns.com": [
-        "104.16.248.249",
-        "104.16.249.249"
-      ]
-    },
-    "servers": [
-EOF
-if [ "$DNS_MODE" = "fake-ip" ]; then
-cat >> /etc/xray/21_dns.json << EOF
-      {
-        "tag": "fakeip",
-        "address": "fakedns"
-      },
-EOF
-fi
-cat >> /etc/xray/21_dns.json << EOF
-      {
-        "tag": "ParallelQuery",
-        "address": "https://dns.google/dns-query"
-      },
-      {
-        "tag": "ParallelQuery",
-        "address": "https://cloudflare-dns.com/dns-query"
-      },
-      {
-        "tag": "ParallelQuery",
-        "address": "https://dns.quad9.net/dns-query"
-      }
-    ],
-    "queryStrategy": "UseIPv4",
-    "enableParallelQuery": true
-  },
-  "fakedns": {
-    "ipPool": "${FAKE_IP_RANGE}",
-    "poolSize": ${FAKE_POOL_SIZE}
-  }
-}
-EOF
+  LOG_DNS_JSON="$(bool_or_empty "$LOG_DNS")"
+  [ -z "$LOG_DNS_JSON" ] && LOG_DNS_JSON=false
+  FAKE_IP_ENABLED=false
+  [ "$DNS_MODE" = "fake-ip" ] && FAKE_IP_ENABLED=true
+  QUIC_DROP_JSON="$(bool_or_empty "$QUIC_DROP")"
+  [ -z "$QUIC_DROP_JSON" ] && QUIC_DROP_JSON=false
+  UDP_TPROXY_ENABLED=false
+  [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ] && UDP_TPROXY_ENABLED=true
 
-cat > /etc/xray/22_routing.json << EOF
-{
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "inboundTag": ["ParallelQuery"],
-        "outboundTag": "direct"
-      },
-      {
-        "inboundTag": ["dns-in"],
-        "outboundTag": "dns"
-      }
-EOF
+  jq -n \
+    --arg access "$LOG_ACCESS" \
+    --arg error "$LOG_ERROR" \
+    --arg level "$LOG_LEVEL" \
+    --arg mask "$LOG_MASK" \
+    --argjson dns_log "$LOG_DNS_JSON" \
+    '{log:{access:$access,error:$error,loglevel:$level,dnsLog:$dns_log,maskAddress:$mask}}' \
+    > /etc/xray/20_log.json
 
-if [ "$QUIC_DROP" = "true" ]; then
-cat >> /etc/xray/22_routing.json << EOF
-      ,
-      {
-        "network": "udp",
-        "port": "443",        
-        "outboundTag": "block"
-      }
-EOF
-
-fi
-if [ "$DNS_MODE" = "fake-ip" ]; then
-cat >> /etc/xray/22_routing.json << EOF
-      ,
-      {
-        "inboundTag": ["all-in"],
-        "ip": ["${FAKE_IP_RANGE}"],
-        "network": "tcp",
-        "outboundTag": "block-http"
-      },
-      {
-        "inboundTag": ["all-in"],
-        "ip": ["${FAKE_IP_RANGE}"],
-        "network": "udp",
-        "outboundTag": "block"
-      },
-      {
-        "inboundTag": ["mixed-in"],
-        "ip": ["${FAKE_IP_RANGE}"],
-        "network": "tcp",
-        "outboundTag": "block-http"
-      },
-      {
-        "inboundTag": ["mixed-in"],
-        "ip": ["${FAKE_IP_RANGE}"],
-        "network": "udp",
-        "outboundTag": "block"
-      }
-EOF
-fi
-cat >> /etc/xray/22_routing.json << EOF
-    ]
-  }
-}
-EOF
-cat > /etc/xray/23_inbounds.json << EOF
-{
-  "inbounds": [
+  jq -n \
+    --arg fake_ip_range "$FAKE_IP_RANGE" \
+    --argjson fake_pool_size "$FAKE_POOL_SIZE" \
+    --argjson fake_ip_enabled "$FAKE_IP_ENABLED" '
     {
-        "tag": "dns-in",
-        "port": 53,
-        "protocol": "dokodemo-door",
-        "settings": {
-            "network": "tcp,udp"
-        }
-    },
-    {
-        "tag": "mixed-in",
-        "port": 1080, 
-        "protocol": "mixed",
-        "settings": {
-            "udp": true
+      dns:{
+        tag:"dns-inbound",
+        hosts:{
+          "dns.google":["8.8.8.8","8.8.4.4"],
+          "dns.quad9.net":["9.9.9.9","149.112.112.112"],
+          "cloudflare-dns.com":["104.16.248.249","104.16.249.249"]
         },
-        "sniffing": {
-            "enabled": true,
-            "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-            ],
-            "metadataOnly": false,
-            "routeOnly": true
-        }
-    },   
-EOF
-if [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ]; then
-cat >> /etc/xray/23_inbounds.json << EOF
-    {
-      "tag": "all-in-udp",
-      "port": 12346,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "network": "udp",
-        "followRedirect": true
+        servers:(
+          (if $fake_ip_enabled then [{tag:"fakeip",address:"fakedns"}] else [] end)
+          + [
+              {tag:"ParallelQuery",address:"https://dns.google/dns-query"},
+              {tag:"ParallelQuery",address:"https://cloudflare-dns.com/dns-query"},
+              {tag:"ParallelQuery",address:"https://dns.quad9.net/dns-query"}
+            ]
+        ),
+        queryStrategy:"UseIPv4",
+        enableParallelQuery:true
       },
-      "streamSettings": {
-        "sockopt": {
-          "tproxy": "tproxy"
-        }
-      },
-        "sniffing": {
-            "enabled": true,
-            "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-            ],
-            "metadataOnly": false,
-            "routeOnly": true
-        }
-    },
-EOF
-else
-cat >> /etc/xray/23_inbounds.json << EOF
-    {
-      "tag": "XrayTUN",
-      "port": 0,
-      "protocol": "tun",
-      "settings": {
-        "name": "Xray",
-        "MTU": 1500
-      },
-        "sniffing": {
-            "enabled": true,
-            "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-            ],
-            "metadataOnly": false,
-            "routeOnly": true
-        }
-    },
-EOF
-fi
-cat >> /etc/xray/23_inbounds.json << EOF
-    {
-      "tag": "all-in-tcp",
-      "port": 12345,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "network": "tcp",
-        "followRedirect": true
-      },
-      "streamSettings": {
-        "sockopt": {
-          "tproxy": "redirect"
-        }
-      },
-        "sniffing": {
-            "enabled": true,
-            "destOverride": [
-                "http",
-                "tls",
-                "quic",
-                "fakedns"
-            ],
-            "metadataOnly": false,
-            "routeOnly": true
-      }
-    }
-  ]
-}
-EOF
+      fakedns:{ipPool:$fake_ip_range,poolSize:$fake_pool_size}
+    }' \
+    > /etc/xray/21_dns.json
 
-cat > /etc/xray/24_outbounds.json << EOF
-{
-  "outbounds": [
-      {
-        "tag": "direct",
-        "protocol": "freedom",
-        "settings": {
-          "domainStrategy": "UseIPv4"
-        }
-      },
-      {
-        "tag": "block-http",
-        "protocol": "blackhole",
-        "settings": {
-          "response": {
-            "type": "http"
-          }
-        }
-      },
-      {
-        "tag": "block",
-        "protocol": "blackhole"
-      },
-      {
-        "tag": "dns",
-        "protocol": "dns",
-        "settings": {
-          "rules": [
-            {
-              "qType": 1,
-              "action": "hijack"
-            },
-            {
-              "qType": [
-                65,
-                28
-              ],
-              "rCode": 5,
-              "action": "return"
-            }
+  jq -n \
+    --arg fake_ip_range "$FAKE_IP_RANGE" \
+    --argjson fake_ip_enabled "$FAKE_IP_ENABLED" \
+    --argjson udp_tproxy_enabled "$UDP_TPROXY_ENABLED" \
+    --argjson quic_drop "$QUIC_DROP_JSON" '
+    {
+      routing:{
+        domainStrategy:"IPIfNonMatch",
+        rules:(
+          [
+            {inboundTag:["ParallelQuery"],outboundTag:"direct"},
+            {inboundTag:["dns-in"],outboundTag:"dns"}
           ]
-        }
+          + (if $quic_drop then [{network:"udp",port:"443",outboundTag:"block"}] else [] end)
+          + (if $fake_ip_enabled then [
+              {inboundTag:["all-in-tcp"],ip:[$fake_ip_range],network:"tcp",outboundTag:"block-http"},
+              (if $udp_tproxy_enabled then
+                {inboundTag:["all-in-udp"],ip:[$fake_ip_range],network:"udp",outboundTag:"block"}
+              else
+                {inboundTag:["XrayTUN"],ip:[$fake_ip_range],network:"udp",outboundTag:"block"}
+              end),
+              {inboundTag:["mixed-in"],ip:[$fake_ip_range],network:"tcp",outboundTag:"block-http"},
+              {inboundTag:["mixed-in"],ip:[$fake_ip_range],network:"udp",outboundTag:"block"}
+            ] else [] end)
+        )
       }
-  ]
-}
-EOF
+    }' \
+    > /etc/xray/22_routing.json
+
+  jq -n \
+    --argjson udp_tproxy_enabled "$UDP_TPROXY_ENABLED" '
+    def sniffing: {
+      enabled:true,
+      destOverride:["http","tls","quic","fakedns"],
+      metadataOnly:false,
+      routeOnly:true
+    };
+    {
+      inbounds:[
+        {
+          tag:"dns-in",
+          port:53,
+          protocol:"dokodemo-door",
+          settings:{network:"tcp,udp"}
+        },
+        {
+          tag:"mixed-in",
+          port:1080,
+          protocol:"mixed",
+          settings:{udp:true},
+          sniffing:sniffing
+        },
+        (if $udp_tproxy_enabled then
+          {
+            tag:"all-in-udp",
+            port:12346,
+            protocol:"dokodemo-door",
+            settings:{network:"udp",followRedirect:true},
+            streamSettings:{sockopt:{tproxy:"tproxy"}},
+            sniffing:sniffing
+          }
+        else
+          {
+            tag:"XrayTUN",
+            port:0,
+            protocol:"tun",
+            settings:{name:"Xray",MTU:1500},
+            sniffing:sniffing
+          }
+        end),
+        {
+          tag:"all-in-tcp",
+          port:12345,
+          protocol:"dokodemo-door",
+          settings:{network:"tcp",followRedirect:true},
+          streamSettings:{sockopt:{tproxy:"redirect"}},
+          sniffing:sniffing
+        }
+      ]
+    }' \
+    > /etc/xray/23_inbounds.json
+
+  jq -n '
+    {
+      outbounds:[
+        {tag:"direct",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},
+        {tag:"block-http",protocol:"blackhole",settings:{response:{type:"http"}}},
+        {tag:"block",protocol:"blackhole"},
+        {tag:"dns",protocol:"dns",settings:{rules:[{qType:[65,28],rCode:5,action:"return"}]}}
+      ]
+    }' \
+    > /etc/xray/24_outbounds.json
 }
 
 # ------------------- NFT -------------------
 nft_rules() {
   echo "Applying nftables..."
   nft flush ruleset || true
+
+  nft create table inet rawdrop
+  nft add chain inet rawdrop prerouting "{ type filter hook prerouting priority raw; policy accept; }"
+  nft add rule inet rawdrop prerouting ip daddr { $FAKE_IP_RANGE } meta l4proto != { tcp, udp } drop
+
+  nft create table inet filter
+  nft add chain inet filter input "{ type filter hook input priority filter; policy accept; }"
+  nft add rule inet filter input ct state { established, related, untracked } accept
+  nft add rule inet filter input ct state invalid drop
+  nft add chain inet filter forward "{ type filter hook forward priority filter; policy accept; }"
+  nft add rule inet filter forward ct state { established, related, untracked } accept
+  nft add rule inet filter forward ct state invalid drop
+
+  nft create table ip nat
+  nft add chain ip nat postrouting "{ type nat hook postrouting priority srcnat; policy accept; }"
+  nft add rule ip nat postrouting oifname "$iface" masquerade
+
 if [ "${TPROXY}" = "true" ]; then
   nft create table inet xray
   nft add chain inet xray pre_nat "{type nat hook prerouting priority dstnat + 1; policy accept;}"
@@ -1323,9 +1247,8 @@ else
   nft add rule inet xray pre ip daddr ${FAKE_IP_RANGE} meta l4proto tcp redirect to 12345
   nft add rule inet xray pre ip daddr { $iface_cidr, 127.0.0.0/8, 100.64.0.1/32, 224.0.0.0/4, 255.255.255.255 } return
   nft add rule inet xray pre meta l4proto tcp redirect to 12345
-  nft add table nat
-  nft add chain nat output '{ type nat hook output priority dstnat + 1; policy accept;}'
-  nft add rule nat output meta l4proto tcp oifname "Xray" redirect to 12345
+  nft add chain ip nat output "{ type nat hook output priority dstnat + 1; policy accept; }"
+  nft add rule ip nat output meta l4proto tcp oifname "Xray" redirect to 12345
   ip rule show | grep -q 'iif $iface ipproto tcp lookup main' || ip rule add iif $iface ipproto tcp lookup main priority 10000
   ip rule show | grep -q 'to $iface_cidr lookup main' || ip rule add to $iface_cidr lookup main priority 10001
   ip rule show | grep -q 'to 127.0.0.0/8 lookup main' || ip rule add to 127.0.0.0/8 lookup main priority 10002
@@ -1345,6 +1268,18 @@ iptables_rules() {
   iptables -t nat -X
   iptables -t mangle -F
   iptables -t mangle -X
+  iptables -t raw -F
+  iptables -t raw -X
+  iptables -t filter -F
+  iptables -t filter -X
+  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -p tcp -j RETURN
+  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -p udp -j RETURN
+  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -j DROP
+  iptables -t filter -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED,UNTRACKED -j ACCEPT
+  iptables -t filter -A INPUT -m conntrack --ctstate INVALID -j DROP
+  iptables -t filter -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED,UNTRACKED -j ACCEPT
+  iptables -t filter -A FORWARD -m conntrack --ctstate INVALID -j DROP
+  iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
   iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j RETURN
   iptables -t nat -A PREROUTING -m addrtype ! --dst-type UNICAST -j RETURN
   iptables -t nat -A PREROUTING -i $iface -p tcp -j REDIRECT --to-ports 12345
@@ -1391,9 +1326,9 @@ run() {
 
   config_file_xray
 
-  echo "Starting xray $(./xray --version)"
+  echo "Starting xray $(xray --version)"
 
-  ./xray run -confdir /etc/xray &
+  xray run -confdir /etc/xray &
   XRAY_PID=$!
 
   if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then

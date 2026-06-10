@@ -1218,7 +1218,7 @@ config_file_xray() {
         {tag:"direct",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},
         {tag:"block-http",protocol:"blackhole",settings:{response:{type:"http"}}},
         {tag:"block",protocol:"blackhole"},
-        {tag:"dns",protocol:"dns",settings:{rules:[{qType:[65,28],rCode:5,action:"return"}]}}
+        {tag:"dns",protocol:"dns",settings:{rules:[{qType:"65,28",rCode:5,action:"return"}]}}
       ]
     }' \
     > "$tmp"

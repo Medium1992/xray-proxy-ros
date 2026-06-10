@@ -2,7 +2,7 @@
 
 # xray-proxy-ros
 
-> Multi-arch Docker-контейнер для **MikroTik RouterOS** на базе [Xray-core](https://github.com/XTLS/Xray-core). Контейнер принимает прокси-ссылку через ENV, генерирует модульный JSON-конфиг Xray и отправляет RouterOS Fake-IP трафик через прокси.
+> Multi-arch Docker-контейнер для **MikroTik RouterOS** на базе [Xray-core](https://github.com/XTLS/Xray-core). Контейнер принимает прокси-ссылку через ENV, генерирует модульный JSON-конфиг Xray и может работать DNS-сервером с Fake-IP для сценариев роутинга в RouterOS.
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/medium1992/xray-proxy-ros?logo=docker&label=docker%20pulls)](https://hub.docker.com/r/medium1992/xray-proxy-ros)
 [![Docker Image Size](https://img.shields.io/docker/image-size/medium1992/xray-proxy-ros/latest?logo=docker&label=image%20size)](https://hub.docker.com/r/medium1992/xray-proxy-ros)
@@ -10,21 +10,20 @@
 ![Platforms](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv5-blue)
 [![Telegram](https://img.shields.io/badge/Telegram-group-blue?logo=telegram)](https://t.me/+96HVPF3Ww6o3YTNi)
 
-## Возможности
+## ✨ Возможности
 
 - **Multi-arch образ**: `amd64`, `arm64`, `arm/v7`, `arm/v5`.
-- **Stable и alpha сборки**: `latest` идет за стабильными релизами Xray, `alpha` идет за prerelease-сборками Xray.
+- **Stable и alpha образы**: `latest` собирается со стабильным релизом Xray-core, `alpha` собирается с последним prerelease Xray-core.
 - **Парсер прокси-ссылки** через `LINK`: `vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://` / `hysteria2://`, `wireguard://` / `wg://`.
 - **Актуальные транспорты Xray**: TCP, WS, HTTPUpgrade, gRPC, XHTTP, HTTP/2, KCP, QUIC и HTTP/3, если они описаны в ссылке.
-- **Fake-IP DNS по умолчанию**: RouterOS маршрутизирует Fake-IP пул на контейнер, а Xray отправляет этот трафик через прокси.
-- **Real-IP DNS режим** через `DNS_MODE=real-ip`: параллельные DoH-запросы к Google, Cloudflare и Quad9.
+- **Fake-IP DNS по умолчанию**: на каждый DNS-запрос контейнер отдает адрес из Fake-IP пула. Этот пул можно смаршрутизировать обратно в контейнер, чтобы дальнейший доступ к ресурсу шел через прокси.
+- **Real-IP DNS режим** через `DNS_MODE=real-ip`: выключает Fake-IP ответы и использует параллельные DoH-запросы к Google, Cloudflare и Quad9.
 - **Модульный конфиг**: сгенерированные JSON-фрагменты лежат в `/etc/xray/`, туда же можно монтировать свои JSON-файлы.
 - **Сетевые правила под RouterOS**: NFTables на `amd64`/`arm64` где доступно, legacy iptables fallback для старых платформ.
-- **Быстрая остановка**: контейнер завершает работу без долгих ожиданий, чтобы RouterOS не показывал красную ошибку при stop.
 
 > В основном проверяется на RouterOS 7.21+. Нужен пакет `container` и `device-mode container=yes`.
 
-## Теги образов
+## 🐳 Теги образов
 
 | Тег | Назначение |
 |---|---|
@@ -37,7 +36,7 @@
 - `ghcr.io/medium1992/xray-proxy-ros`
 - `medium1992/xray-proxy-ros`
 
-## Как это работает
+## ⚙️ Как это работает
 
 При старте entrypoint создает такие фрагменты конфига:
 
@@ -52,26 +51,26 @@
 
 Xray запускается с `/etc/xray/` как директорией multi-file config, поэтому дополнительные смонтированные JSON-файлы могут расширять конфигурацию по правилам Xray.
 
-## Переменные окружения
+## 🔧 Переменные окружения
 
 | ENV | По умолчанию | Описание |
 |---|---|---|
 | `LINK` | пусто | Прокси-ссылка. Поддерживаются схемы: `vless`, `vmess`, `trojan`, `ss`, `hy2`/`hysteria2`, `wireguard`/`wg`. |
-| `LOG_LEVEL` | `error` | Уровень логов Xray. |
+| `LOG_LEVEL` | `error` | Уровень логов Xray. [Docs](https://xtls.github.io/ru/config/log.html#logobject). |
 | `LOG_ACCESS` | пусто | Путь к access log. Пусто значит поведение Xray по умолчанию. |
 | `LOG_ERROR` | пусто | Путь к error log. Пусто значит поведение Xray по умолчанию. |
-| `LOG_DNS` | `false` | Включает логирование DNS-запросов в конфиге Xray DNS. |
+| `LOG_DNS` | `false` | Включает логирование DNS-запросов в конфиге Xray DNS. [Docs](https://xtls.github.io/ru/config/dns.html#dnsobject). |
 | `LOG_MASK` | пусто | Режим маскирования логов Xray, если поддерживается текущим ядром. |
-| `DNS_MODE` | `fake-ip` | `fake-ip` выдает Fake-IP адреса. Любое другое значение включает real-IP DoH режим. |
-| `FAKE_IP_RANGE` | `198.18.0.0/15` | Fake-IP пул, который маршрутизируется на контейнер. |
-| `MUX` | `false` | Включает Xray outbound mux. |
-| `MUX_CONCURRENCY` | `8` | Конкурентность TCP mux. |
-| `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | Конкурентность UDP mux. |
-| `MUX_XUDPPROXYUDP443` | `reject` | Обработка UDP/443 в Xray mux. |
+| `DNS_MODE` | `fake-ip` | `fake-ip` выдает адреса из Fake-IP пула. Любое другое значение выключает Fake-IP и возвращает IP-адреса ресурсов через DoH. |
+| `FAKE_IP_RANGE` | `198.18.0.0/15` | Диапазон Fake-IP пула. [Docs](https://xtls.github.io/ru/config/fakedns.html). |
+| `MUX` | `false` | Включение Xray outbound mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
+| `MUX_CONCURRENCY` | `8` | Конкурентность TCP mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
+| `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | Конкурентность UDP mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
+| `MUX_XUDPPROXYUDP443` | `reject` | Обработка UDP/443 в Xray mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
 | `TPROXY` | `true` | С NFTables: `true` использует Redirect TCP + TProxy UDP, `false` использует Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` добавляет в Xray routing правило блокировки UDP/443. |
 
-## Установка в RouterOS
+## 🛠 Установка в RouterOS
 
 Сначала проверьте, что установлен пакет `container` и включена поддержка контейнеров:
 
@@ -108,14 +107,14 @@ Xray запускается с `/etc/xray/` как директорией multi-
 
 После этого задайте свою прокси-ссылку в `LINK` и перезапустите контейнер.
 
-## Заметки
+## 📝 Заметки
 
-- В Fake-IP режиме нужно маршрутизировать `FAKE_IP_RANGE` на IP контейнера. За счет этого выбранный по DNS трафик уходит через Xray.
-- Если нужны реальные DNS-ответы, задайте `DNS_MODE=real-ip`.
+- В Fake-IP режиме Xray DNS возвращает адреса из `FAKE_IP_RANGE`. Этот пул нужно маршрутизировать на IP контейнера, если хотите чтобы запросы к таким ресурсам уходили через прокси.
+- Чтобы выключить Fake-IP ответы и возвращать IP-адреса ресурсов через DoH, задайте `DNS_MODE=real-ip`.
 - Для проверки prerelease-сборок Xray используйте `ghcr.io/medium1992/xray-proxy-ros:alpha`.
 - Контейнер не собирает Xray из исходников, а скачивает официальные архивы Xray-core во время Docker build.
 
-## Поддержка проекта
+## 💖 Поддержка проекта
 
 Если проект сэкономил время на настройке MikroTik:
 

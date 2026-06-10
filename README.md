@@ -2,7 +2,7 @@
 
 # xray-proxy-ros
 
-> Multi-arch Docker container for **MikroTik RouterOS** based on [Xray-core](https://github.com/XTLS/Xray-core). It accepts a proxy link through ENV, generates modular Xray JSON config, and routes RouterOS Fake-IP traffic through the proxy.
+> Multi-arch Docker container for **MikroTik RouterOS** based on [Xray-core](https://github.com/XTLS/Xray-core). It accepts a proxy link through ENV, generates modular Xray JSON config, and can work as a Fake-IP DNS server for RouterOS routing scenarios.
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/medium1992/xray-proxy-ros?logo=docker&label=docker%20pulls)](https://hub.docker.com/r/medium1992/xray-proxy-ros)
 [![Docker Image Size](https://img.shields.io/docker/image-size/medium1992/xray-proxy-ros/latest?logo=docker&label=image%20size)](https://hub.docker.com/r/medium1992/xray-proxy-ros)
@@ -10,21 +10,20 @@
 ![Platforms](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv5-blue)
 [![Telegram](https://img.shields.io/badge/Telegram-group-blue?logo=telegram)](https://t.me/+96HVPF3Ww6o3YTNi)
 
-## Features
+## ✨ Features
 
 - **Multi-arch image**: `amd64`, `arm64`, `arm/v7`, `arm/v5`.
-- **Stable and alpha builds**: `latest` follows stable Xray releases, `alpha` follows Xray prereleases.
+- **Stable and alpha images**: `latest` is built with the stable Xray-core release, `alpha` is built with the latest Xray-core prerelease.
 - **Proxy link parser** via `LINK`: `vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://` / `hysteria2://`, `wireguard://` / `wg://`.
 - **Modern Xray transports** including TCP, WS, HTTPUpgrade, gRPC, XHTTP, HTTP/2, KCP, QUIC and HTTP/3 where supported by the link.
-- **Fake-IP DNS mode** by default: RouterOS routes the Fake-IP pool to the container and Xray sends that traffic through the proxy.
-- **Real-IP DNS mode** via `DNS_MODE=real-ip`: parallel DoH queries to Google, Cloudflare and Quad9.
+- **Fake-IP DNS mode** by default: for every DNS request the container returns an address from the Fake-IP pool. That pool can then be routed back to the container so access to the requested resource goes through the proxy.
+- **Real-IP DNS mode** via `DNS_MODE=real-ip`: disables Fake-IP answers and uses parallel DoH queries to Google, Cloudflare and Quad9.
 - **Modular config**: generated JSON fragments live in `/etc/xray/`, and you can mount extra JSON files there.
 - **RouterOS-friendly network rules**: NFTables on `amd64`/`arm64` where available, legacy iptables fallback for older platforms.
-- **Fast stop handling**: the container exits cleanly enough for RouterOS without waiting for long shutdown chains.
 
 > Tested primarily with RouterOS 7.21+. Requires the `container` package and `device-mode container=yes`.
 
-## Image Tags
+## 🐳 Image Tags
 
 | Tag | Purpose |
 |---|---|
@@ -37,7 +36,7 @@ Images are published to:
 - `ghcr.io/medium1992/xray-proxy-ros`
 - `medium1992/xray-proxy-ros`
 
-## How It Works
+## ⚙️ How It Works
 
 At startup the entrypoint creates these config fragments:
 
@@ -52,26 +51,26 @@ At startup the entrypoint creates these config fragments:
 
 Xray is started with `/etc/xray/` as a multi-file config directory, so additional mounted JSON files can extend or override the generated setup according to Xray's multi-file config rules.
 
-## Environment Variables
+## 🔧 Environment Variables
 
 | ENV | Default | Description |
 |---|---|---|
 | `LINK` | empty | Proxy URL. Supported schemes: `vless`, `vmess`, `trojan`, `ss`, `hy2`/`hysteria2`, `wireguard`/`wg`. |
-| `LOG_LEVEL` | `error` | Xray log level. |
+| `LOG_LEVEL` | `error` | Xray log level. [Docs](https://xtls.github.io/en/config/log.html#logobject). |
 | `LOG_ACCESS` | empty | Access log path. Empty means Xray default. |
 | `LOG_ERROR` | empty | Error log path. Empty means Xray default. |
-| `LOG_DNS` | `false` | Enables DNS query logging in Xray DNS config. |
+| `LOG_DNS` | `false` | Enables DNS query logging in Xray DNS config. [Docs](https://xtls.github.io/en/config/dns.html#dnsobject). |
 | `LOG_MASK` | empty | Xray log masking mode, if supported by the current core. |
-| `DNS_MODE` | `fake-ip` | `fake-ip` returns Fake-IP addresses. Any other value enables real-IP DoH mode. |
-| `FAKE_IP_RANGE` | `198.18.0.0/15` | Fake-IP pool routed to the container. |
-| `MUX` | `false` | Enables Xray outbound mux. |
-| `MUX_CONCURRENCY` | `8` | TCP mux concurrency. |
-| `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | UDP mux concurrency. |
-| `MUX_XUDPPROXYUDP443` | `reject` | Xray mux UDP/443 handling. |
+| `DNS_MODE` | `fake-ip` | `fake-ip` returns addresses from the Fake-IP pool. Any other value disables Fake-IP and returns resource IP addresses from DoH. |
+| `FAKE_IP_RANGE` | `198.18.0.0/15` | Fake-IP pool range. [Docs](https://xtls.github.io/en/config/fakedns.html). |
+| `MUX` | `false` | Enables Xray outbound mux. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
+| `MUX_CONCURRENCY` | `8` | TCP mux concurrency. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
+| `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | UDP mux concurrency. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
+| `MUX_XUDPPROXYUDP443` | `reject` | Xray mux UDP/443 handling. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
 | `TPROXY` | `true` | With NFTables: `true` uses Redirect TCP + TProxy UDP, `false` uses Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` adds an Xray routing rule that blocks UDP/443. |
 
-## RouterOS Install
+## 🛠 RouterOS Install
 
 First, make sure the `container` package is installed and container support is enabled:
 
@@ -108,14 +107,14 @@ Example install for RouterOS 7.21+:
 
 Then put your proxy URL into `LINK` and restart the container.
 
-## Notes
+## 📝 Notes
 
-- In Fake-IP mode, route `FAKE_IP_RANGE` to the container IP. This is what makes domain-selected traffic leave through Xray.
-- For real DNS answers, set `DNS_MODE=real-ip`.
+- In Fake-IP mode, Xray DNS returns addresses from `FAKE_IP_RANGE`. Route this pool to the container when you want requests to those resources to go through the proxy.
+- To disable Fake-IP answers and return resource IP addresses from DoH, set `DNS_MODE=real-ip`.
 - To test prerelease Xray builds, use `ghcr.io/medium1992/xray-proxy-ros:alpha`.
 - The container does not build Xray itself; it downloads official Xray-core release archives during Docker build.
 
-## Support
+## 💖 Support
 
 If this project saved you time configuring MikroTik:
 

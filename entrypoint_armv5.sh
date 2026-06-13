@@ -2,6 +2,30 @@
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
+set_kernel_param /proc/sys/net/ipv4/ip_forward 0
+set_kernel_param /proc/sys/net/ipv6/conf/all/disable_ipv6 1
+set_kernel_param /proc/sys/net/ipv6/conf/default/disable_ipv6 1
+set_kernel_param /proc/sys/net/ipv6/conf/all/forwarding 0
+set_kernel_param /proc/sys/net/ipv6/conf/default/forwarding 0
+for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  set_kernel_param "$f" 1
+done
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 86400
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent 5
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv 5
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close 10
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_unacknowledged 300
+set_kernel_param /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream 180
+
+for iface in $(ip -o link show up | awk -F': ' '/link\/ether/ {gsub(/@.*$/,"",$2); if($2!="lo") print $2}'); do
+tc qdisc add dev $iface root fq_codel >/dev/null 2>&1;
+ip link set dev $iface multicast off >/dev/null 2>&1;
+done
+
 SHUTTING_DOWN=0
 XRAY_PID=""
 
@@ -20,22 +44,6 @@ sleep 1
 set_kernel_param() {
   [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null || true
 }
-
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 86400
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_sent 5
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_syn_recv 5
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait 10
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait 10
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack 10
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait 10
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close 10
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_unacknowledged 300
-set_kernel_param /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream 180
-
-for iface in $(ip -o link show up | awk -F': ' '/link\/ether/ {gsub(/@.*$/,"",$2); if($2!="lo") print $2}'); do
-tc qdisc add dev $iface root fq_codel >/dev/null 2>&1;
-ip link set dev $iface multicast off >/dev/null 2>&1;
-done
 
 set -eu
 TPROXY="${TPROXY:-true}"
@@ -1226,25 +1234,38 @@ config_file_xray() {
 }
 
 # ------------------- NFT -------------------
+setup_forward_nft() {
+  [ "${TPROXY}" = "true" ] && return 0
+
+  echo "Applying forward firewall..."
+
+  nft add table inet forward 2>/dev/null || true
+  nft add chain inet forward forward '{
+    type filter hook forward priority filter;
+    policy drop;
+  }' 2>/dev/null || true
+  nft add rule inet forward forward \
+    ct state { established, related, untracked } \
+    accept
+  nft add rule inet forward forward \
+    ct state invalid \
+    drop
+  nft add rule inet forward forward \
+    iifname "$iface" oifname "Xray" meta l4proto udp \
+    accept
+
+  set_kernel_param /proc/sys/net/ipv4/ip_forward 1
+}
+
 nft_rules() {
   echo "Applying nftables..."
   nft flush ruleset || true
-
-  nft create table inet rawdrop
-  nft add chain inet rawdrop prerouting "{ type filter hook prerouting priority raw; policy accept; }"
-  nft add rule inet rawdrop prerouting ip daddr { $FAKE_IP_RANGE } meta l4proto != { tcp, udp } drop
 
   nft create table inet filter
   nft add chain inet filter input "{ type filter hook input priority filter; policy accept; }"
   nft add rule inet filter input ct state { established, related, untracked } accept
   nft add rule inet filter input ct state invalid drop
-  nft add chain inet filter forward "{ type filter hook forward priority filter; policy accept; }"
-  nft add rule inet filter forward ct state { established, related, untracked } accept
-  nft add rule inet filter forward ct state invalid drop
-
-  nft create table ip nat
-  nft add chain ip nat postrouting "{ type nat hook postrouting priority srcnat; policy accept; }"
-  nft add rule ip nat postrouting oifname "$iface" masquerade
+  setup_forward_nft
 
 if [ "${TPROXY}" = "true" ]; then
   nft create table inet xray
@@ -1296,14 +1317,13 @@ iptables_rules() {
   iptables -t raw -X
   iptables -t filter -F
   iptables -t filter -X
-  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -p tcp -j RETURN
-  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -p udp -j RETURN
-  iptables -t raw -A PREROUTING -d $FAKE_IP_RANGE -j DROP
+  iptables -P FORWARD DROP
   iptables -t filter -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED,UNTRACKED -j ACCEPT
   iptables -t filter -A INPUT -m conntrack --ctstate INVALID -j DROP
   iptables -t filter -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED,UNTRACKED -j ACCEPT
   iptables -t filter -A FORWARD -m conntrack --ctstate INVALID -j DROP
-  iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+  iptables -t filter -A FORWARD -i "$iface" -o Xray -p udp -j ACCEPT
+  set_kernel_param /proc/sys/net/ipv4/ip_forward 1
   iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j RETURN
   iptables -t nat -A PREROUTING -m addrtype ! --dst-type UNICAST -j RETURN
   iptables -t nat -A PREROUTING -i $iface -p tcp -j REDIRECT --to-ports 12345

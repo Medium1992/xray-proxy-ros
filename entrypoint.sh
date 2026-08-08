@@ -263,6 +263,27 @@ EOF
     printf '%s' "$OUT"
 }
 
+append_fragment_finalmask() {
+    fragment_value="$1"
+    [ -z "$fragment_value" ] && return
+
+    fragment_settings="$(printf '%s' "$fragment_value" | jq -Rc '
+      split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) as $parts
+      | if ($parts | length) == 3 and ($parts | all(length > 0)) then
+          {packets:$parts[2], length:$parts[0], delay:$parts[1]}
+        else
+          {packets:., length:"100-200", delay:"1-1"}
+        end
+    ' 2>/dev/null || true)"
+    [ -z "$fragment_settings" ] && return
+
+    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --argjson settings "$fragment_settings" '
+      if type != "object" then {} else . end
+      | .tcp = ((.tcp // []) + [{"type":"fragment","settings":$settings}])
+    ' 2>/dev/null || printf '{}')"
+    FINALMASK_USED=true
+}
+
 parse() {
 
     LINK_NOPATH="$(printf '%s' "$LINK" | cut -d'#' -f1)"
@@ -477,14 +498,16 @@ parse() {
         VMESS_MODE="$(printf '%s' "$JSON" | jq -r '.mode // empty' 2>/dev/null || true)"
         VMESS_EXTRA="$(printf '%s' "$JSON" | jq -c '.extra // empty' 2>/dev/null || true)"
         VMESS_FM="$(printf '%s' "$JSON" | jq -r '.fm // empty' 2>/dev/null || true)"
+        VMESS_FRAGMENT="$(printf '%s' "$JSON" | jq -r '.fragment // empty' 2>/dev/null || true)"
         [ -n "$VMESS_FM" ] && FINALMASK_JSON="$(json_object_or_empty_string "$VMESS_FM")" && [ -n "$FINALMASK_JSON" ] && FINALMASK_USED=true
+        append_fragment_finalmask "$VMESS_FRAGMENT"
 
         [ -n "$WS_PATH" ] && WS_USED=true
         [ -n "$WS_HOST" ] && WS_USED=true
         [ -n "$TLS_SERVER_NAME$TLS_FINGERPRINT$TLS_ALPN$TLS_ECH_CONFIG$TLS_PINNED_CERT" ] && TLS_USED=true
         [ -n "$REALITY_SERVER_NAME$REALITY_FINGERPRINT$REALITY_PASSWORD$REALITY_SHORT_ID$REALITY_SPIDER_X$REALITY_MLDSA65_VERIFY" ] && REALITY_USED=true
 
-        if [ "$NETWORK" = "grpc" ]; then
+        if [ "$NETWORK" = "grpc" ] || [ "$NETWORK" = "gun" ]; then
             GRPC_SERVICE_NAME="$WS_PATH"
             GRPC_AUTHORITY="$WS_HOST"
             case "$VMESS_MODE:$VMESS_HEADER_TYPE" in
@@ -605,7 +628,7 @@ parse() {
             mode)
                 XHTTP_MODE="$val"
                 XHTTP_USED=true
-                if [ "$NETWORK" = "grpc" ]; then
+                if [ "$NETWORK" = "grpc" ] || [ "$NETWORK" = "gun" ]; then
                     case "$val" in
                         multi) GRPC_MULTI_MODE="true" ;;
                         gun) GRPC_MULTI_MODE="false" ;;
@@ -762,7 +785,7 @@ parse() {
             insecure)
                 # Removed from current Xray; ignore old panel links instead of emitting invalid JSON.
                 ;;
-            verifyPeerCertByName)
+            verifyPeerCertByName|vcn)
                 TLS_VERIFY_NAMES="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
@@ -833,13 +856,7 @@ parse() {
                 ;;
             fragment)
                 DECODED_FRAGMENT="$(urldecode "$val")"
-                if [ -n "$DECODED_FRAGMENT" ]; then
-                    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg packets "$DECODED_FRAGMENT" '
-                      if type != "object" then {} else . end
-                      | .tcp = ((.tcp // []) + [{"type":"fragment","settings":{"packets":$packets,"length":"100-200","delay":"1-1"}}])
-                    ' 2>/dev/null || printf '{}')"
-                    FINALMASK_USED=true
-                fi
+                append_fragment_finalmask "$DECODED_FRAGMENT"
                 ;;
         esac
     done
@@ -856,6 +873,10 @@ parse() {
             ;;
         websocket)
             NETWORK="ws"
+            ;;
+        gun)
+            NETWORK="grpc"
+            GRPC_USED=true
             ;;
         splithttp)
             NETWORK="xhttp"
@@ -1222,7 +1243,7 @@ config_file_xray() {
             tag:"XrayTUN",
             port:0,
             protocol:"tun",
-            settings:{name:"Xray",MTU:1500},
+            settings:{name:"Xray",MTU:1500,gateway:["100.64.0.1/32"]},
             sniffing:sniffing
           }
         end),
@@ -1397,8 +1418,6 @@ run() {
 
   if [ "$USE_NFT" = "false" ] || [ "${TPROXY}" = "false" ]; then
   wait_for_tun
-  ip addr add 100.64.0.1/32 dev Xray
-  ip link set Xray up
   fi
 
   if [ "$USE_NFT" = "true" ]; then

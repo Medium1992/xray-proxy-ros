@@ -21,8 +21,21 @@ jobs:
 
       - name: Get latest Xray prerelease
         id: upstream
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASES_JSON=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100)
+          gh_curl() {
+            if [ -n "${GH_API_TOKEN:-}" ]; then
+              curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_API_TOKEN" "$@"
+            else
+              curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+                -H "Accept: application/vnd.github+json" "$@"
+            fi
+          }
+
+          RELEASES_JSON=$(gh_curl https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100)
           TAG=$(echo "$RELEASES_JSON" | jq -r '[.[] | select(.prerelease == true and .draft == false)][0].tag_name // empty')
 
           if [ -z "$TAG" ]; then
@@ -127,6 +140,8 @@ jobs:
           push: true
           build-args: |
             XRAY_RELEASE_TAG=${{ needs.alpha-check.outputs.tag }}
+          secrets: |
+            gh_token=${{ secrets.GITHUB_TOKEN }}
           tags: |
             ghcr.io/medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
             ghcr.io/medium1992/xray-proxy-ros:alpha

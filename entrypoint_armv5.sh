@@ -99,6 +99,10 @@ urldecode() {
     printf '%b' "$(printf '%s' "$1" | sed 's/%/\\x/g')"
 }
 
+querydecode() {
+    urldecode "$(printf '%s' "$1" | tr '+' ' ')"
+}
+
 tolower() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
@@ -264,6 +268,17 @@ append_fragment_finalmask() {
     FINALMASK_USED=true
 }
 
+set_hy2_udp_hop_ports() {
+    hy2_ports="$1"
+    [ -z "$hy2_ports" ] && return
+
+    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg ports "$hy2_ports" '
+      if type != "object" then {} else . end
+      | .quicParams = ((.quicParams // {}) | .udpHop = ((.udpHop // {}) + {ports:$ports}))
+    ' 2>/dev/null || printf '{}')"
+    FINALMASK_USED=true
+}
+
 parse() {
 
     LINK_NOPATH="$(printf '%s' "$LINK" | cut -d'#' -f1)"
@@ -308,7 +323,7 @@ parse() {
                 PORT=""
                 ;;
         esac
-        PORT="$(printf '%s' "$PORT" | tr -cd '0-9')"
+        PORT="$(trim "$PORT")"
     fi
 
     UUID=""
@@ -373,6 +388,7 @@ parse() {
     HY2_AUTH=""
     HY2_OBFS=""
     HY2_OBFS_PASSWORD=""
+    HY2_PORTS=""
     HY2_USED=false
 
     TLS_SERVER_NAME=""
@@ -431,7 +447,16 @@ parse() {
             PASSWORD="$(printf '%s' "$SS_DECODED" | cut -d':' -f2-)"
             ;;
         hy2|hysteria2)
-            HY2_AUTH="$CREDS"
+            HY2_AUTH="$(urldecode "$CREDS")"
+            case "$PORT" in
+                "") PORT="443" ;;
+                *,*|*-*)
+                    HY2_PORTS="$PORT"
+                    PORT="${PORT%%,*}"
+                    PORT="${PORT%%-*}"
+                    set_hy2_udp_hop_ports "$HY2_PORTS"
+                    ;;
+            esac
             HY2_USED=true
             ;;
         wireguard|wg)
@@ -727,20 +752,14 @@ parse() {
                 KCP_USED=true
                 ;;
             obfs)
-                HY2_OBFS="$val"
+                HY2_OBFS="$(tolower "$(urldecode "$val")")"
                 ;;
             obfs-password)
-                HY2_OBFS_PASSWORD="$(urldecode "$val")"
+                HY2_OBFS_PASSWORD="$(querydecode "$val")"
                 ;;
             mport)
                 DECODED_MPORT="$(urldecode "$val")"
-                if [ -n "$DECODED_MPORT" ]; then
-                    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg ports "$DECODED_MPORT" '
-                      if type != "object" then {} else . end
-                      | .quicParams.udpHop.ports = $ports
-                    ' 2>/dev/null || printf '{}')"
-                    FINALMASK_USED=true
-                fi
+                set_hy2_udp_hop_ports "$DECODED_MPORT"
                 ;;
             sni)
                 DECODED_SNI="$(urldecode "$val")"
@@ -1068,7 +1087,11 @@ parse() {
       def finalmask_settings:
         (($finalmask // {})
           | if nonempty($hy2_obfs) then
-              .udp = ((.udp // []) + [{type:$hy2_obfs, settings:({} | putstr("password"; $hy2_obfs_password))}])
+              if $hy2_obfs == "gecko" then
+                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | .packetSize="512-1200")}])
+              elif $hy2_obfs == "salamander" then
+                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password))}])
+              else . end
             else . end);
       def stream_settings:
         ({network:$network, security:$security}

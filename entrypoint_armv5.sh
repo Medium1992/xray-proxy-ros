@@ -288,6 +288,8 @@ parse() {
     [ "$PROTOCOL" = "ss" ] && XRAY_PROTOCOL="shadowsocks"
     [ "$PROTOCOL" = "hy2" ] && XRAY_PROTOCOL="hysteria"
     [ "$PROTOCOL" = "hysteria2" ] && XRAY_PROTOCOL="hysteria"
+    [ "$PROTOCOL" = "hysteria2+realm" ] && XRAY_PROTOCOL="hysteria"
+    [ "$PROTOCOL" = "hysteria2+realm+http" ] && XRAY_PROTOCOL="hysteria"
     [ "$PROTOCOL" = "wg" ] && XRAY_PROTOCOL="wireguard"
     if [ "$PROTOCOL" != "vmess" ]; then
         CREDS="${LINK_NOPATH%@*}"
@@ -389,6 +391,10 @@ parse() {
     HY2_OBFS=""
     HY2_OBFS_PASSWORD=""
     HY2_PORTS=""
+    HY2_REALM_URL=""
+    HY2_REALM_STUN='["stun.nextcloud.com:3478","stun.sip.us:3478","global.stun.twilio.com:3478"]'
+    HY2_REALM_STUN_CUSTOM=false
+    HY2_REALM_LPORT=""
     HY2_USED=false
 
     TLS_SERVER_NAME=""
@@ -448,6 +454,8 @@ parse() {
             ;;
         hy2|hysteria2)
             HY2_AUTH="$(urldecode "$CREDS")"
+            SECURITY="tls"
+            TLS_USED=true
             case "$PORT" in
                 "") PORT="443" ;;
                 *,*|*-*)
@@ -455,6 +463,22 @@ parse() {
                     PORT="${PORT%%,*}"
                     PORT="${PORT%%-*}"
                     set_hy2_udp_hop_ports "$HY2_PORTS"
+                    ;;
+            esac
+            HY2_USED=true
+            ;;
+        hysteria2+realm|hysteria2+realm+http)
+            REALM_SCHEME="realm"
+            [ "$PROTOCOL" = "hysteria2+realm+http" ] && REALM_SCHEME="realm+http"
+            REALM_PATH="$(printf '%s' "$REST" | cut -d'?' -f1)"
+            REALM_PATH="${REALM_PATH#*/}"
+            HY2_REALM_URL="${REALM_SCHEME}://${CREDS}@${HOSTPORT}/${REALM_PATH}"
+            HY2_AUTH=""
+            SECURITY="tls"
+            TLS_USED=true
+            case "$PORT" in
+                "")
+                    [ "$REALM_SCHEME" = "realm+http" ] && PORT="80" || PORT="443"
                     ;;
             esac
             HY2_USED=true
@@ -757,6 +781,19 @@ parse() {
             obfs-password)
                 HY2_OBFS_PASSWORD="$(querydecode "$val")"
                 ;;
+            auth)
+                HY2_AUTH="$(querydecode "$val")"
+                ;;
+            stun)
+                if [ -n "$HY2_REALM_URL" ]; then
+                    DECODED_STUN="$(querydecode "$val")"
+                    [ "$HY2_REALM_STUN_CUSTOM" = false ] && HY2_REALM_STUN='[]' && HY2_REALM_STUN_CUSTOM=true
+                    [ -n "$DECODED_STUN" ] && HY2_REALM_STUN="$(printf '%s' "$HY2_REALM_STUN" | jq -c --arg stun "$DECODED_STUN" '. + [$stun]' 2>/dev/null || printf '[]')"
+                fi
+                ;;
+            lport)
+                [ -n "$HY2_REALM_URL" ] && HY2_REALM_LPORT="$(querydecode "$val")"
+                ;;
             mport)
                 DECODED_MPORT="$(urldecode "$val")"
                 set_hy2_udp_hop_ports "$DECODED_MPORT"
@@ -919,6 +956,10 @@ parse() {
         esac
     fi
 
+    if [ -n "$HY2_REALM_LPORT" ]; then
+        echo "Hysteria Realm lport is not supported by current Xray and will be ignored" >&2
+    fi
+
     PORT="$(int_or_default "$PORT" 0)"
     VLESS_LEVEL="$(int_or_default "$VLESS_LEVEL" 0)"
     VMESS_LEVEL="$(int_or_default "$VMESS_LEVEL" 0)"
@@ -980,6 +1021,7 @@ parse() {
       --arg hy2_auth "$HY2_AUTH" \
       --arg hy2_obfs "$HY2_OBFS" \
       --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
+      --arg hy2_realm_url "$HY2_REALM_URL" \
       --arg tls_server_name "$TLS_SERVER_NAME" \
       --arg tls_fingerprint "$TLS_FINGERPRINT" \
       --arg tls_min_version "$TLS_MIN_VERSION" \
@@ -1021,6 +1063,7 @@ parse() {
       --argjson httpup_headers "$HTTPUP_HEADERS_JSON" \
       --argjson xhttp_extra "$XHTTP_EXTRA_JSON" \
       --argjson finalmask "$FINALMASK_JSON" \
+      --argjson hy2_realm_stun "$HY2_REALM_STUN" \
       --argjson ws_heartbeat "$WS_HEARTBEAT" \
       --argjson grpc_idle_timeout "$GRPC_IDLE_TIMEOUT" \
       --argjson grpc_health_check_timeout "$GRPC_HEALTH_CHECK_TIMEOUT" \
@@ -1048,7 +1091,7 @@ parse() {
           ({address:$address, port:$port, password:$password, level:$trojan_level} | putstr("email"; $email) | putstr("flow"; $vless_flow))
         elif $protocol == "ss" then
           ({address:$address, port:$port, method:$method, password:$password, uot:true, UoTVersion:2, level:$ss_level} | putstr("email"; $email))
-        elif ($protocol == "hy2" or $protocol == "hysteria2") then
+        elif ($protocol == "hy2" or $protocol == "hysteria2" or $protocol == "hysteria2+realm" or $protocol == "hysteria2+realm+http") then
           {version:2, address:$address, port:$port}
         elif ($protocol == "wireguard" or $protocol == "wg") then
           ({secretKey:$wg_secret_key,
@@ -1086,6 +1129,9 @@ parse() {
             | putstr("spiderX"; $reality_spider_x));
       def finalmask_settings:
         (($finalmask // {})
+          | if nonempty($hy2_realm_url) then
+              .udp = ([{type:"realm", settings:{url:$hy2_realm_url, stunServers:$hy2_realm_stun}}] + (.udp // []))
+            else . end
           | if nonempty($hy2_obfs) then
               if $hy2_obfs == "gecko" then
                 .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | .packetSize="512-1200")}])
@@ -1104,7 +1150,7 @@ parse() {
           | if $network == "grpc" then . + {grpcSettings: ({} | putstr("serviceName"; $grpc_service_name) | putstr("authority"; $grpc_authority) | putstr("user_agent"; $grpc_user_agent) | putbool("multiMode"; $grpc_multi_mode) | putnum("idle_timeout"; $grpc_idle_timeout) | putnum("health_check_timeout"; $grpc_health_check_timeout) | putbool("permit_without_stream"; $grpc_permit_without_stream) | putnum("initial_windows_size"; $grpc_initial_windows_size))} else . end
           | if $network == "kcp" then . + {kcpSettings: ({} | putnum("mtu"; $kcp_mtu) | putnum("tti"; $kcp_tti) | putnum("uplinkCapacity"; $kcp_uplink) | putnum("downlinkCapacity"; $kcp_downlink) | putbool("congestion"; $kcp_congestion) | putnum("readBufferSize"; $kcp_read_buf) | putnum("writeBufferSize"; $kcp_write_buf))} else . end
           | if $network == "httpupgrade" then . + {httpupgradeSettings: ({} | putstr("path"; $httpup_path) | putstr("host"; $httpup_host) | if ($httpup_headers|length) > 0 then . + {headers:$httpup_headers} else . end)} else . end
-          | if ($protocol == "hy2" or $protocol == "hysteria2") then . + {hysteriaSettings:{version:2, auth:$hy2_auth}} else . end
+          | if ($protocol == "hy2" or $protocol == "hysteria2" or $protocol == "hysteria2+realm" or $protocol == "hysteria2+realm+http") then . + {hysteriaSettings:{version:2, auth:$hy2_auth}} else . end
           | . + {sockopt:{domainStrategy:"ForceIPv4"}});
       {outbounds:[{tag:"XrayProxyRoS", protocol:$xray_protocol, settings:base_settings, streamSettings:stream_settings, mux:{enabled:$mux_enabled, concurrency:$mux_concurrency, xudpConcurrency:$mux_xudp_concurrency, xudpProxyUDP443:$mux_xudp_proxy_udp443}}]}
       ' > "$tmp"
@@ -1115,7 +1161,7 @@ LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(tolower "$(printf '%s' "$LINK" | cut -d':' -f1)")"
 
 case "$SCHEME" in
-    vless|vmess|trojan|ss|hy2|hysteria2|wireguard|wg)
+    vless|vmess|trojan|ss|hy2|hysteria2|hysteria2+realm|hysteria2+realm+http|wireguard|wg)
         parse "$LINK"
         ;;
     "")

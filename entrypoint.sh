@@ -1312,7 +1312,7 @@ config_file_xray() {
             tag:"XrayTUN",
             port:0,
             protocol:"tun",
-            settings:{name:"Xray",MTU:1500,gateway:["100.64.0.1/32"]},
+            settings:{name:"Xray",MTU:1500,gateway:["100.64.0.1/30"]},
             sniffing:sniffing
           }
         end),

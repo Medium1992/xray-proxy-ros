@@ -87,16 +87,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          URL=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" \
-            --jq '.assets[] | select(.name == "version.txt") | .url' 2>/dev/null || true)
-
-          CURRENT="none"
-          if [ -n "$URL" ]; then
-            CURRENT=$(gh api -H "Accept: application/octet-stream" "$URL" 2>/dev/null | tr -d '\r\n' || true)
+          # Пока релиза нет, gh api отвечает 404 телом в stdout, поэтому
+          # разбираем ответ только после успешного запроса.
+          current="none"
+          if response=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" 2>/dev/null); then
+            url=$(printf '%s' "$response" | jq -r '.assets[]? | select(.name == "version.txt") | .url' 2>/dev/null | head -n1 || true)
+            if [ -n "$url" ]; then
+              current=$(gh api -H "Accept: application/octet-stream" "$url" 2>/dev/null | tr -d '\r\n' || true)
+            fi
           fi
-          [ -n "$CURRENT" ] || CURRENT="none"
+          [ -n "$current" ] || current="none"
 
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether a build is needed
         id: compare
@@ -192,13 +194,27 @@ jobs:
 
       # Релиз катящийся, поэтому старый сносится целиком вместе с тегом: иначе
       # softprops дописывает ассеты к уже существующему набору.
+      # Релиз катящийся, поэтому старый сносится целиком вместе с тегом: иначе
+      # softprops дописывает ассеты к уже существующему набору.
+      #
+      # gh api печатает тело ответа в stdout и при 404, а --jq к неуспешному
+      # запросу не применяется, поэтому подстановка отдавала JSON ошибки как
+      # значение id. Берём его только когда запрос действительно удался.
       - name: Replace the alpha release
         run: |
           set -euo pipefail
-          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" --jq '.id' 2>/dev/null || true)
-          if [ -n "$RELEASE_ID" ]; then
-            gh api -X DELETE "repos/${{ github.repository }}/releases/${RELEASE_ID}"
+          release_id=""
+          if response=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" 2>/dev/null); then
+            release_id=$(printf '%s' "$response" | jq -r '.id // empty' 2>/dev/null || true)
           fi
+
+          if printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+            echo "Deleting release $release_id"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/${release_id}"
+          else
+            echo "No alpha release to delete"
+          fi
+
           if gh api "repos/${{ github.repository }}/git/refs/tags/alpha" >/dev/null 2>&1; then
             gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/alpha"
           fi

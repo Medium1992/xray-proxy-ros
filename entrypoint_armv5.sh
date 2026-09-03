@@ -972,11 +972,20 @@ parse() {
         echo "Hysteria Realm lport is not supported by current Xray and will be ignored" >&2
     fi
 
-    # 3x-ui carries the gecko packet range in its own URI fields; Xray reads it
-    # as one salamander packetSize range and falls back to hysteria's defaults.
-    HY2_PACKET_SIZE="512-1200"
+    # Xray has no gecko mask type: the mask is always salamander, and gecko is
+    # what a packetSize range turns it into. So the range decides, not the obfs
+    # name, and Xray rejects the whole config outside 1-2048.
+    HY2_PACKET_SIZE=""
     if [ -n "$HY2_PACKET_MIN" ] && [ -n "$HY2_PACKET_MAX" ]; then
-        HY2_PACKET_SIZE="${HY2_PACKET_MIN}-${HY2_PACKET_MAX}"
+        if [ "$HY2_PACKET_MIN" -ge 1 ] && [ "$HY2_PACKET_MAX" -le 2048 ] && [ "$HY2_PACKET_MIN" -le "$HY2_PACKET_MAX" ]; then
+            HY2_PACKET_SIZE="${HY2_PACKET_MIN}-${HY2_PACKET_MAX}"
+        else
+            echo "Hysteria packet size ${HY2_PACKET_MIN}-${HY2_PACKET_MAX} is outside Xray's 1-2048 range and will be ignored" >&2
+        fi
+    fi
+    # obfs=gecko without an explicit range means hysteria's own gecko defaults.
+    if [ -z "$HY2_PACKET_SIZE" ] && [ "$HY2_OBFS" = "gecko" ]; then
+        HY2_PACKET_SIZE="512-1200"
     fi
 
     PORT="$(int_or_default "$PORT" 0)"
@@ -1152,12 +1161,8 @@ parse() {
           | if nonempty($hy2_realm_url) then
               .udp = ([{type:"realm", settings:{url:$hy2_realm_url, stunServers:$hy2_realm_stun}}] + (.udp // []))
             else . end
-          | if nonempty($hy2_obfs) then
-              if $hy2_obfs == "gecko" then
-                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | .packetSize=$hy2_packet_size)}])
-              elif $hy2_obfs == "salamander" then
-                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password))}])
-              else . end
+          | if ($hy2_obfs == "salamander" or $hy2_obfs == "gecko") then
+              .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | putstr("packetSize"; $hy2_packet_size))}])
             else . end);
       def stream_settings:
         ({network:$network, security:$security}

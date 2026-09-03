@@ -1,0 +1,5 @@
+# Всё, что попадает в контейнер, обязано быть с LF: CRLF в шебанге
+# (`#!/bin/sh^M`) ломает запуск entrypoint, а разработка идёт с Windows, где
+# core.autocrlf=true иначе подсунет CRLF при клонировании.
+* text=auto eol=lf
+*.tar binary

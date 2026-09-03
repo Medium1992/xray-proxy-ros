@@ -1,0 +1,64 @@
+# Сборка ядра Xray из исходников. Образ отсюда не собирается: последняя стадия
+# отдаёт наружу один бинарник, который воркфлоу кладёт в релиз, а уже оттуда его
+# забирает основной Dockerfile.
+#
+#   docker buildx build -f Dockerfile-release \
+#     --platform linux/arm64 \
+#     --build-arg XRAY_REF=v26.7.28 \
+#     --build-arg GO_VERSION=1.27.1 \
+#     --output type=local,dest=out .
+#
+# Xray собирается стоковым Go, поэтому тулчейн берётся официальным образом
+# golang, а не тарболлом форка, как это приходится делать для mihomo.
+ARG GO_VERSION
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS package
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG XRAY_REPO=XTLS/Xray-core
+ARG XRAY_REF
+
+# go.mod апстрима закрепляет более старую версию языка, и GOTOOLCHAIN=local
+# запрещает Go молча подтянуть себе другой тулчейн: собираем ровно тем, что
+# в образе, а несовместимость всплывает ошибкой, а не тихой подменой.
+ENV GOTOOLCHAIN=local \
+    CGO_ENABLED=0
+RUN apk add --no-cache git && go version
+
+RUN mkdir -p /final
+
+# Клон полный: core.build берётся из git describe, которому нужны теги.
+RUN [ -n "$XRAY_REF" ] || { echo "XRAY_REF build arg is required" >&2; exit 1; }; \
+    git clone "https://github.com/${XRAY_REPO}.git" /src
+
+WORKDIR /src
+
+RUN git checkout --detach "$XRAY_REF" \
+    || { echo "Failed to check out ${XRAY_REPO}@${XRAY_REF}" >&2; exit 1; }
+
+RUN go mod download
+
+# Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
+# бинарник отличался от официального только версией тулчейна.
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      arm) \
+        case "$TARGETVARIANT" in \
+          v5) GOARM=5 ;; \
+          v6) GOARM=6 ;; \
+          v7|"") GOARM=7 ;; \
+          *) echo "Unsupported ARM variant: $TARGETVARIANT" >&2; exit 1 ;; \
+        esac; \
+        export GOARM; \
+        ;; \
+    esac; \
+    COMMID="$(git describe --always --dirty)"; \
+    echo "Building ${XRAY_REPO}@${XRAY_REF} (${COMMID}) for ${TARGETOS}/${TARGETARCH}${TARGETVARIANT:+/}${TARGETVARIANT} with $(go version)"; \
+    GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -o /final/xray -trimpath -buildvcs=false \
+      -gcflags="all=-l=4" \
+      -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
+      -v ./main
+
+FROM scratch AS export
+COPY --from=package /final /

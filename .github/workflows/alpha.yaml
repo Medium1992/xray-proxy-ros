@@ -127,57 +127,40 @@ jobs:
       matrix:
         include:
           - asset: Xray-linux-64.zip
-            goarch: amd64
-            goarm: ""
+            platform: linux/amd64
           - asset: Xray-linux-arm64-v8a.zip
-            goarch: arm64
-            goarm: ""
+            platform: linux/arm64
           - asset: Xray-linux-arm32-v7a.zip
-            goarch: arm
-            goarm: "7"
+            platform: linux/arm/v7
           - asset: Xray-linux-arm32-v5.zip
-            goarch: arm
-            goarm: "5"
-    env:
-      GOOS: linux
-      GOARCH: ${{ matrix.goarch }}
-      GOARM: ${{ matrix.goarm }}
-      CGO_ENABLED: 0
+            platform: linux/arm/v5
 
     steps:
-      - name: Check out Xray-core at the resolved commit
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.XRAY_REPO }}
-          ref: ${{ needs.alpha-check.outputs.sha }}
-          # git describe нужен весь граф с тегами: из него берётся core.build.
-          fetch-depth: 0
+      - uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ needs.alpha-check.outputs.go_version }}
+      - uses: docker/setup-buildx-action@v4
 
-      - name: Get project dependencies
-        run: go mod download
-
-      # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы
-      # свой бинарник отличался от официального только версией тулчейна.
-      - name: Build Xray
+      # Кросс-компиляция: все стадии Dockerfile-release идут на BUILDPLATFORM,
+      # а целевая архитектура приходит аргументами, поэтому QEMU не нужен.
+      - name: Build the Xray core
         run: |
           set -euo pipefail
-          mkdir -p build_assets
-          COMMID=$(git describe --always --dirty)
-          go build -o build_assets/xray -trimpath -buildvcs=false \
-            -gcflags="all=-l=4" \
-            -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
-            -v ./main
+          docker buildx build \
+            -f Dockerfile-release \
+            --platform ${{ matrix.platform }} \
+            --build-arg XRAY_REPO=${{ env.XRAY_REPO }} \
+            --build-arg XRAY_REF=${{ needs.alpha-check.outputs.sha }} \
+            --build-arg GO_VERSION=${{ needs.alpha-check.outputs.go_version }} \
+            --output type=local,dest=out \
+            --progress=plain \
+            .
 
       - name: Package the asset
         run: |
           set -euo pipefail
           mkdir -p dist
-          (cd build_assets && zip -9 "${GITHUB_WORKSPACE}/dist/${{ matrix.asset }}" xray)
+          chmod 0755 out/xray
+          (cd out && zip -9 "${GITHUB_WORKSPACE}/dist/${{ matrix.asset }}" xray)
 
       - uses: actions/upload-artifact@v7
         with:

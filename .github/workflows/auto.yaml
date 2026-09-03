@@ -157,13 +157,27 @@ jobs:
 
       # Релиз катящийся, поэтому старый сносится целиком вместе с тегом: иначе
       # softprops дописывает ассеты к уже существующему набору.
+      # Релиз катящийся, поэтому старый сносится целиком вместе с тегом: иначе
+      # softprops дописывает ассеты к уже существующему набору.
+      #
+      # gh api печатает тело ответа в stdout и при 404, а --jq к неуспешному
+      # запросу не применяется, поэтому подстановка отдавала JSON ошибки как
+      # значение id. Берём его только когда запрос действительно удался.
       - name: Replace the stable release
         run: |
           set -euo pipefail
-          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/stable" --jq '.id' 2>/dev/null || true)
-          if [ -n "$RELEASE_ID" ]; then
-            gh api -X DELETE "repos/${{ github.repository }}/releases/${RELEASE_ID}"
+          release_id=""
+          if response=$(gh api "repos/${{ github.repository }}/releases/tags/stable" 2>/dev/null); then
+            release_id=$(printf '%s' "$response" | jq -r '.id // empty' 2>/dev/null || true)
           fi
+
+          if printf '%s' "$release_id" | grep -Eq '^[0-9]+$'; then
+            echo "Deleting release $release_id"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/${release_id}"
+          else
+            echo "No stable release to delete"
+          fi
+
           if gh api "repos/${{ github.repository }}/git/refs/tags/stable" >/dev/null 2>&1; then
             gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/stable"
           fi

@@ -23,7 +23,6 @@ jobs:
     outputs:
       build_needed: ${{ steps.compare.outputs.build_needed }}
       sha: ${{ steps.upstream.outputs.sha }}
-      short_sha: ${{ steps.upstream.outputs.short_sha }}
       version: ${{ steps.upstream.outputs.version }}
       go_version: ${{ steps.upstream.outputs.go_version }}
 
@@ -50,22 +49,7 @@ jobs:
             echo "Could not resolve ${XRAY_REPO}@${BRANCH} to a commit: '$SHA'" >&2
             exit 1
           fi
-          SHORT_SHA=${SHA:0:7}
-
-          # Версия ядра живёт в core/core.go как три отдельные байтовые
-          # константы; тега у коммита из main нет, поэтому собираем её оттуда.
-          CORE_GO=$(gh_curl -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/${XRAY_REPO}/contents/core/core.go?ref=${SHA}")
-          read_const() {
-            printf '%s' "$CORE_GO" | sed -nE "s/^[[:space:]]*$1[[:space:]]+byte[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p" | head -n1
-          }
-          X=$(read_const Version_x); Y=$(read_const Version_y); Z=$(read_const Version_z)
-
-          if [ -z "$X" ] || [ -z "$Y" ] || [ -z "$Z" ]; then
-            echo "Could not read Version_x/y/z out of core/core.go at ${SHA}" >&2
-            exit 1
-          fi
-          VERSION="v${X}.${Y}.${Z}-${SHORT_SHA}"
+          VERSION=${SHA:0:7}
 
           # Xray собирается стоковым Go (setup-go по go.mod, без форка
           # тулчейна), так что берём свежий стабильный релиз go.dev.
@@ -78,10 +62,9 @@ jobs:
           fi
 
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Upstream ${XRAY_REPO}@${SHORT_SHA} -> ${VERSION}, Go ${GO_VERSION}"
+          echo "Upstream ${XRAY_REPO}@${VERSION}, Go ${GO_VERSION}"
 
       - name: Read the version our alpha release already carries
         id: mine
@@ -229,7 +212,7 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: alpha
-          name: Xray core alpha ${{ needs.alpha-check.outputs.short_sha }}
+          name: Xray core alpha ${{ needs.alpha-check.outputs.version }}
           body: |
             Ядро Xray, собранное из ${{ env.XRAY_REPO }}@${{ needs.alpha-check.outputs.sha }}
             на Go ${{ needs.alpha-check.outputs.go_version }}.

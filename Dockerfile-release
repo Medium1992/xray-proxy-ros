@@ -10,7 +10,11 @@
 #
 # Xray собирается стоковым Go, поэтому тулчейн берётся официальным образом
 # golang, а не тарболлом форка, как это приходится делать для mihomo.
-ARG GO_VERSION
+# Значение по умолчанию нужно только локальным запускам и линтеру: без него
+# базовый образ раскрывается в невалидное имя. Воркфлоу всегда передаёт
+# GO_VERSION явно, свежим стабильным релизом с go.dev, так что в CI это число
+# не участвует и устареть там не может.
+ARG GO_VERSION=1.27.1
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS package
 ARG TARGETOS
 ARG TARGETARCH
@@ -28,15 +32,30 @@ RUN apk add --no-cache git && go version
 RUN mkdir -p /final
 
 # Клон полный: core.build берётся из git describe, которому нужны теги.
-RUN [ -n "$XRAY_REF" ] || { echo "XRAY_REF build arg is required" >&2; exit 1; }; \
-    git clone "https://github.com/${XRAY_REPO}.git" /src
+RUN set -eu; \
+    [ -n "$XRAY_REF" ] || { echo "XRAY_REF build arg is required" >&2; exit 1; }; \
+    for attempt in 1 2 3 4 5; do \
+      git clone "https://github.com/${XRAY_REPO}.git" /src && exit 0; \
+      echo "clone failed (attempt ${attempt}), retrying" >&2; \
+      rm -rf /src; \
+      sleep 5; \
+    done; \
+    echo "Failed to clone ${XRAY_REPO}" >&2; \
+    exit 1
 
 WORKDIR /src
 
 RUN git checkout --detach "$XRAY_REF" \
     || { echo "Failed to check out ${XRAY_REPO}@${XRAY_REF}" >&2; exit 1; }
 
-RUN go mod download
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+      go mod download && exit 0; \
+      echo "go mod download failed (attempt ${attempt}), retrying" >&2; \
+      sleep 5; \
+    done; \
+    echo "go mod download failed after 5 attempts" >&2; \
+    exit 1
 
 # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
 # бинарник отличался от официального только версией тулчейна.

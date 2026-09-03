@@ -23,6 +23,7 @@ jobs:
     outputs:
       build_needed: ${{ steps.compare.outputs.build_needed }}
       sha: ${{ steps.upstream.outputs.sha }}
+      short_sha: ${{ steps.upstream.outputs.short_sha }}
       version: ${{ steps.upstream.outputs.version }}
       go_version: ${{ steps.upstream.outputs.go_version }}
 
@@ -77,6 +78,7 @@ jobs:
           fi
 
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
           echo "Upstream ${XRAY_REPO}@${SHORT_SHA} -> ${VERSION}, Go ${GO_VERSION}"
@@ -227,7 +229,7 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: alpha
-          name: Xray core alpha ${{ needs.alpha-check.outputs.version }}
+          name: Xray core alpha ${{ needs.alpha-check.outputs.short_sha }}
           body: |
             Ядро Xray, собранное из ${{ env.XRAY_REPO }}@${{ needs.alpha-check.outputs.sha }}
             на Go ${{ needs.alpha-check.outputs.go_version }}.

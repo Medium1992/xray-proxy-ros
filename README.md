@@ -30,7 +30,7 @@
 | `latest` | Most recent Xray-core release, prereleases included. |
 | `alpha` | Upstream `main`, rebuilt every 12 hours. |
 | `vX.Y.Z` | A specific Xray-core release. |
-| `vX.Y.Z-<sha>` | A specific `main` commit. |
+| `<sha>` | A specific `main` commit, named by its short SHA. |
 
 Images are published to:
 

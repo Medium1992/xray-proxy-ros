@@ -88,6 +88,8 @@ jobs:
       PACKAGE_OWNER: medium1992
       PACKAGE_NAME: xray-proxy-ros
       PACKAGE_NAME_ENCODED: xray-proxy-ros
+      GHCR_IMAGE: ghcr.io/medium1992/xray-proxy-ros
+      DOCKERHUB_IMAGE: medium1992/xray-proxy-ros
       DELETE_UNTAGGED: "true"
 
     steps:
@@ -104,6 +106,45 @@ jobs:
       - name: Update VERSIONS_ALPHA
         run: |
           echo "xray=${{ needs.alpha-check.outputs.tag }}" > VERSIONS_ALPHA
+
+      # latest всегда указывает на самое свежее ядро Xray, независимо от того,
+      # пришло оно из стабильного релиза или из пререлиза. Поэтому alpha берёт
+      # latest себе, только если её тег не старше записанного в VERSIONS.
+      - name: Assemble image tags
+        id: tags
+        env:
+          CANDIDATE: ${{ needs.alpha-check.outputs.tag }}
+        run: |
+          set -eu
+          stable=""
+          if [ -f VERSIONS ]; then
+            stable="$(sed -n 's/^xray=//p' VERSIONS | head -n1)"
+          fi
+
+          tags="${GHCR_IMAGE}:${CANDIDATE}
+          ${GHCR_IMAGE}:alpha
+          ${DOCKERHUB_IMAGE}:${CANDIDATE}
+          ${DOCKERHUB_IMAGE}:alpha"
+
+          newest="${CANDIDATE}"
+          if [ -n "${stable}" ]; then
+            newest="$( { echo "${CANDIDATE}"; echo "${stable}"; } | sort -V | tail -n1)"
+          fi
+
+          if [ "${newest}" = "${CANDIDATE}" ]; then
+            echo "Xray ${CANDIDATE} is not older than stable ${stable:-none}: taking latest"
+            tags="${tags}
+          ${GHCR_IMAGE}:latest
+          ${DOCKERHUB_IMAGE}:latest"
+          else
+            echo "Stable ${stable} is newer than ${CANDIDATE}: leaving latest alone"
+          fi
+
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${tags}" | sed 's/^[[:space:]]*//'
+            echo "TAGS_EOF"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -138,15 +179,13 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
           push: true
+          provenance: false
+          sbom: false
           build-args: |
             XRAY_RELEASE_TAG=${{ needs.alpha-check.outputs.tag }}
           secrets: |
             gh_token=${{ secrets.GITHUB_TOKEN }}
-          tags: |
-            ghcr.io/medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
-            ghcr.io/medium1992/xray-proxy-ros:alpha
-            medium1992/xray-proxy-ros:${{ needs.alpha-check.outputs.tag }}
-            medium1992/xray-proxy-ros:alpha
+          tags: ${{ steps.tags.outputs.tags }}
 
       - name: Commit and push VERSIONS_ALPHA
         run: |
@@ -171,7 +210,7 @@ jobs:
           while true; do
             echo "Fetching page $page..."
             chunk=$(timeout 30s gh api -H "Accept: application/vnd.github+json" \
-              /users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME_ENCODED}/versions?per_page=100&page=$page || echo "TIMEOUT")
+              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME_ENCODED}/versions?per_page=100&page=$page" || echo "TIMEOUT")
             if [[ "$chunk" == "TIMEOUT" ]]; then
               echo "Error: gh api timed out on page $page"
               exit 1

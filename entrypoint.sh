@@ -2,6 +2,10 @@
 
 log() { echo "[$(date +'%H:%M:%S')] $*"; }
 
+set_kernel_param() {
+  [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null || true
+}
+
 set_kernel_param /proc/sys/net/ipv4/ip_forward 0
 set_kernel_param /proc/sys/net/ipv6/conf/all/disable_ipv6 1
 set_kernel_param /proc/sys/net/ipv6/conf/default/disable_ipv6 1
@@ -40,10 +44,6 @@ graceful_shutdown() {
 trap graceful_shutdown TERM INT
 
 sleep 1
-
-set_kernel_param() {
-  [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null || true
-}
 
 set -eu
 TPROXY="${TPROXY:-true}"
@@ -410,6 +410,8 @@ parse() {
     HY2_AUTH=""
     HY2_OBFS=""
     HY2_OBFS_PASSWORD=""
+    HY2_PACKET_MIN=""
+    HY2_PACKET_MAX=""
     HY2_PORTS=""
     HY2_REALM_URL=""
     HY2_REALM_STUN='["stun.nextcloud.com:3478","stun.sip.us:3478","global.stun.twilio.com:3478"]'
@@ -801,6 +803,12 @@ parse() {
             obfs-password)
                 HY2_OBFS_PASSWORD="$(querydecode "$val")"
                 ;;
+            minPacketSize)
+                HY2_PACKET_MIN="$(printf '%s' "$val" | tr -cd '0-9')"
+                ;;
+            maxPacketSize)
+                HY2_PACKET_MAX="$(printf '%s' "$val" | tr -cd '0-9')"
+                ;;
             auth)
                 HY2_AUTH="$(querydecode "$val")"
                 ;;
@@ -838,7 +846,7 @@ parse() {
                 TLS_USED=true
                 REALITY_USED=true
                 ;;
-            insecure)
+            insecure|allowInsecure)
                 # Removed from current Xray; ignore old panel links instead of emitting invalid JSON.
                 ;;
             verifyPeerCertByName|vcn)
@@ -870,7 +878,7 @@ parse() {
                 TLS_MAX_VERSION="$val"
                 TLS_USED=true
                 ;;
-            cipherSuites)
+            cipherSuites|cs)
                 TLS_CIPHER_SUITES="$(urldecode "$val")"
                 TLS_USED=true
                 ;;
@@ -946,6 +954,10 @@ parse() {
             ;;
     esac
 
+    # Panel links carry no type= for Hysteria2, and Xray refuses the outbound
+    # ("not hysteria transport") unless the stream uses the hysteria transport.
+    [ "$HY2_USED" = true ] && NETWORK="hysteria"
+
     case "$(tolower "$KCP_HEADER_TYPE")" in
         none)
             KCP_HEADER_TYPE=""
@@ -978,6 +990,13 @@ parse() {
 
     if [ -n "$HY2_REALM_LPORT" ]; then
         echo "Hysteria Realm lport is not supported by current Xray and will be ignored" >&2
+    fi
+
+    # 3x-ui carries the gecko packet range in its own URI fields; Xray reads it
+    # as one salamander packetSize range and falls back to hysteria's defaults.
+    HY2_PACKET_SIZE="512-1200"
+    if [ -n "$HY2_PACKET_MIN" ] && [ -n "$HY2_PACKET_MAX" ]; then
+        HY2_PACKET_SIZE="${HY2_PACKET_MIN}-${HY2_PACKET_MAX}"
     fi
 
     PORT="$(int_or_default "$PORT" 0)"
@@ -1041,6 +1060,7 @@ parse() {
       --arg hy2_auth "$HY2_AUTH" \
       --arg hy2_obfs "$HY2_OBFS" \
       --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
+      --arg hy2_packet_size "$HY2_PACKET_SIZE" \
       --arg hy2_realm_url "$HY2_REALM_URL" \
       --arg tls_server_name "$TLS_SERVER_NAME" \
       --arg tls_fingerprint "$TLS_FINGERPRINT" \
@@ -1154,7 +1174,7 @@ parse() {
             else . end
           | if nonempty($hy2_obfs) then
               if $hy2_obfs == "gecko" then
-                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | .packetSize="512-1200")}])
+                .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | .packetSize=$hy2_packet_size)}])
               elif $hy2_obfs == "salamander" then
                 .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password))}])
               else . end

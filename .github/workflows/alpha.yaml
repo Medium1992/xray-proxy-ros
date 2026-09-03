@@ -1,12 +1,13 @@
-name: Build and Publish
+name: Build and Publish Alpha
 
-# Ядро собирается из исходников по тегу релиза, а не скачивается официальным
-# zip: так оно едет на свежем Go вместо того, что стоит в go.mod апстрима.
-# Бинарники ложатся в катящийся релиз `stable` этого репозитория, откуда их
-# забирает образ.
+# Апстрим Xray не публикует покоммитные сборки: ассеты релиза появляются только
+# на `release: published`, а пуши уезжают в Actions-артефакты, которые живут 90
+# дней и требуют авторизации. Поэтому alpha собирает ядро из HEAD сама и кладёт
+# бинарники в катящийся релиз `alpha` этого репозитория, откуда их и забирает
+# образ.
 on:
   schedule:
-    - cron: "0 20 * * *" # 20:00 UTC
+    - cron: "0 */12 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -17,17 +18,16 @@ env:
   XRAY_REPO: XTLS/Xray-core
 
 jobs:
-  check:
+  alpha-check:
     runs-on: ubuntu-latest
     outputs:
       build_needed: ${{ steps.compare.outputs.build_needed }}
+      sha: ${{ steps.upstream.outputs.sha }}
       version: ${{ steps.upstream.outputs.version }}
       go_version: ${{ steps.upstream.outputs.go_version }}
 
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Resolve the Xray release
+      - name: Resolve upstream HEAD
         id: upstream
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -42,15 +42,29 @@ jobs:
               ${GH_API_TOKEN:+-H "Authorization: Bearer $GH_API_TOKEN"} "$@"
           }
 
-          # Самый свежий релиз, включая pre-release. Черновики пропускаем:
-          # у них ещё нет тега.
-          VERSION=$(gh_curl "https://api.github.com/repos/${XRAY_REPO}/releases?per_page=20" \
-            | jq -r '[.[] | select(.draft == false)] | sort_by(.published_at) | last | .tag_name // empty')
+          BRANCH=$(gh_curl "https://api.github.com/repos/${XRAY_REPO}" | jq -r '.default_branch // empty')
+          SHA=$(gh_curl "https://api.github.com/repos/${XRAY_REPO}/commits/${BRANCH}" | jq -r '.sha // empty')
 
-          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z]+)*$'; then
-            echo "Invalid Xray release tag: '$VERSION'" >&2
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Could not resolve ${XRAY_REPO}@${BRANCH} to a commit: '$SHA'" >&2
             exit 1
           fi
+          SHORT_SHA=${SHA:0:7}
+
+          # Версия ядра живёт в core/core.go как три отдельные байтовые
+          # константы; тега у коммита из main нет, поэтому собираем её оттуда.
+          CORE_GO=$(gh_curl -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${XRAY_REPO}/contents/core/core.go?ref=${SHA}")
+          read_const() {
+            printf '%s' "$CORE_GO" | sed -nE "s/^[[:space:]]*$1[[:space:]]+byte[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p" | head -n1
+          }
+          X=$(read_const Version_x); Y=$(read_const Version_y); Z=$(read_const Version_z)
+
+          if [ -z "$X" ] || [ -z "$Y" ] || [ -z "$Z" ]; then
+            echo "Could not read Version_x/y/z out of core/core.go at ${SHA}" >&2
+            exit 1
+          fi
+          VERSION="v${X}.${Y}.${Z}-${SHORT_SHA}"
 
           # Xray собирается стоковым Go (setup-go по go.mod, без форка
           # тулчейна), так что берём свежий стабильный релиз go.dev.
@@ -62,30 +76,51 @@ jobs:
             exit 1
           fi
 
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved Xray ${VERSION}, Go ${GO_VERSION}"
+          echo "Upstream ${XRAY_REPO}@${SHORT_SHA} -> ${VERSION}, Go ${GO_VERSION}"
+
+      - name: Read the version our alpha release already carries
+        id: mine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          URL=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" \
+            --jq '.assets[] | select(.name == "version.txt") | .url' 2>/dev/null || true)
+
+          CURRENT="none"
+          if [ -n "$URL" ]; then
+            CURRENT=$(gh api -H "Accept: application/octet-stream" "$URL" 2>/dev/null | tr -d '\r\n' || true)
+          fi
+          [ -n "$CURRENT" ] || CURRENT="none"
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether a build is needed
         id: compare
         run: |
           set -euo pipefail
           TARGET='${{ steps.upstream.outputs.version }}'
+          CURRENT='${{ steps.mine.outputs.current }}'
+          echo "target:  $TARGET"
+          echo "current: $CURRENT"
 
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "Manual run -> force build"
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
-          elif [ -f VERSIONS ] && grep -qx "xray=${TARGET}" VERSIONS; then
-            echo "Xray ${TARGET} is already published"
+          elif [ "$TARGET" = "$CURRENT" ]; then
+            echo "Already built this commit"
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New Xray release: ${TARGET}"
+            echo "New upstream commit"
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    needs: check
-    if: needs.check.outputs.build_needed == 'true'
+  alpha-build:
+    needs: alpha-check
+    if: needs.alpha-check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -110,18 +145,18 @@ jobs:
       CGO_ENABLED: 0
 
     steps:
-      - name: Check out Xray-core at the release tag
+      - name: Check out Xray-core at the resolved commit
         uses: actions/checkout@v6
         with:
           repository: ${{ env.XRAY_REPO }}
-          ref: ${{ needs.check.outputs.version }}
+          ref: ${{ needs.alpha-check.outputs.sha }}
           # git describe нужен весь граф с тегами: из него берётся core.build.
           fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: ${{ needs.check.outputs.go_version }}
+          go-version: ${{ needs.alpha-check.outputs.go_version }}
 
       - name: Get project dependencies
         run: go mod download
@@ -150,8 +185,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    needs: [check, build]
+  alpha-release:
+    needs: [alpha-check, alpha-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -168,37 +203,38 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find artifacts -type f -name '*.zip' -exec cp {} release/ \;
-          echo '${{ needs.check.outputs.version }}' > release/version.txt
+          echo '${{ needs.alpha-check.outputs.version }}' > release/version.txt
           (cd release && sha256sum ./*.zip > sha256sums.txt)
           ls -l release
 
       # Релиз катящийся, поэтому старый сносится целиком вместе с тегом: иначе
       # softprops дописывает ассеты к уже существующему набору.
-      - name: Replace the stable release
+      - name: Replace the alpha release
         run: |
           set -euo pipefail
-          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/stable" --jq '.id' 2>/dev/null || true)
+          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/alpha" --jq '.id' 2>/dev/null || true)
           if [ -n "$RELEASE_ID" ]; then
             gh api -X DELETE "repos/${{ github.repository }}/releases/${RELEASE_ID}"
           fi
-          if gh api "repos/${{ github.repository }}/git/refs/tags/stable" >/dev/null 2>&1; then
-            gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/stable"
+          if gh api "repos/${{ github.repository }}/git/refs/tags/alpha" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/alpha"
           fi
 
       - uses: softprops/action-gh-release@v3
         with:
-          tag_name: stable
-          name: Xray core ${{ needs.check.outputs.version }}
+          tag_name: alpha
+          name: Xray core alpha ${{ needs.alpha-check.outputs.version }}
           body: |
-            Ядро Xray, собранное из ${{ env.XRAY_REPO }}@${{ needs.check.outputs.version }}
-            на Go ${{ needs.check.outputs.go_version }}.
+            Ядро Xray, собранное из ${{ env.XRAY_REPO }}@${{ needs.alpha-check.outputs.sha }}
+            на Go ${{ needs.alpha-check.outputs.go_version }}.
 
             Релиз катящийся: ассеты заменяются на каждой новой сборке.
-          make_latest: true
+          prerelease: true
+          make_latest: false
           files: release/*
 
-  image:
-    needs: [check, build, release]
+  alpha-image:
+    needs: [alpha-check, alpha-build, alpha-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -211,13 +247,12 @@ jobs:
       GHCR_IMAGE: ghcr.io/medium1992/xray-proxy-ros
       DOCKERHUB_IMAGE: medium1992/xray-proxy-ros
       DELETE_UNTAGGED: "true"
-      xray: ${{ needs.check.outputs.version }}
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Record the published version
-        run: echo "xray=${xray}" > VERSIONS
+        run: echo 'xray=${{ needs.alpha-check.outputs.version }}' > VERSIONS_ALPHA
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -245,7 +280,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push multi-arch
+      - name: Build and push alpha multi-arch
         uses: docker/build-push-action@v7
         with:
           context: ./
@@ -256,109 +291,21 @@ jobs:
           sbom: false
           build-args: |
             XRAY_RELEASE_REPO=${{ github.repository }}
-            XRAY_RELEASE_TAG=stable
+            XRAY_RELEASE_TAG=alpha
           secrets: |
             gh_token=${{ secrets.GITHUB_TOKEN }}
           tags: |
-            ${{ env.GHCR_IMAGE }}:${{ env.xray }}
-            ${{ env.GHCR_IMAGE }}:latest
-            ${{ env.DOCKERHUB_IMAGE }}:${{ env.xray }}
-            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ needs.alpha-check.outputs.version }}
+            ${{ env.GHCR_IMAGE }}:alpha
+            ${{ env.DOCKERHUB_IMAGE }}:${{ needs.alpha-check.outputs.version }}
+            ${{ env.DOCKERHUB_IMAGE }}:alpha
 
-      - name: Publish container archives to Telegram
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-          IMAGE_REPO: medium1992/xray-proxy-ros
-        run: |
-          set -euo pipefail
-
-          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
-            echo "Telegram secrets are not configured, skipping Telegram publish."
-            exit 0
-          fi
-
-          telegram_api() {
-            local method="$1"
-            shift
-
-            response=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}" "$@")
-            echo "$response" | grep -q '"ok":true' || {
-              echo "Telegram API call failed:"
-              echo "$response"
-              exit 1
-            }
-          }
-
-          retry() {
-            local attempt
-            for attempt in 1 2 3 4 5; do
-              "$@" && return 0
-              echo "Attempt ${attempt} failed, retrying..."
-              sleep 10
-            done
-            "$@"
-          }
-
-          thread_data_args=()
-          thread_form_args=()
-          if [ -n "${TELEGRAM_THREAD_ID}" ]; then
-            thread_data_args=(-d "message_thread_id=${TELEGRAM_THREAD_ID}")
-            thread_form_args=(-F "message_thread_id=${TELEGRAM_THREAD_ID}")
-          fi
-
-          mkdir -p telegram-images
-
-          export_image() {
-            local name="$1"
-            local platform="$2"
-            local image="$3"
-            local file="telegram-images/xray-proxy-ros-${name}-${xray}.tar.gz"
-
-            retry docker pull --platform "${platform}" "${image}"
-            docker save "${image}" | gzip -9 > "${file}"
-            docker image rm "${image}" || true
-          }
-
-          export_image "amd64" "linux/amd64" "${IMAGE_REPO}:${xray}"
-          export_image "arm64" "linux/arm64" "${IMAGE_REPO}:${xray}"
-          export_image "armv7" "linux/arm/v7" "${IMAGE_REPO}:${xray}"
-          export_image "armv5" "linux/arm/v5" "${IMAGE_REPO}:${xray}"
-
-          sha256sum telegram-images/*.tar.gz > telegram-images/sha256sums.txt
-
-          files_list=$(find telegram-images -maxdepth 1 -name '*.tar.gz' -type f -printf '%f\n' | sort)
-          message=$(printf 'Xray Proxy ROS container images\n\nxray: %s\n\nDocker Hub: https://hub.docker.com/r/%s\n\nFiles:\n%s\n\nChecksums: sha256sums.txt' \
-            "${xray}" \
-            "${IMAGE_REPO}" \
-            "${files_list}")
-
-          telegram_api sendMessage \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            "${thread_data_args[@]}" \
-            --data-urlencode "text=${message}"
-
-          while IFS= read -r file; do
-            telegram_api sendDocument \
-              -F "chat_id=${TELEGRAM_CHAT_ID}" \
-              "${thread_form_args[@]}" \
-              -F "document=@${file}" \
-              -F "caption=$(basename "$file")"
-          done < <(find telegram-images -maxdepth 1 -name '*.tar.gz' -type f | sort)
-
-          telegram_api sendDocument \
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \
-            "${thread_form_args[@]}" \
-            -F "document=@telegram-images/sha256sums.txt" \
-            -F "caption=sha256sums.txt"
-
-      - name: Commit and push VERSIONS
+      - name: Commit and push VERSIONS_ALPHA
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add VERSIONS
-          git commit -m "Auto-update: VERSIONS" || exit 0
+          git add VERSIONS_ALPHA
+          git commit -m "Auto-update: VERSIONS_ALPHA" || exit 0
           git push
 
       - name: Install crane

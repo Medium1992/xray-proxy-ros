@@ -4,6 +4,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG XRAY_RELEASE_TAG=latest
+ARG XRAY_RELEASE_REPO=XTLS/Xray-core
 RUN apk add --no-cache curl jq unzip
 RUN mkdir -p /final/usr/local/bin
 
@@ -16,9 +17,9 @@ RUN --mount=type=secret,id=gh_token set -eu; \
       fi; \
     }; \
     if [ "$XRAY_RELEASE_TAG" = "latest" ]; then \
-      XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"; \
+      XRAY_RELEASE_API="https://api.github.com/repos/${XRAY_RELEASE_REPO}/releases/latest"; \
     else \
-      XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/tags/${XRAY_RELEASE_TAG}"; \
+      XRAY_RELEASE_API="https://api.github.com/repos/${XRAY_RELEASE_REPO}/releases/tags/${XRAY_RELEASE_TAG}"; \
     fi; \
     if [ "$TARGETARCH" = "amd64" ]; then \
       ASSET="Xray-linux-64.zip"; \

@@ -13,7 +13,7 @@
 ## ✨ Features
 
 - **Multi-arch image**: `amd64`, `arm64`, `arm/v7`, `arm/v5`.
-- **Always the newest core**: `latest` is built with the most recent Xray-core release, prereleases included.
+- **Self-built core on a current Go**: Xray-core is compiled from source with the newest stable Go toolchain rather than downloaded as an official release archive. `latest` follows the most recent Xray-core release, prereleases included; `alpha` follows upstream `main` and is rebuilt every 12 hours.
 - **Proxy link parser** via `LINK`: `vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://` / `hysteria2://`, `wireguard://` / `wg://`.
 - **Modern Xray transports** including TCP, WS, HTTPUpgrade, gRPC, XHTTP, HTTP/2, KCP, QUIC and HTTP/3 where supported by the link.
 - **Fake-IP DNS mode** by default: for every DNS request the container returns an address from the Fake-IP pool. That pool can then be routed back to the container so access to the requested resource goes through the proxy.
@@ -28,7 +28,9 @@
 | Tag | Purpose |
 |---|---|
 | `latest` | Most recent Xray-core release, prereleases included. |
-| `vX.Y.Z` | Specific Xray-core version or prerelease, when built by workflow. |
+| `alpha` | Upstream `main`, rebuilt every 12 hours. |
+| `vX.Y.Z` | A specific Xray-core release. |
+| `vX.Y.Z-<sha>` | A specific `main` commit. |
 
 Images are published to:
 
@@ -111,7 +113,7 @@ Then put your proxy URL into `LINK` and restart the container.
 - In Fake-IP mode, Xray DNS returns addresses from `FAKE_IP_RANGE`. Route this pool to the container when you want requests to those resources to go through the proxy.
 - To disable Fake-IP answers and return resource IP addresses from DoH, set `DNS_MODE=real-ip`.
 - To pin a particular Xray core rather than follow the newest one, use its version tag, for example `ghcr.io/medium1992/xray-proxy-ros:v26.7.28`.
-- The container does not build Xray itself; it downloads official Xray-core release archives during Docker build.
+- Xray-core is built from source by this repository's workflows, on the newest stable Go, with the same build flags upstream uses. The resulting binaries are published to this repository's `stable` and `alpha` releases, and the Docker build pulls them from there.
 
 ## 💖 Support
 

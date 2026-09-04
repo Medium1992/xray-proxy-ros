@@ -31,7 +31,6 @@ RUN apk add --no-cache git && go version
 
 RUN mkdir -p /final
 
-# Клон полный: core.build берётся из git describe, которому нужны теги.
 RUN set -eu; \
     [ -n "$XRAY_REF" ] || { echo "XRAY_REF build arg is required" >&2; exit 1; }; \
     for attempt in 1 2 3 4 5; do \
@@ -59,6 +58,12 @@ RUN set -eu; \
 
 # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
 # бинарник отличался от официального только версией тулчейна.
+#
+# core.build апстрим берёт из git describe, но у него чекаут поверхностный и
+# без тегов, поэтому describe всегда сваливается в короткий SHA. У нас клон
+# полный, и describe видит теги — причём только аннотированные: версионные
+# теги вроде v26.7.28 лёгкие, ближайший аннотированный это v1.260327.0, и
+# строка сборки получалась как v1.260327.0-226-gcd4ce973. Берём SHA напрямую.
 RUN set -eu; \
     case "$TARGETARCH" in \
       arm) \
@@ -71,7 +76,7 @@ RUN set -eu; \
         export GOARM; \
         ;; \
     esac; \
-    COMMID="$(git describe --always --dirty)"; \
+    COMMID="$(git rev-parse --short=7 HEAD)"; \
     echo "Building ${XRAY_REPO}@${XRAY_REF} (${COMMID}) for ${TARGETOS}/${TARGETARCH}${TARGETVARIANT:+/}${TARGETVARIANT} with $(go version)"; \
     GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -o /final/xray -trimpath -buildvcs=false \

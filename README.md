@@ -113,7 +113,7 @@ Then put your proxy URL into `LINK` and restart the container.
 - In Fake-IP mode, Xray DNS returns addresses from `FAKE_IP_RANGE`. Route this pool to the container when you want requests to those resources to go through the proxy.
 - To disable Fake-IP answers and return resource IP addresses from DoH, set `DNS_MODE=real-ip`.
 - To pin a particular Xray core rather than follow the newest one, use its version tag, for example `ghcr.io/medium1992/xray-proxy-ros:v26.7.28`.
-- Xray-core is built from source by this repository's workflows, on the newest stable Go, with the same build flags upstream uses. The resulting binaries are published to this repository's `stable` and `alpha` releases, and the Docker build pulls them from there.
+- Xray-core is built from source by this repository's workflows, on the newest stable Go, with the same build flags upstream uses. The core reports itself as `X.Y.Z-ros` (`X.Y.Z-ros.alpha` on the alpha channel) so a panel can tell these builds from the official ones. The resulting binaries are published to this repository's `stable` and `alpha` releases, and the Docker build pulls them from there.
 
 ## 💖 Support
 

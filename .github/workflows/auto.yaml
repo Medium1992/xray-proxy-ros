@@ -120,6 +120,7 @@ jobs:
             --build-arg XRAY_REPO=${{ env.XRAY_REPO }} \
             --build-arg XRAY_REF=${{ needs.check.outputs.version }} \
             --build-arg GO_VERSION=${{ needs.check.outputs.go_version }} \
+            --build-arg XRAY_VERSION_SUFFIX=ros \
             --output type=local,dest=out \
             --progress=plain \
             .

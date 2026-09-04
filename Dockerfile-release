@@ -22,6 +22,9 @@ ARG TARGETVARIANT
 ARG XRAY_REPO=XTLS/Xray-core
 ARG XRAY_REF
 
+# Метка своей сборки. Пустое значение собирает ядро как есть.
+ARG XRAY_VERSION_SUFFIX=ros
+
 # go.mod апстрима закрепляет более старую версию языка, и GOTOOLCHAIN=local
 # запрещает Go молча подтянуть себе другой тулчейн: собираем ровно тем, что
 # в образе, а несовместимость всплывает ошибкой, а не тихой подменой.
@@ -46,6 +49,31 @@ WORKDIR /src
 
 RUN git checkout --detach "$XRAY_REF" \
     || { echo "Failed to check out ${XRAY_REPO}@${XRAY_REF}" >&2; exit 1; }
+
+# Единственное место, по которому панель может увидеть, что ядро не
+# официальное. Version_x/y/z объявлены как byte, поэтому -X до них не
+# дотянется — правим саму Version().
+#
+# Суффикс обязан быть валидным semver prerelease: remnanode отдаёт панели
+# semver.valid(semver.coerce(первая строка "xray version", includePrerelease)),
+# и из всей строки доживает только prerelease. Метаданные сборки через "+"
+# semver отбрасывает, а codename в разбор вообще не попадает.
+#
+# sed молча ничего не заменяет, если апстрим перепишет функцию, поэтому и
+# исходная форма, и результат проверяются тут же.
+RUN set -eu; \
+    if [ -z "$XRAY_VERSION_SUFFIX" ]; then \
+      echo "No version suffix requested, building the core as is"; \
+      exit 0; \
+    fi; \
+    printf '%s' "$XRAY_VERSION_SUFFIX" | grep -Eq '^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$' \
+      || { echo "XRAY_VERSION_SUFFIX is not a valid semver prerelease: $XRAY_VERSION_SUFFIX" >&2; exit 1; }; \
+    grep -Fq 'fmt.Sprintf("%v.%v.%v", Version_x, Version_y, Version_z)' core/core.go \
+      || { echo "core.Version() no longer has the shape this patch expects" >&2; exit 1; }; \
+    sed -i "s|\"%v\.%v\.%v\", Version_x|\"%v.%v.%v-${XRAY_VERSION_SUFFIX}\", Version_x|" core/core.go; \
+    grep -Fq "\"%v.%v.%v-${XRAY_VERSION_SUFFIX}\", Version_x" core/core.go \
+      || { echo "version suffix patch did not apply (core/core.go)" >&2; exit 1; }; \
+    echo "Core version marked as X.Y.Z-${XRAY_VERSION_SUFFIX}"
 
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \

@@ -64,7 +64,7 @@ Xray is started with `/etc/xray/` as a multi-file config directory, so additiona
 | `LOG_MASK` | empty | Xray log masking mode, if supported by the current core. |
 | `DNS_MODE` | `fake-ip` | `fake-ip` returns addresses from the Fake-IP pool. Any other value disables Fake-IP and returns resource IP addresses from DoH. |
 | `FAKE_IP_RANGE` | `198.18.0.0/15` | Fake-IP pool range. [Docs](https://xtls.github.io/en/config/fakedns.html). |
-| `DNS_DIRECT` | `true` | Sends the container's own DoH queries out directly, bypassing the proxy. Set to `false` to resolve through the tunnel instead. |
+| `DNS_DIRECT` | `true` | Sends the container's own DoH queries out directly, bypassing the proxy. Set to `false` to resolve through the tunnel instead; the proxy's own address is then resolved by the system resolver, since resolving it through the tunnel would require the tunnel. |
 | `MUX` | `false` | Enables Xray outbound mux. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
 | `MUX_CONCURRENCY` | `8` | TCP mux concurrency. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
 | `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | UDP mux concurrency. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |

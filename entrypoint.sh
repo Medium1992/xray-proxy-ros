@@ -48,6 +48,7 @@ sleep 1
 set -eu
 TPROXY="${TPROXY:-true}"
 DNS_MODE="${DNS_MODE:-fake-ip}"
+DNS_DIRECT="${DNS_DIRECT:-true}"
 FAKE_IP_RANGE="${FAKE_IP_RANGE:-198.18.0.0/15}"
 LOG_ACCESS="${LOG_ACCESS:-}"
 LOG_ERROR="${LOG_ERROR:-}"
@@ -1225,6 +1226,8 @@ config_file_xray() {
   [ "$DNS_MODE" = "fake-ip" ] && FAKE_IP_ENABLED=true
   QUIC_DROP_JSON="$(bool_or_empty "$QUIC_DROP")"
   [ -z "$QUIC_DROP_JSON" ] && QUIC_DROP_JSON=false
+  DNS_DIRECT_JSON="$(bool_or_empty "$DNS_DIRECT")"
+  [ -z "$DNS_DIRECT_JSON" ] && DNS_DIRECT_JSON=true
   UDP_TPROXY_ENABLED=false
   [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ] && UDP_TPROXY_ENABLED=true
 
@@ -1273,13 +1276,14 @@ config_file_xray() {
     --arg fake_ip_range "$FAKE_IP_RANGE" \
     --argjson fake_ip_enabled "$FAKE_IP_ENABLED" \
     --argjson udp_tproxy_enabled "$UDP_TPROXY_ENABLED" \
+    --argjson dns_direct "$DNS_DIRECT_JSON" \
     --argjson quic_drop "$QUIC_DROP_JSON" '
     {
       routing:{
         domainStrategy:"IPIfNonMatch",
         rules:(
-          [
-            {inboundTag:["ParallelQuery"],outboundTag:"direct"},
+          (if $dns_direct then [{inboundTag:["ParallelQuery"],outboundTag:"direct"}] else [] end)
+          + [
             {inboundTag:["dns-in"],outboundTag:"dns"}
           ]
           + (if $quic_drop then [{network:"udp",port:"443",outboundTag:"block"}] else [] end)

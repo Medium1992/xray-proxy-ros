@@ -84,7 +84,7 @@ install_config_if_changed() {
 }
 
 remove_config_if_exists() {
-    [ -e "$1" ] && rm -f "$1"
+    rm -f "$1"
 }
 
 first_iface() {

@@ -71,6 +71,7 @@ Xray is started with `/etc/xray/` as a multi-file config directory, so additiona
 | `MUX_XUDPPROXYUDP443` | `reject` | Xray mux UDP/443 handling. [Docs](https://xtls.github.io/en/config/outbound.html#muxobject). |
 | `TPROXY` | `true` | With NFTables: `true` uses Redirect TCP + TProxy UDP, `false` uses Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` adds an Xray routing rule that blocks UDP/443. |
+| `HY2_HOP_INTERVAL` | `30` | Seconds between remote port changes when a Hysteria2 link asks for port hopping (`mport` or a port range). Must be at least 5. |
 
 ## 🛠 RouterOS Install
 

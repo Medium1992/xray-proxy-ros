@@ -1071,6 +1071,7 @@ parse() {
       --arg hy2_obfs "$HY2_OBFS" \
       --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
       --arg hy2_packet_size "$HY2_PACKET_SIZE" \
+      --argjson dns_direct "$DNS_DIRECT_JSON" \
       --arg hy2_realm_url "$HY2_REALM_URL" \
       --arg tls_server_name "$TLS_SERVER_NAME" \
       --arg tls_fingerprint "$TLS_FINGERPRINT" \
@@ -1197,11 +1198,14 @@ parse() {
           | if $network == "kcp" then . + {kcpSettings: ({} | putnum("mtu"; $kcp_mtu) | putnum("tti"; $kcp_tti) | putnum("uplinkCapacity"; $kcp_uplink) | putnum("downlinkCapacity"; $kcp_downlink) | putbool("congestion"; $kcp_congestion) | putnum("readBufferSize"; $kcp_read_buf) | putnum("writeBufferSize"; $kcp_write_buf))} else . end
           | if $network == "httpupgrade" then . + {httpupgradeSettings: ({} | putstr("path"; $httpup_path) | putstr("host"; $httpup_host) | if ($httpup_headers|length) > 0 then . + {headers:$httpup_headers} else . end)} else . end
           | if ($protocol == "hy2" or $protocol == "hysteria2" or $protocol == "hysteria2+realm" or $protocol == "hysteria2+realm+http") then . + {hysteriaSettings:{version:2, auth:$hy2_auth}} else . end
-          | . + {sockopt:{domainStrategy:"ForceIPv4"}});
+          | if $dns_direct then . + {sockopt:{domainStrategy:"ForceIPv4"}} else . end);
       {outbounds:[{tag:"XrayProxyRoS", protocol:$xray_protocol, settings:base_settings, streamSettings:stream_settings, mux:{enabled:$mux_enabled, concurrency:$mux_concurrency, xudpConcurrency:$mux_xudp_concurrency, xudpProxyUDP443:$mux_xudp_proxy_udp443}}]}
       ' > "$tmp"
     install_config_if_changed "$tmp" /etc/xray/25_outbound.json
 }
+
+DNS_DIRECT_JSON="$(bool_or_empty "$DNS_DIRECT")"
+[ -z "$DNS_DIRECT_JSON" ] && DNS_DIRECT_JSON=true
 
 LINK="$(printf '%s' "$LINK" | sed 's/&amp;/\&/g')"
 SCHEME="$(tolower "$(printf '%s' "$LINK" | cut -d':' -f1)")"
@@ -1226,8 +1230,6 @@ config_file_xray() {
   [ "$DNS_MODE" = "fake-ip" ] && FAKE_IP_ENABLED=true
   QUIC_DROP_JSON="$(bool_or_empty "$QUIC_DROP")"
   [ -z "$QUIC_DROP_JSON" ] && QUIC_DROP_JSON=false
-  DNS_DIRECT_JSON="$(bool_or_empty "$DNS_DIRECT")"
-  [ -z "$DNS_DIRECT_JSON" ] && DNS_DIRECT_JSON=true
   UDP_TPROXY_ENABLED=false
   [ "$USE_NFT" = "true" ] && [ "${TPROXY}" = "true" ] && UDP_TPROXY_ENABLED=true
 

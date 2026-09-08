@@ -64,6 +64,7 @@ Xray запускается с `/etc/xray/` как директорией multi-
 | `LOG_MASK` | пусто | Режим маскирования логов Xray, если поддерживается текущим ядром. |
 | `DNS_MODE` | `fake-ip` | `fake-ip` выдает адреса из Fake-IP пула. Любое другое значение выключает Fake-IP и возвращает IP-адреса ресурсов через DoH. |
 | `FAKE_IP_RANGE` | `198.18.0.0/15` | Диапазон Fake-IP пула. [Docs](https://xtls.github.io/ru/config/fakedns.html). |
+| `DNS_DIRECT` | `true` | Отправляет собственные DoH-запросы контейнера напрямую, мимо прокси. `false` — резолвить через туннель. |
 | `MUX` | `false` | Включение Xray outbound mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
 | `MUX_CONCURRENCY` | `8` | Конкурентность TCP mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
 | `MUX_XUDPCONCURRENCY` | `MUX_CONCURRENCY` | Конкурентность UDP mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |

@@ -71,6 +71,7 @@ Xray запускается с `/etc/xray/` как директорией multi-
 | `MUX_XUDPPROXYUDP443` | `reject` | Обработка UDP/443 в Xray mux. [Docs](https://xtls.github.io/ru/config/outbound.html#muxobject). |
 | `TPROXY` | `true` | С NFTables: `true` использует Redirect TCP + TProxy UDP, `false` использует Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` добавляет в Xray routing правило блокировки UDP/443. |
+| `HY2_HOP_INTERVAL` | `30` | Секунд между сменами удалённого порта, когда ссылка Hysteria2 просит port hopping (`mport` или диапазон портов). Не меньше 5. |
 
 ## 🛠 Установка в RouterOS
 

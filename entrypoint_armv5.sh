@@ -61,6 +61,9 @@ MUX_CONCURRENCY="${MUX_CONCURRENCY:-8}"
 MUX_XUDPCONCURRENCY="${MUX_XUDPCONCURRENCY:-$MUX_CONCURRENCY}"
 MUX_XUDPPROXYUDP443="${MUX_XUDPPROXYUDP443:-reject}"
 QUIC_DROP="${QUIC_DROP:-false}"
+# Ядро выбрасывало 30 секунд по умолчанию, пока udpHop жил в quicParams; теперь
+# умолчания нет, а интервал меньше 5 отвергается. Ссылка его не несёт.
+HY2_HOP_INTERVAL="${HY2_HOP_INTERVAL:-30}"
 
 CIDR_MASK="${FAKE_IP_RANGE##*/}"
 FAKE_POOL_SIZE=$(( (1 << (32 - CIDR_MASK)) - 2 ))
@@ -273,10 +276,7 @@ set_hy2_udp_hop_ports() {
     hy2_ports="$1"
     [ -z "$hy2_ports" ] && return
 
-    FINALMASK_JSON="$(printf '%s' "${FINALMASK_JSON:-{}}" | jq -c --arg ports "$hy2_ports" '
-      if type != "object" then {} else . end
-      | .quicParams = ((.quicParams // {}) | .udpHop = ((.udpHop // {}) + {ports:$ports}))
-    ' 2>/dev/null || printf '{}')"
+    HY2_HOP_PORTS="$hy2_ports"
     FINALMASK_USED=true
 }
 
@@ -394,6 +394,7 @@ parse() {
     HY2_PACKET_MIN=""
     HY2_PACKET_MAX=""
     HY2_PORTS=""
+    HY2_HOP_PORTS=""
     HY2_REALM_URL=""
     HY2_REALM_STUN='["stun.nextcloud.com:3478","stun.sip.us:3478","global.stun.twilio.com:3478"]'
     HY2_REALM_STUN_CUSTOM=false
@@ -1051,6 +1052,8 @@ parse() {
       --arg hy2_obfs "$HY2_OBFS" \
       --arg hy2_obfs_password "$HY2_OBFS_PASSWORD" \
       --arg hy2_packet_size "$HY2_PACKET_SIZE" \
+      --arg hy2_hop_ports "$HY2_HOP_PORTS" \
+      --argjson hy2_hop_interval "$HY2_HOP_INTERVAL" \
       --argjson dns_direct "$DNS_DIRECT_JSON" \
       --arg hy2_realm_url "$HY2_REALM_URL" \
       --arg tls_server_name "$TLS_SERVER_NAME" \
@@ -1165,6 +1168,9 @@ parse() {
             else . end
           | if ($hy2_obfs == "salamander" or $hy2_obfs == "gecko") then
               .udp = ((.udp // []) + [{type:"salamander", settings:({} | putstr("password"; $hy2_obfs_password) | putstr("packetSize"; $hy2_packet_size))}])
+            else . end
+          | if nonempty($hy2_hop_ports) then
+              .udp = ((.udp // []) + [{type:"udphop", settings:{mode:"intervalremote", interval:$hy2_hop_interval, remotePorts:$hy2_hop_ports}}])
             else . end);
       def stream_settings:
         ({network:$network, security:$security}

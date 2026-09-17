@@ -122,4 +122,5 @@ Xray запускается с `/etc/xray/` как директорией multi-
 Если проект сэкономил время на настройке MikroTik:
 
 - **USDT (TRC20):** `TWDDYD1nk5JnG6FxvEu2fyFqMCY9PcdEsJ`
+- **USDT (Polygon PoS):** `0xa4f2d9035e8bacf4cdff27904f03ecc5479f7e17`
 

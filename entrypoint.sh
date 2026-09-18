@@ -1370,7 +1370,7 @@ config_file_xray() {
   jq -n '
     {
       outbounds:[
-        {tag:"direct",protocol:"freedom",settings:{domainStrategy:"UseIPv4"}},
+        {tag:"direct",protocol:"freedom",streamSettings:{sockopt:{domainStrategy:"UseIPv4"}}},
         {tag:"block-http",protocol:"blackhole",settings:{response:{type:"http"}}},
         {tag:"block",protocol:"blackhole"},
         {tag:"dns",protocol:"dns",settings:{rules:[{qType:"65,28",rCode:5,action:"return"}]}}

@@ -5,7 +5,7 @@
 #   docker buildx build -f Dockerfile-release \
 #     --platform linux/arm64 \
 #     --build-arg XRAY_REF=v26.7.28 \
-#     --build-arg GO_VERSION=1.27.1 \
+#     --build-arg GO_VERSION=1.27 \
 #     --output type=local,dest=out .
 #
 # Xray собирается стоковым Go, поэтому тулчейн берётся официальным образом
@@ -14,7 +14,12 @@
 # базовый образ раскрывается в невалидное имя. Воркфлоу всегда передаёт
 # GO_VERSION явно, свежим стабильным релизом с go.dev, так что в CI это число
 # не участвует и устареть там не может.
-ARG GO_VERSION=1.27.1
+#
+# По умолчанию стоит минорная версия без патча — ровно та, что объявлена в
+# go.mod апстрима. Официальный релиз собирается через setup-go с
+# go-version-file: go.mod, то есть тем же 1.27, а тег golang:1.27-alpine сам
+# раскрывается в свежий патч этой линейки.
+ARG GO_VERSION=1.27
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS package
 ARG TARGETOS
 ARG TARGETARCH
@@ -25,9 +30,28 @@ ARG XRAY_REF
 # Метка своей сборки. Пустое значение собирает ядро как есть.
 ARG XRAY_VERSION_SUFFIX=ros
 
-# go.mod апстрима закрепляет более старую версию языка, и GOTOOLCHAIN=local
-# запрещает Go молча подтянуть себе другой тулчейн: собираем ровно тем, что
-# в образе, а несовместимость всплывает ошибкой, а не тихой подменой.
+# Два буфера по 512 КБ, которые ядро держит на каждое соединение и которые
+# нельзя опустить ни конфигом, ни переменной окружения. Пустое значение любого
+# из них отключает соответствующую правку.
+#
+# Лимит пайпов диспетчера (два на соединение) берётся из policy.levels только
+# у VMess, Trojan и Shadowsocks. VLESS кладёт его в контекст лишь в ветке
+# fallback, а socks/http/dokodemo не кладут никогда, так что в обычной связке
+# VLESS-клиент - VLESS-сервер работает захардкоженный дефолт по архитектуре:
+# 0 на arm, 4 КБ на arm64 и 512 КБ на всё остальное. Правка трогает только
+# последнюю ветку, поэтому на arm64 она ничего не меняет.
+ARG PIPE_BUFFER_KB=64
+
+# Скретч-буфер записи HTTP/2 в x/net/http2: min(SETTINGS пира, 512 КиБ) на
+# каждый аплинк-стрим, от архитектуры не зависит. У XHTTP через io.Pipe за раз
+# приходит buf.Size = 8192 байт, то есть буфер заполняется на 1.6% и держится
+# всю жизнь стрима. Апстримный proposal golang/go#79831 предлагает ровно это
+# значение, пока не принят.
+ARG H2_SCRATCH_KB=32
+
+# GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
+# ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
+# ошибкой, а не тихой подменой.
 ENV GOTOOLCHAIN=local \
     CGO_ENABLED=0
 RUN apk add --no-cache git && go version
@@ -75,6 +99,23 @@ RUN set -eu; \
       || { echo "version suffix patch did not apply (core/core.go)" >&2; exit 1; }; \
     echo "Core version marked as X.Y.Z-${XRAY_VERSION_SUFFIX}"
 
+# Дефолт лимита пайпа для amd64. Ветки arm и arm64 не трогаются: там уже 0 и
+# 4 КБ. Как и выше, sed молча ничего не заменит, если апстрим перепишет
+# readDefaultBufferSize, поэтому форма проверяется до и после.
+RUN set -eu; \
+    if [ -z "$PIPE_BUFFER_KB" ]; then \
+      echo "Dispatcher pipe buffer left at upstream defaults"; \
+      exit 0; \
+    fi; \
+    printf '%s' "$PIPE_BUFFER_KB" | grep -Eq '^[1-9][0-9]*$' \
+      || { echo "PIPE_BUFFER_KB is not a positive number: $PIPE_BUFFER_KB" >&2; exit 1; }; \
+    grep -Fq 'return 512 * 1024' features/policy/policy.go \
+      || { echo "readDefaultBufferSize no longer has the shape this patch expects" >&2; exit 1; }; \
+    sed -i "s|return 512 \* 1024|return ${PIPE_BUFFER_KB} * 1024|" features/policy/policy.go; \
+    grep -Fq "return ${PIPE_BUFFER_KB} * 1024" features/policy/policy.go \
+      || { echo "pipe buffer patch did not apply (features/policy/policy.go)" >&2; exit 1; }; \
+    echo "Dispatcher pipe buffer set to ${PIPE_BUFFER_KB} KiB (non-ARM branch)"
+
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
       go mod download && exit 0; \
@@ -84,8 +125,27 @@ RUN set -eu; \
     echo "go mod download failed after 5 attempts" >&2; \
     exit 1
 
+# Правка лежит в зависимости, а не в /src, поэтому дерево вендорится: сборка
+# ниже подхватит vendor/ автоматически. Без правки vendor/ не создаётся и
+# сборка идёт по модулям, как у апстрима.
+RUN set -eu; \
+    if [ -z "$H2_SCRATCH_KB" ]; then \
+      echo "HTTP/2 scratch buffer left at upstream defaults"; \
+      exit 0; \
+    fi; \
+    printf '%s' "$H2_SCRATCH_KB" | grep -Eq '^[1-9][0-9]*$' \
+      || { echo "H2_SCRATCH_KB is not a positive number: $H2_SCRATCH_KB" >&2; exit 1; }; \
+    go mod vendor; \
+    T=vendor/golang.org/x/net/http2/transport.go; \
+    grep -Fq 'const max = 512 << 10' "$T" \
+      || { echo "frameScratchBufferLen no longer has the shape this patch expects" >&2; exit 1; }; \
+    sed -i "s|const max = 512 << 10|const max = ${H2_SCRATCH_KB} << 10|" "$T"; \
+    grep -Fq "const max = ${H2_SCRATCH_KB} << 10" "$T" \
+      || { echo "h2 scratch patch did not apply ($T)" >&2; exit 1; }; \
+    echo "HTTP/2 uplink scratch buffer capped at ${H2_SCRATCH_KB} KiB"
+
 # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
-# бинарник отличался от официального только версией тулчейна.
+# бинарник отличался от официального только версией тулчейна и правками выше.
 #
 # core.build апстрим берёт из git describe, но у него чекаут поверхностный и
 # без тегов, поэтому describe всегда сваливается в короткий SHA. У нас клон

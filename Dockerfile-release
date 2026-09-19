@@ -42,7 +42,7 @@ ARG XRAY_VERSION_SUFFIX=ros
 # последнюю ветку, поэтому на arm64 она ничего не меняет.
 ARG PIPE_BUFFER_KB=64
 
-# Скретч-буфер записи HTTP/2 в x/net/http2: min(SETTINGS пира, 512 КиБ) на
+# Скретч-буфер записи HTTP/2 (stdlib или x/net/http2): min(SETTINGS пира, 512 КиБ) на
 # каждый аплинк-стрим, от архитектуры не зависит. У XHTTP через io.Pipe за раз
 # приходит buf.Size = 8192 байт, то есть буфер заполняется на 1.6% и держится
 # всю жизнь стрима. Апстримный proposal golang/go#79831 предлагает ровно это
@@ -125,8 +125,14 @@ RUN set -eu; \
     echo "go mod download failed after 5 attempts" >&2; \
     exit 1
 
-# Правка лежит в зависимости, а не в /src, поэтому дерево вендорится: сборка
-# ниже подхватит vendor/ автоматически. Без правки vendor/ не создаётся и
+# Где живёт frameScratchBufferLen, зависит от тулчейна. С Go 1.27 x/net/http2
+# стал обёрткой над stdlib: его transport.go собирается только с тегом
+# http2legacy (//go:build !(go1.27 && !http2legacy)), а работает копия в
+# $GOROOT/src/net/http/internal/http2. Правка только в vendor/ поэтому ничего
+# не меняла — это показал замер памяти, куча на соединение не сдвинулась.
+# Патчим оба места: какое из них скомпилируется, то и будет с правкой.
+# Stdlib собирается из исходников GOROOT, изменённый файл пересоберётся сам.
+# Дерево вендорится ради копии в x/net; без правки vendor/ не создаётся и
 # сборка идёт по модулям, как у апстрима.
 RUN set -eu; \
     if [ -z "$H2_SCRATCH_KB" ]; then \
@@ -136,13 +142,19 @@ RUN set -eu; \
     printf '%s' "$H2_SCRATCH_KB" | grep -Eq '^[1-9][0-9]*$' \
       || { echo "H2_SCRATCH_KB is not a positive number: $H2_SCRATCH_KB" >&2; exit 1; }; \
     go mod vendor; \
-    T=vendor/golang.org/x/net/http2/transport.go; \
-    grep -Fq 'const max = 512 << 10' "$T" \
-      || { echo "frameScratchBufferLen no longer has the shape this patch expects" >&2; exit 1; }; \
-    sed -i "s|const max = 512 << 10|const max = ${H2_SCRATCH_KB} << 10|" "$T"; \
-    grep -Fq "const max = ${H2_SCRATCH_KB} << 10" "$T" \
-      || { echo "h2 scratch patch did not apply ($T)" >&2; exit 1; }; \
-    echo "HTTP/2 uplink scratch buffer capped at ${H2_SCRATCH_KB} KiB"
+    patched=0; \
+    for T in "$(go env GOROOT)/src/net/http/internal/http2/transport.go" \
+             vendor/golang.org/x/net/http2/transport.go; do \
+      [ -f "$T" ] || continue; \
+      grep -Fq 'const max = 512 << 10' "$T" \
+        || { echo "frameScratchBufferLen no longer has the shape this patch expects ($T)" >&2; exit 1; }; \
+      sed -i "s|const max = 512 << 10|const max = ${H2_SCRATCH_KB} << 10|" "$T"; \
+      grep -Fq "const max = ${H2_SCRATCH_KB} << 10" "$T" \
+        || { echo "h2 scratch patch did not apply ($T)" >&2; exit 1; }; \
+      echo "HTTP/2 uplink scratch buffer capped at ${H2_SCRATCH_KB} KiB in $T"; \
+      patched=$((patched+1)); \
+    done; \
+    [ "$patched" -gt 0 ] || { echo "no HTTP/2 transport source found to patch" >&2; exit 1; }
 
 # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
 # бинарник отличался от официального только версией тулчейна и правками выше.

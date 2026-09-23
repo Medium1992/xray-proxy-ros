@@ -49,6 +49,15 @@ ARG PIPE_BUFFER_KB=64
 # значение, пока не принят.
 ARG H2_SCRATCH_KB=32
 
+# http2legacy возвращает x/net/http2 его собственный пул соединений. Под Go 1.27
+# без тега x/net оборачивает net/http, а тот дозванивается отдельно для каждого
+# запроса, пока соединения нет: когда TLS-хендшейк глохнет на пути, каждая
+# сессия открывает свой TCP, xmux.maxConnections перестаёт ограничивать сокеты,
+# и память растёт до OOM (XTLS/Xray-core#6797). Замер на сервере, который не
+# отвечает на ClientHello: 40 сессий — 40 дозвонов без тега и 3 с ним. Пустое
+# значение собирает без тегов. Убрать, когда это починят в Xray или Go.
+ARG GO_BUILD_TAGS=http2legacy
+
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
 # ошибкой, а не тихой подменой.
@@ -176,6 +185,14 @@ RUN set -eu; \
       MODMODE=-mod=mod; \
     fi; \
     echo "Module mode: ${MODMODE}"; \
+    echo "Build tags: ${GO_BUILD_TAGS:-none}"; \
+    case ",${GO_BUILD_TAGS}," in \
+      *,http2legacy,*) \
+        go list "$MODMODE" -tags "$GO_BUILD_TAGS" -f '{{join .GoFiles " "}}' golang.org/x/net/http2 \
+          | tr ' ' '\n' | grep -qx transport.go \
+          || { echo "http2legacy no longer selects x/net's own transport" >&2; exit 1; }; \
+        ;; \
+    esac; \
     case "$TARGETARCH" in \
       arm) \
         case "$TARGETVARIANT" in \
@@ -190,7 +207,7 @@ RUN set -eu; \
     COMMID="$(git rev-parse --short=7 HEAD)"; \
     echo "Building ${XRAY_REPO}@${XRAY_REF} (${COMMID}) for ${TARGETOS}/${TARGETARCH}${TARGETVARIANT:+/}${TARGETVARIANT} with $(go version)"; \
     GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
-    go build "$MODMODE" -o /final/xray -trimpath -buildvcs=false \
+    go build "$MODMODE" -tags "$GO_BUILD_TAGS" -o /final/xray -trimpath -buildvcs=false \
       -gcflags="all=-l=4" \
       -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
       -v ./main

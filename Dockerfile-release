@@ -58,6 +58,14 @@ ARG H2_SCRATCH_KB=32
 # значение собирает без тегов. Убрать, когда это починят в Xray или Go.
 ARG GO_BUILD_TAGS=http2legacy
 
+# Регулятор окон HTTP/2 для XHTTP из форка mux-ka (patches/xhttp-flow): окно
+# приёма загрузки стартует с 64 КиБ и растёт только по тому, что читатель
+# реально вычитал за RTT, как автоподстройка TCP. Без него Go держит до 4 МиБ
+# непрочитанного на каждый стрим. required — патчи обязаны лечь, иначе сборка
+# падает; off — ядро без регулятора. На роутере его выключает переменная
+# окружения XRAY_XHTTP_FLOW=off без пересборки.
+ARG XHTTP_FLOW=required
+
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
 # ошибкой, а не тихой подменой.
@@ -82,6 +90,24 @@ WORKDIR /src
 
 RUN git checkout --detach "$XRAY_REF" \
     || { echo "Failed to check out ${XRAY_REPO}@${XRAY_REF}" >&2; exit 1; }
+
+# git apply, а не git am: HEAD остаётся коммитом апстрима, и в core.build
+# уходит его хэш. Хуки проверяются отдельно: патч может лечь, но не туда.
+COPY patches/xhttp-flow /patches/xhttp-flow
+RUN set -eu; \
+    case "$XHTTP_FLOW" in \
+      off) echo "XHTTP flow governor: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "XHTTP_FLOW must be required or off, got '$XHTTP_FLOW'" >&2; exit 1 ;; \
+    esac; \
+    for p in /patches/xhttp-flow/*.patch; do \
+      git apply "$p" \
+        || { echo "XHTTP flow patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'flowListener{' transport/internet/splithttp/hub.go \
+      && grep -q 'newFlowClientConn(conn)' transport/internet/splithttp/dialer.go \
+      || { echo "XHTTP flow governor hooks are missing after patching" >&2; exit 1; }; \
+    echo "XHTTP flow governor: included"
 
 # Единственное место, по которому панель может увидеть, что ядро не
 # официальное. Version_x/y/z объявлены как byte, поэтому -X до них не

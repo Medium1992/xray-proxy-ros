@@ -1,0 +1,83 @@
+From dd02f975dd219d9e1e6b5e67973dd7847250ec41 Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 21:13:30 +0300
+Subject: [PATCH 6/6] XHTTP: Let XRAY_XHTTP_FLOW=off disable the HTTP/2 flow
+ governor
+
+The governor has no config field, so the environment variable is the
+way to take it out of both the server and the client role without a
+new build, should a deployment need to.
+---
+ common/platform/platform.go            | 1 +
+ transport/internet/splithttp/dialer.go | 4 ++--
+ transport/internet/splithttp/h2flow.go | 4 ++++
+ transport/internet/splithttp/hub.go    | 4 +++-
+ 4 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/common/platform/platform.go b/common/platform/platform.go
+index b60b8bd2..f015eb2b 100644
+--- a/common/platform/platform.go
++++ b/common/platform/platform.go
+@@ -23,6 +23,7 @@ const (
+ 	BrowserDialerAddress = "xray.browser.dialer"
+ 	XUDPLog              = "xray.xudp.show"
+ 	XUDPBaseKey          = "xray.xudp.basekey"
++	XHTTPFlow            = "xray.xhttp.flow"
+ 
+ 	TunFdKey = "xray.tun.fd"
+ )
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index dd775f5d..350ce25f 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -258,8 +258,8 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 		transport = &http2.Transport{
+ 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
+ 				conn, err := dialContext(ctxInner)
+-				if err != nil {
+-					return nil, err
++				if err != nil || !flowEnabled {
++					return conn, err
+ 				}
+ 				return newFlowClientConn(conn), nil
+ 			},
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 7342bbbc..d5a17789 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -8,6 +8,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common/bytespool"
++	"github.com/xtls/xray-core/common/platform"
+ )
+ 
+ // flowConn sits between a TLS/REALITY connection and the local HTTP/2 stack.
+@@ -67,6 +68,9 @@ func (l flowLimit) enabled() bool {
+ 	return l.max > 0
+ }
+ 
++// flowEnabled lets XRAY_XHTTP_FLOW=off take the governor out of both roles.
++var flowEnabled = platform.NewEnvFlag(platform.XHTTPFlow).GetValue(func() string { return "" }) != "off"
++
+ // flowDefault starts every stream at the initial window HTTP/2 itself
+ // defines and lets it grow no further than the peer really granted.
+ var flowDefault = flowLimit{init: h2InitWindow, max: 1 << 30}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index 2d97d7af..00f9c092 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -577,7 +577,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+ 			Protocols:         protocols,
+ 		}
+-		l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
++		if flowEnabled {
++			l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
++		}
+ 		go func() {
+ 			if err := l.server.Serve(l.listener); err != nil {
+ 				errors.LogErrorInner(ctx, err, "failed to serve HTTP for XHTTP")
+-- 
+2.52.0.windows.1
+

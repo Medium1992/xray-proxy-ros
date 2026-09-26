@@ -83,8 +83,35 @@ jobs:
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  # Стабильный релиз без регулятора окон XHTTP не выходит: если патчи
+  # (patches/xhttp-flow) не ложатся на тег или их тесты падают, прогон
+  # останавливается здесь, и пересобирать их надо руками.
+  flow:
     needs: check
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test the XHTTP flow patches on the release
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/patches/xhttp-flow:/patches:ro" \
+            -e REF=${{ needs.check.outputs.version }} -e REPO=${{ env.XRAY_REPO }} \
+            golang:${{ needs.check.outputs.go_version }}-alpine sh -euc '
+              apk add --no-cache git >/dev/null
+              git clone -q "https://github.com/${REPO}.git" /src
+              cd /src
+              git checkout -q --detach "$REF"
+              for p in /patches/*.patch; do git apply "$p"; done
+              export GOTOOLCHAIN=local CGO_ENABLED=0
+              for tags in "" http2legacy; do
+                go test -short -count=1 -tags "$tags" -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/
+              done'
+
+  build:
+    needs: [check, flow]
     if: needs.check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
     strategy:

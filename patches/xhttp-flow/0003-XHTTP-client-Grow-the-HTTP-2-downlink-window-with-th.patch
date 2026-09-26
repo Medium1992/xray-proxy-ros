@@ -1,0 +1,660 @@
+From b92f05c5661c6171b6dc42e4eef25adeb00aa91f Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 16:29:34 +0300
+Subject: [PATCH 3/6] XHTTP client: Grow the HTTP/2 downlink window with the
+ reader
+
+A node that dials XHTTP over HTTP/2, such as a transit hop, buffers up
+to its 4 MiB stream window of downlink data whenever the local reader
+falls behind. The same flow governor now wraps the connections the
+HTTP/2 transport dials, in a client role that governs only the
+downlink: the server is shown the 64 KiB initial window and gets the
+transport's credit back only while unread data stays under twice what
+the reader consumed over the lowest recent round trip, measured with
+PING towards the server.
+
+The uplink is left to the server, which buffers it. Any server works
+unchanged, stock or governed.
+---
+ transport/internet/splithttp/dialer.go        |   6 +-
+ transport/internet/splithttp/h2flow.go        | 125 ++++++--
+ .../internet/splithttp/h2flow_client_test.go  | 294 ++++++++++++++++++
+ .../internet/splithttp/h2flow_fuzz_test.go    |  27 ++
+ .../internet/splithttp/h2flow_read_test.go    |  15 +-
+ 5 files changed, 434 insertions(+), 33 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_client_test.go
+
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index 9bac57a1..dd775f5d 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -257,7 +257,11 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 		}
+ 		transport = &http2.Transport{
+ 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
+-				return dialContext(ctxInner)
++				conn, err := dialContext(ctxInner)
++				if err != nil {
++					return nil, err
++				}
++				return newFlowClientConn(conn), nil
+ 			},
+ 			IdleConnTimeout: net.ConnIdleTimeout,
+ 			ReadIdleTimeout: keepAlivePeriod,
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 0ab28595..d8ae6e62 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -10,16 +10,17 @@ import (
+ 	"github.com/xtls/xray-core/common/bytespool"
+ )
+ 
+-// flowConn sits between the server's TLS/REALITY connection and net/http.
+-// It rewrites HTTP/2 flow control so that neither side buffers more than the
+-// reader has recently shown it can consume, the way TCP autotuning does:
++// flowConn sits between a TLS/REALITY connection and the local HTTP/2 stack.
++// It rewrites HTTP/2 flow control so that nothing buffers more than its reader
++// has recently shown it can consume, the way TCP autotuning does:
+ //   - uplink: the client is shown a small initial window and gets credit only
+ //     as the handler reads, capped at twice what the handler read per RTT;
+ //   - downlink: the server is shown a small client window and gets the
+ //     client's credit back only while unread data at the client stays under
+ //     twice what the client read per RTT.
+-// Neither peer needs to know: each only ever sees a window no larger than the
+-// other side really granted.
++// On a server both apply; on a client only the downlink does, since that is
++// the only side of the exchange whose buffers are local. Neither peer needs to
++// know: each only ever sees a window no larger than the other side granted.
+ 
+ const (
+ 	h2Preface     = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+@@ -246,6 +247,7 @@ type flowStream struct {
+ type flowConn struct {
+ 	net.Conn
+ 	up, down flowLimit
++	client   bool
+ 	mode     atomic.Int32
+ 
+ 	mu          sync.Mutex
+@@ -278,6 +280,7 @@ type flowConn struct {
+ 	wqueue       []byte
+ 	wpending     atomic.Bool
+ 	settingsSent bool
++	pingReady    bool
+ 	closed       bool
+ }
+ 
+@@ -294,6 +297,13 @@ func newFlowConn(c net.Conn, up, down flowLimit) *flowConn {
+ 	}
+ }
+ 
++// newFlowClientConn governs the downlink of a connection this side dialed.
++func newFlowClientConn(c net.Conn) *flowConn {
++	fc := newFlowConn(c, flowLimit{}, flowDefault)
++	fc.client = true
++	return fc
++}
++
+ func (c *flowConn) Read(b []byte) (int, error) {
+ 	if len(c.rpending) > 0 {
+ 		n := copy(b, c.rpending)
+@@ -316,7 +326,12 @@ func (c *flowConn) Read(b []byte) (int, error) {
+ 		}
+ 		in := bytespool.Alloc(int32(n))
+ 		copy(in, b[:n])
+-		out := c.readFrames(in[:n], b[:0])
++		var out []byte
++		if c.client {
++			out = c.fromServer(in[:n], b[:0])
++		} else {
++			out = c.readFrames(in[:n], b[:0])
++		}
+ 		bytespool.Free(in)
+ 		m := copy(b, out)
+ 		if m < len(out) {
+@@ -376,14 +391,15 @@ func (c *flowConn) readFrames(in, out []byte) []byte {
+ }
+ 
+ func (c *flowConn) Write(b []byte) (int, error) {
++	if c.client {
++		return c.writeToServer(b)
++	}
+ 	if c.mode.Load() != flowH2 {
+ 		return c.Conn.Write(b)
+ 	}
+ 	c.wmu.Lock()
+ 	out := bytespool.Alloc(int32(len(b) + 64))
+-	c.mu.Lock()
+-	out = c.wp.feed(b, out[:0], (*flowWriter)(c))
+-	c.mu.Unlock()
++	out = c.fromServer(b, out[:0])
+ 	_, err := c.Conn.Write(out)
+ 	bytespool.Free(out)
+ 	c.wmu.Unlock()
+@@ -394,6 +410,30 @@ func (c *flowConn) Write(b []byte) (int, error) {
+ 	return len(b), nil
+ }
+ 
++// fromServer processes frames on their way from the server to the client.
++func (c *flowConn) fromServer(in, out []byte) []byte {
++	c.mu.Lock()
++	out = c.wp.feed(in, out, (*flowWriter)(c))
++	c.mu.Unlock()
++	return out
++}
++
++func (c *flowConn) writeToServer(b []byte) (int, error) {
++	c.wmu.Lock()
++	defer c.wmu.Unlock()
++	if c.mode.Load() == flowPlain {
++		return c.Conn.Write(b)
++	}
++	out := bytespool.Alloc(int32(len(b) + 64))
++	out = c.readFrames(b, out[:0])
++	_, err := c.Conn.Write(out)
++	bytespool.Free(out)
++	if err != nil {
++		return 0, err
++	}
++	return len(b), nil
++}
++
+ // injectToClient queues frames for the client without ever waiting for a
+ // write in progress: whoever holds wmu drains the queue after letting go.
+ func (c *flowConn) injectToClient(frames []byte) {
+@@ -470,6 +510,33 @@ func (c *flowConn) sampleRTT(now time.Time, sample time.Duration) {
+ 	}
+ }
+ 
++// appendPing adds a PING for the remote peer once a second while streams are
++// open, so the connection knows its round trip.
++func (c *flowConn) appendPing(out []byte) []byte {
++	now := time.Now()
++	if !c.pingReady || len(c.streams) == 0 || now.Sub(c.lastPing) < flowPingInterval ||
++		(!c.pingSentAt.IsZero() && now.Sub(c.pingSentAt) < flowPingTimeout) {
++		return out
++	}
++	c.pingSeq++
++	c.pingSentAt, c.lastPing = now, now
++	out = append(out, 0, 0, 8, h2Ping, 0, 0, 0, 0, 0)
++	out = binary.BigEndian.AppendUint32(out, flowPingMagic)
++	return binary.BigEndian.AppendUint32(out, c.pingSeq)
++}
++
++// pingAck reports whether a PING ACK answers ours, taking its round trip.
++func (c *flowConn) pingAck(f h2Frame, payload []byte) bool {
++	if f.flags&h2FlagAck == 0 || binary.BigEndian.Uint32(payload) != flowPingMagic ||
++		binary.BigEndian.Uint32(payload[4:]) != c.pingSeq || c.pingSentAt.IsZero() {
++		return false
++	}
++	now := time.Now()
++	c.sampleRTT(now, now.Sub(c.pingSentAt))
++	c.pingSentAt = time.Time{}
++	return true
++}
++
+ // flowGuardMin bounds how long a downlink stream may sit with the server out
+ // of window and no credit from the client before the guard steps in.
+ var flowGuardMin = 200 * time.Millisecond
+@@ -484,7 +551,7 @@ func (c *flowConn) guardDelay() time.Duration {
+ // consumed and would never do it under a small cap. Until the client has
+ // shown it credits in small steps, a stream stuck like this gets probed.
+ func (c *flowConn) armGuard(s *flowStream) {
+-	if c.incremental || !s.down.waiting.IsZero() {
++	if c.client || c.incremental || !s.down.waiting.IsZero() {
+ 		return
+ 	}
+ 	if int64(c.clientShown)+s.downForwarded-s.downSent > 0 {
+@@ -622,19 +689,18 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	c := (*flowConn)(r)
+ 	switch f.typ {
+ 	case h2Settings:
+-		if f.flags&h2FlagAck == 0 && c.down.enabled() {
+-			if real, shown, ok := rewriteInitialWindow(payload, c.down.init); ok {
+-				c.clientInit, c.clientShown = real, shown
++		if f.flags&h2FlagAck == 0 {
++			if c.down.enabled() {
++				if real, shown, ok := rewriteInitialWindow(payload, c.down.init); ok {
++					c.clientInit, c.clientShown = real, shown
++				}
+ 			}
++			c.pingReady = c.pingReady || c.client
+ 		}
+ 	case h2Ping:
+-		if f.flags&h2FlagAck != 0 && binary.BigEndian.Uint32(payload) == flowPingMagic &&
+-			binary.BigEndian.Uint32(payload[4:]) == c.pingSeq && !c.pingSentAt.IsZero() {
+-			now := time.Now()
+-			c.sampleRTT(now, now.Sub(c.pingSentAt))
+-			c.pingSentAt = time.Time{}
++		if !c.client && c.pingAck(f, payload) {
+ 			if c.guardProbe {
+-				return c.unstick(now, out)
++				return c.unstick(time.Now(), out)
+ 			}
+ 			return out
+ 		}
+@@ -684,6 +750,9 @@ func (r *flowReader) boundary(out []byte) []byte {
+ 		}
+ 	}
+ 	c.opened = c.opened[:0]
++	if c.client {
++		out = c.appendPing(out)
++	}
+ 	return out
+ }
+ 
+@@ -723,6 +792,11 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 				}
+ 			}
+ 			c.settingsSent = true
++			c.pingReady = c.pingReady || !c.client
++		}
++	case h2Ping:
++		if c.client && c.pingAck(f, payload) {
++			return out
+ 		}
+ 	case h2WindowUpdate:
+ 		inc := int64(binary.BigEndian.Uint32(payload) & 0x7fffffff)
+@@ -747,21 +821,12 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 
+ func (w *flowWriter) boundary(out []byte) []byte {
+ 	c := (*flowConn)(w)
+-	if !c.settingsSent {
++	if c.client || !c.settingsSent {
+ 		return out
+ 	}
+ 	if len(c.wqueue) > 0 {
+ 		out = append(out, c.wqueue...)
+ 		c.wqueue = nil
+ 	}
+-	now := time.Now()
+-	if len(c.streams) > 0 && now.Sub(c.lastPing) >= flowPingInterval &&
+-		(c.pingSentAt.IsZero() || now.Sub(c.pingSentAt) >= flowPingTimeout) {
+-		c.pingSeq++
+-		c.pingSentAt, c.lastPing = now, now
+-		out = append(out, 0, 0, 8, h2Ping, 0, 0, 0, 0, 0)
+-		out = binary.BigEndian.AppendUint32(out, flowPingMagic)
+-		out = binary.BigEndian.AppendUint32(out, c.pingSeq)
+-	}
+-	return out
++	return c.appendPing(out)
+ }
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+new file mode 100644
+index 00000000..a9c5a8f6
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -0,0 +1,294 @@
++package splithttp
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	gotls "crypto/tls"
++	"io"
++	mrand "math/rand/v2"
++	"net"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// flowClient is an XHTTP-like HTTP/2 client: x/net's transport over a dialed
++// connection, optionally governed, keeping the governed connections around.
++type flowClient struct {
++	*http.Client
++	mu    sync.Mutex
++	conns []*flowConn
++}
++
++func newFlowTestClient(addr string, governed bool) *flowClient {
++	fc := &flowClient{}
++	fc.Client = &http.Client{Transport: &http2.Transport{
++		AllowHTTP: true,
++		DialTLSContext: func(ctx context.Context, network, _ string, _ *gotls.Config) (net.Conn, error) {
++			c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
++			if err != nil || !governed {
++				return c, err
++			}
++			g := newFlowClientConn(c)
++			fc.mu.Lock()
++			fc.conns = append(fc.conns, g)
++			fc.mu.Unlock()
++			return g, nil
++		},
++	}}
++	return fc
++}
++
++func (fc *flowClient) each(f func(c *flowConn)) {
++	fc.mu.Lock()
++	conns := append([]*flowConn(nil), fc.conns...)
++	fc.mu.Unlock()
++	for _, c := range conns {
++		c.mu.Lock()
++		f(c)
++		c.mu.Unlock()
++	}
++}
++
++var clientCases = []struct {
++	name     string
++	up, down flowLimit
++}{
++	{"stock server", flowLimit{}, flowLimit{}},
++	{"governed server", testUp, testDown},
++}
++
++func TestFlowClientSlowReaderBounded(t *testing.T) {
++	for _, sc := range clientCases {
++		for _, governed := range []bool{true, false} {
++			var written atomic.Int64
++			_, addr := startFlowServer(t, sc.up, sc.down, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				buf := make([]byte, 16<<10)
++				for {
++					n, err := w.Write(buf)
++					written.Add(int64(n))
++					if err != nil {
++						return
++					}
++				}
++			}))
++			client := newFlowTestClient(addr, governed)
++			resp, err := client.Get("http://x/down")
++			if err != nil {
++				t.Fatal(err)
++			}
++			var consumed atomic.Int64
++			stop := make(chan struct{})
++			go slowCopy(resp.Body, 256<<10, &consumed, stop)
++			time.Sleep(3 * time.Second)
++			var unread int64
++			client.each(func(c *flowConn) {
++				for _, s := range c.streams {
++					unread = max(unread, s.downSent-s.down.returned)
++				}
++			})
++			gap := written.Load() - consumed.Load()
++			close(stop)
++			resp.Body.Close()
++			t.Logf("%s, governed client %v: server wrote %d, client read %d, gap %d, unread at client %d", sc.name, governed, written.Load(), consumed.Load(), gap, unread)
++			if governed && unread > int64(h2InitWindow)+64<<10 {
++				t.Fatalf("%s: unread at the governed client %d", sc.name, unread)
++			}
++			if governed && gap > 512<<10 {
++				t.Fatalf("%s: gap %d between written and read", sc.name, gap)
++			}
++		}
++	}
++}
++
++func TestFlowClientIntegrityDuplex(t *testing.T) {
++	for _, sc := range clientCases {
++		_, addr := startFlowServer(t, sc.up, sc.down, true, http.HandlerFunc(echoHandler))
++		client := newFlowTestClient(addr, true)
++		var wg sync.WaitGroup
++		errs := make(chan error, 16)
++		for i := 0; i < 16; i++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				data := make([]byte, 1<<20+mrand.IntN(3<<20))
++				rand.Read(data)
++				pr, pw := io.Pipe()
++				go func() {
++					for off := 0; off < len(data); {
++						n := min(len(data)-off, 1+mrand.IntN(64<<10))
++						if _, err := pw.Write(data[off : off+n]); err != nil {
++							return
++						}
++						off += n
++					}
++					pw.Close()
++				}()
++				req, _ := http.NewRequest("POST", "http://x/echo", pr)
++				resp, err := client.Do(req)
++				if err != nil {
++					errs <- err
++					return
++				}
++				defer resp.Body.Close()
++				got, err := io.ReadAll(resp.Body)
++				if err != nil {
++					errs <- err
++					return
++				}
++				if sha256.Sum256(got) != sha256.Sum256(data) {
++					errs <- io.ErrShortBuffer
++				}
++			}()
++		}
++		wg.Wait()
++		close(errs)
++		for err := range errs {
++			t.Fatalf("%s: %v", sc.name, err)
++		}
++	}
++}
++
++func clientDownloadRate(t *testing.T, sc struct {
++	name     string
++	up, down flowLimit
++}, governed bool, rtt time.Duration) (float64, time.Duration) {
++	const size = 64 << 20
++	_, addr := startFlowServer(t, sc.up, sc.down, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		buf := make([]byte, 32<<10)
++		for sent := 0; sent < size; sent += len(buf) {
++			if _, err := w.Write(buf); err != nil {
++				return
++			}
++		}
++	}))
++	client := newFlowTestClient(lagProxy(t, addr, rtt/2), governed)
++	if resp, err := client.Get("http://x/warm"); err == nil {
++		resp.Body.Read(make([]byte, 1))
++		resp.Body.Close()
++	}
++	start := time.Now()
++	resp, err := client.Get("http://x/down")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	buf := make([]byte, 32<<10)
++	var got int
++	var first4, half time.Time
++	for {
++		n, err := resp.Body.Read(buf)
++		got += n
++		if got >= 4<<20 && first4.IsZero() {
++			first4 = time.Now()
++		}
++		if got >= size/2 && half.IsZero() {
++			half = time.Now()
++		}
++		if err != nil {
++			break
++		}
++	}
++	if got != size {
++		t.Fatalf("downloaded %d of %d", got, size)
++	}
++	return float64(size/2) / time.Since(half).Seconds() / (1 << 20), first4.Sub(start)
++}
++
++func TestFlowClientKeepsThroughput(t *testing.T) {
++	if testing.Short() {
++		t.Skip("slow")
++	}
++	rtt := 40 * time.Millisecond
++	for _, sc := range clientCases {
++		base, baseRamp := clientDownloadRate(t, sc, false, rtt)
++		gov, govRamp := clientDownloadRate(t, sc, true, rtt)
++		t.Logf("%s rtt=%v: steady stock client %.1f MiB/s, governed client %.1f MiB/s; first 4 MiB %v / %v",
++			sc.name, rtt, base, gov, baseRamp.Round(time.Millisecond), govRamp.Round(time.Millisecond))
++		if gov < base*0.85 {
++			t.Fatalf("%s: governed client steady %.1f is below 85%% of %.1f", sc.name, gov, base)
++		}
++	}
++}
++
++func TestFlowClientMeasuresRTT(t *testing.T) {
++	_, addr := startFlowServer(t, flowLimit{}, flowLimit{}, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		for i := 0; i < 30; i++ {
++			w.Write(make([]byte, 32<<10))
++			w.(http.Flusher).Flush()
++			time.Sleep(100 * time.Millisecond)
++		}
++	}))
++	client := newFlowTestClient(lagProxy(t, addr, 25*time.Millisecond), true)
++	resp, err := client.Get("http://x/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	io.Copy(io.Discard, resp.Body)
++	resp.Body.Close()
++	var rtt time.Duration
++	client.each(func(c *flowConn) { rtt = max(rtt, c.currentRTT()) })
++	t.Logf("client measured rtt %v", rtt)
++	if rtt < 40*time.Millisecond || rtt > 200*time.Millisecond {
++		t.Fatalf("rtt %v is off the 50ms path", rtt)
++	}
++}
++
++func TestFlowClientStreamStateReleased(t *testing.T) {
++	for _, sc := range clientCases {
++		_, addr := startFlowServer(t, sc.up, sc.down, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			switch r.URL.Path {
++			case "/hang":
++				<-r.Context().Done()
++			default:
++				io.Copy(io.Discard, r.Body)
++				w.Write(make([]byte, 100<<10))
++			}
++		}))
++		client := newFlowTestClient(addr, true)
++		var wg sync.WaitGroup
++		for i := 0; i < 300; i++ {
++			wg.Add(1)
++			go func(i int) {
++				defer wg.Done()
++				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(1+mrand.IntN(100))*time.Millisecond)
++				defer cancel()
++				var req *http.Request
++				switch i % 3 {
++				case 0:
++					req, _ = http.NewRequestWithContext(ctx, "POST", "http://x/ok", io.LimitReader(zeroReader{}, 64<<10))
++				case 1:
++					req, _ = http.NewRequestWithContext(ctx, "GET", "http://x/hang", nil)
++				default:
++					req, _ = http.NewRequestWithContext(context.Background(), "GET", "http://x/ok", nil)
++				}
++				if resp, err := client.Do(req); err == nil {
++					io.Copy(io.Discard, resp.Body)
++					resp.Body.Close()
++				}
++			}(i)
++		}
++		wg.Wait()
++		deadline := time.Now().Add(5 * time.Second)
++		for {
++			left := 0
++			client.each(func(c *flowConn) {
++				if !c.closed {
++					left += len(c.streams)
++				}
++			})
++			if left == 0 {
++				break
++			}
++			if time.Now().After(deadline) {
++				t.Fatalf("%s: %d stream states left on the client", sc.name, left)
++			}
++			time.Sleep(50 * time.Millisecond)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_fuzz_test.go b/transport/internet/splithttp/h2flow_fuzz_test.go
+index 42e33226..64915bd4 100644
+--- a/transport/internet/splithttp/h2flow_fuzz_test.go
++++ b/transport/internet/splithttp/h2flow_fuzz_test.go
+@@ -2,6 +2,7 @@ package splithttp
+ 
+ import (
+ 	"bytes"
++	mrand "math/rand/v2"
+ 	"testing"
+ 
+ 	"golang.org/x/net/http2"
+@@ -58,5 +59,31 @@ func FuzzFlowConn(f *testing.F) {
+ 			t.Fatalf("read side produced %d bytes from %d", len(out), len(fromClient))
+ 		}
+ 		c.Close()
++
++		for _, client := range []bool{false, true} {
++			in := append([]byte(h2Preface), fromClient...)
++			if client {
++				in = fromServer
++			}
++			rnd := mrand.New(mrand.NewPCG(uint64(cut), uint64(len(in))))
++			cc := &chunkConn{data: in, rnd: rnd}
++			rc := newFlowConn(cc, testUp, testDown)
++			if client {
++				rc = newFlowClientConn(cc)
++				rc.mode.Store(flowH2)
++			}
++			var got []byte
++			for {
++				b := make([]byte, 1+rnd.IntN(64))
++				n, err := rc.Read(b)
++				got = append(got, b[:n]...)
++				if err != nil {
++					break
++				}
++			}
++			if len(got) > len(in)+64*(len(in)/h2FrameHeader+2) {
++				t.Fatalf("Read produced %d bytes from %d", len(got), len(in))
++			}
++		}
+ 	})
+ }
+diff --git a/transport/internet/splithttp/h2flow_read_test.go b/transport/internet/splithttp/h2flow_read_test.go
+index a42e3c78..4f7a590d 100644
+--- a/transport/internet/splithttp/h2flow_read_test.go
++++ b/transport/internet/splithttp/h2flow_read_test.go
+@@ -71,14 +71,25 @@ func TestFlowReadChunked(t *testing.T) {
+ 	}{
+ 		{"server passthrough", false, false},
+ 		{"server governed", false, true},
++		{"client passthrough", true, false},
++		{"client governed", true, true},
+ 	} {
+ 		in, want := frameStream(!tc.client)
+ 		for round := 0; round < 100; round++ {
+ 			rnd := mrand.New(mrand.NewPCG(uint64(round), 7))
+ 			cc := &chunkConn{data: append([]byte(nil), in...), rnd: rnd}
+-			c := newFlowConn(cc, flowLimit{}, flowLimit{})
+-			if tc.governed {
++			var c *flowConn
++			switch {
++			case tc.client:
++				c = newFlowClientConn(cc)
++				c.mode.Store(flowH2)
++				if !tc.governed {
++					c.down = flowLimit{}
++				}
++			case tc.governed:
+ 				c = newFlowConn(cc, flowDefault, flowDefault)
++			default:
++				c = newFlowConn(cc, flowLimit{}, flowLimit{})
+ 			}
+ 			var got []byte
+ 			for {
+-- 
+2.52.0.windows.1
+

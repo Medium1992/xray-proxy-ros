@@ -1,0 +1,308 @@
+From 07d54bfd5f38d066a8b240d59b3fcec1e9912f4a Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 18:15:26 +0300
+Subject: [PATCH 4/6] XHTTP: Shrink HTTP/2 flow windows when the reader slows
+ down
+
+A window grown by a fast reader stayed at that size, so a reader that
+settled to a lower rate, such as a video player once its buffer is
+full, kept the fast-phase amount unread. A window now comes down by a
+quarter at a time, never below its initial size, once its reader has
+consumed less than a quarter of it per round trip for three round trips
+in a row. It still grows at once when the reader speeds up.
+
+Downlink windows on a server that has had to unstick a client which
+returns credit in large steps are left alone, so the guard and the
+shrinking do not undo each other.
+
+Throughput assertions are skipped under the race detector, where the
+extra copying costs enough CPU to make them meaningless.
+---
+ transport/internet/splithttp/h2flow.go        | 25 ++++--
+ .../internet/splithttp/h2flow_client_test.go  |  4 +-
+ .../internet/splithttp/h2flow_model_test.go   | 29 +++++--
+ .../internet/splithttp/h2flow_norace_test.go  |  5 ++
+ .../internet/splithttp/h2flow_race_test.go    |  5 ++
+ .../internet/splithttp/h2flow_shrink_test.go  | 79 +++++++++++++++++++
+ transport/internet/splithttp/h2flow_test.go   |  4 +-
+ 7 files changed, 134 insertions(+), 17 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_norace_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_race_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_shrink_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index d8ae6e62..952d38b5 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -50,6 +50,7 @@ const (
+ 	flowMinRTT       = time.Millisecond
+ 	flowLearnHalf    = 5 * time.Second
+ 	flowSmallCredit  = 64 << 10
++	flowShrinkAfter  = 3
+ 
+ 	flowUndecided = 0
+ 	flowH2        = 1
+@@ -191,10 +192,14 @@ type flowWindow struct {
+ 	returned int64
+ 	mark     time.Time
+ 	markBase int64
++	slow     int
+ 	waiting  time.Time
+ }
+ 
+-func (w *flowWindow) grow(now time.Time, rtt time.Duration, limit int32) {
++// adjust sets the cap to twice what the reader consumed over the last round
++// trip: at once when that is more, and by a quarter at a time, never below
++// init, once the reader has kept well under it for flowShrinkAfter round trips.
++func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32, shrink bool) {
+ 	if w.mark.IsZero() {
+ 		w.mark, w.markBase = now, w.returned
+ 		return
+@@ -202,10 +207,20 @@ func (w *flowWindow) grow(now time.Time, rtt time.Duration, limit int32) {
+ 	if now.Sub(w.mark) < rtt {
+ 		return
+ 	}
+-	if s := 2 * (w.returned - w.markBase); s > int64(w.cap) {
++	s := 2 * (w.returned - w.markBase)
++	w.mark, w.markBase = now, w.returned
++	switch {
++	case s > int64(w.cap):
+ 		w.cap = int32(min(s, int64(limit)))
++		w.slow = 0
++	case shrink && 2*s < int64(w.cap):
++		if w.slow++; w.slow >= flowShrinkAfter {
++			w.cap = int32(max(int64(init), s, int64(w.cap)*3/4))
++			w.slow = 0
++		}
++	default:
++		w.slow = 0
+ 	}
+-	w.mark, w.markBase = now, w.returned
+ }
+ 
+ // flowLearned remembers the largest cap a stream on this connection needed
+@@ -716,7 +731,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if inc < flowSmallCredit {
+ 			c.incremental = true
+ 		}
+-		s.down.grow(now, c.currentRTT(), c.down.max)
++		s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental)
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+ 		if rel <= 0 {
+@@ -806,7 +821,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		}
+ 		now := time.Now()
+ 		s.up.returned += inc
+-		s.up.grow(now, c.currentRTT(), c.up.max)
++		s.up.adjust(now, c.currentRTT(), c.up.init, c.up.max, true)
+ 		c.upLearned.note(now, c.up.init, s.up.cap)
+ 		rel := c.upRelease(s)
+ 		if rel <= 0 {
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index a9c5a8f6..250e1e6d 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -201,8 +201,8 @@ func clientDownloadRate(t *testing.T, sc struct {
+ }
+ 
+ func TestFlowClientKeepsThroughput(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("slow")
++	if testing.Short() || raceEnabled {
++		t.Skip("timing-sensitive")
+ 	}
+ 	rtt := 40 * time.Millisecond
+ 	for _, sc := range clientCases {
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index c587689f..4fad8099 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -45,7 +45,8 @@ type side struct {
+ }
+ 
+ type modelStream struct {
+-	client, server side
++	client, server   side
++	peakUp, peakDown int64
+ }
+ 
+ type flowModel struct {
+@@ -149,6 +150,7 @@ func readAll(t *testing.T, b []byte, f func(http2.Frame)) {
+ }
+ 
+ func (m *flowModel) deliverToServer(b []byte) {
++	m.notePeaks()
+ 	readAll(m.t, b, func(frame http2.Frame) {
+ 		switch f := frame.(type) {
+ 		case *http2.SettingsFrame:
+@@ -190,6 +192,7 @@ func (m *flowModel) deliverToServer(b []byte) {
+ }
+ 
+ func (m *flowModel) deliverToClient() {
++	m.notePeaks()
+ 	b := m.capture.take()
+ 	readAll(m.t, b, func(frame http2.Frame) {
+ 		switch f := frame.(type) {
+@@ -230,19 +233,29 @@ func (m *flowModel) deliverToClient() {
+ 	})
+ }
+ 
+-// limit is the governor's current cap for the stream; caps only grow, so data
+-// the reader has not consumed can never exceed it.
+-func (m *flowModel) limit(id uint32, up bool) int64 {
++// notePeaks records the largest cap each stream has had: a cap shrinks once
++// its reader slows down, but what was sent under the larger one may still be
++// unread, so that is the bound unread data is held to.
++func (m *flowModel) notePeaks() {
+ 	m.c.mu.Lock()
+ 	defer m.c.mu.Unlock()
+-	st := m.c.streams[id]
++	for id, s := range m.streams {
++		if st := m.c.streams[id]; st != nil {
++			s.peakUp = max(s.peakUp, int64(st.up.cap))
++			s.peakDown = max(s.peakDown, int64(st.down.cap))
++		}
++	}
++}
++
++func (m *flowModel) limit(id uint32, up bool) int64 {
++	s := m.streams[id]
+ 	switch {
+-	case st == nil:
++	case s == nil:
+ 		return 0
+ 	case up && m.up.enabled():
+-		return int64(st.up.cap)
++		return s.peakUp
+ 	case !up && m.down.enabled():
+-		return int64(st.down.cap)
++		return s.peakDown
+ 	}
+ 	return 0
+ }
+diff --git a/transport/internet/splithttp/h2flow_norace_test.go b/transport/internet/splithttp/h2flow_norace_test.go
+new file mode 100644
+index 00000000..c03b450a
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_norace_test.go
+@@ -0,0 +1,5 @@
++//go:build !race
++
++package splithttp
++
++const raceEnabled = false
+diff --git a/transport/internet/splithttp/h2flow_race_test.go b/transport/internet/splithttp/h2flow_race_test.go
+new file mode 100644
+index 00000000..4b0aea39
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_race_test.go
+@@ -0,0 +1,5 @@
++//go:build race
++
++package splithttp
++
++const raceEnabled = true
+diff --git a/transport/internet/splithttp/h2flow_shrink_test.go b/transport/internet/splithttp/h2flow_shrink_test.go
+new file mode 100644
+index 00000000..6d148cc3
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_shrink_test.go
+@@ -0,0 +1,79 @@
++package splithttp
++
++import (
++	"net/http"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// TestFlowWindowShrinks reads fast until the window has grown, then slowly, as
++// a video player does once its buffer is full: the window must come back
++// down instead of keeping a slow reader's unread data at the fast size.
++func TestFlowWindowShrinks(t *testing.T) {
++	if testing.Short() {
++		t.Skip("slow")
++	}
++	for _, role := range []string{"server", "client"} {
++		up, down := testUp, testDown
++		if role == "client" {
++			up, down = flowLimit{}, flowLimit{}
++		}
++		tl, addr := startFlowServer(t, up, down, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			buf := make([]byte, 16<<10)
++			for {
++				if _, err := w.Write(buf); err != nil {
++					return
++				}
++			}
++		}))
++		proxy := lagProxy(t, addr, 20*time.Millisecond)
++		var get func(string) (*http.Response, error)
++		var client *flowClient
++		if role == "client" {
++			client = newFlowTestClient(proxy, true)
++			get = client.Get
++		} else {
++			get = h2Client(proxy).Get
++		}
++		resp, err := get("http://x/down")
++		if err != nil {
++			t.Fatal(err)
++		}
++		state := func() (unread int64, cap int32) {
++			f := func(c *flowConn) {
++				for _, s := range c.streams {
++					unread, cap = max(unread, s.downSent-s.down.returned), max(cap, s.down.cap)
++				}
++			}
++			if client != nil {
++				client.each(f)
++			} else {
++				tl.each(f)
++			}
++			return
++		}
++		deadline := time.Now().Add(2 * time.Second)
++		buf := make([]byte, 64<<10)
++		for time.Now().Before(deadline) {
++			if _, err := resp.Body.Read(buf); err != nil {
++				t.Fatal(err)
++			}
++		}
++		fastUnread, fastCap := state()
++		var consumed atomic.Int64
++		stop := make(chan struct{})
++		go slowCopy(resp.Body, 1<<20, &consumed, stop)
++		time.Sleep(8 * time.Second)
++		slowUnread, slowCap := state()
++		close(stop)
++		resp.Body.Close()
++		t.Logf("%s: after the fast phase cap %d unread %d; after the slow phase cap %d unread %d", role, fastCap, fastUnread, slowCap, slowUnread)
++		if fastCap < 1<<20 {
++			t.Fatalf("%s: the window did not grow in the fast phase (%d)", role, fastCap)
++		}
++		if slowCap > 256<<10 || slowUnread > 256<<10 {
++			t.Fatalf("%s: the window stayed at %d with %d unread after slowing down", role, slowCap, slowUnread)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index 2755c339..41facd6f 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -510,8 +510,8 @@ func (zeroReader) Read(b []byte) (int, error) {
+ }
+ 
+ func TestFlowFastReaderKeepsThroughput(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("slow")
++	if testing.Short() || raceEnabled {
++		t.Skip("timing-sensitive")
+ 	}
+ 	rtt := 40 * time.Millisecond
+ 	for _, upload := range []bool{false, true} {
+-- 
+2.52.0.windows.1
+

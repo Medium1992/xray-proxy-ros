@@ -105,8 +105,44 @@ jobs:
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
-  alpha-build:
+  # Патчи регулятора окон XHTTP (patches/xhttp-flow) кладутся на каждый коммит
+  # апстрима и прогоняются его тестами тем же Go, что и сборка. Если апстрим
+  # их сломал, alpha не встаёт, а собирается без регулятора: с суффиксом
+  # .noflow, который видно в панели, и предупреждением в сводке прогона.
+  alpha-flow:
     needs: alpha-check
+    if: needs.alpha-check.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      flow: ${{ steps.test.outputs.flow }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test the XHTTP flow patches on upstream HEAD
+        id: test
+        run: |
+          set -uo pipefail
+          if docker run --rm -v "$PWD/patches/xhttp-flow:/patches:ro" \
+              -e SHA=${{ needs.alpha-check.outputs.sha }} -e REPO=${{ env.XRAY_REPO }} \
+              golang:${{ needs.alpha-check.outputs.go_version }}-alpine sh -euc '
+                apk add --no-cache git >/dev/null
+                git clone -q "https://github.com/${REPO}.git" /src
+                cd /src
+                git checkout -q --detach "$SHA"
+                for p in /patches/*.patch; do git apply "$p"; done
+                export GOTOOLCHAIN=local CGO_ENABLED=0
+                for tags in "" http2legacy; do
+                  go test -short -count=1 -tags "$tags" -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/
+                done'; then
+            echo "flow=required" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::XHTTP flow patches do not apply or fail their tests on ${{ needs.alpha-check.outputs.version }}; this alpha is built without them"
+            echo "flow=off" >> "$GITHUB_OUTPUT"
+          fi
+
+  alpha-build:
+    needs: [alpha-check, alpha-flow]
     if: needs.alpha-check.outputs.build_needed == 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -142,7 +178,8 @@ jobs:
             --build-arg XRAY_REPO=${{ env.XRAY_REPO }} \
             --build-arg XRAY_REF=${{ needs.alpha-check.outputs.sha }} \
             --build-arg GO_VERSION=${{ needs.alpha-check.outputs.go_version }} \
-            --build-arg XRAY_VERSION_SUFFIX=ros.alpha \
+            --build-arg XRAY_VERSION_SUFFIX=${{ needs.alpha-flow.outputs.flow == 'off' && 'ros.alpha.noflow' || 'ros.alpha' }} \
+            --build-arg XHTTP_FLOW=${{ needs.alpha-flow.outputs.flow }} \
             --output type=local,dest=out \
             --progress=plain \
             .

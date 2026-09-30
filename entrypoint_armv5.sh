@@ -448,10 +448,17 @@ parse() {
             PASSWORD="$CREDS"
             ;;
         ss)
-            SS_CLEAN="$(b64_normalize "$CREDS")"
-
-            SS_DECODED="$(printf '%s' "$SS_CLEAN" | base64 -d 2>/dev/null || true)"
-            [ -z "$SS_DECODED" ] && SS_DECODED="$CREDS"
+            # SIP002 допускает userinfo без base64 (method:password, обычно для 2022-*);
+            # в base64 двоеточия не бывает, поэтому по нему и различаем.
+            SS_PLAIN="$(urldecode "$CREDS")"
+            case "$SS_PLAIN" in
+                *:*) SS_DECODED="$SS_PLAIN" ;;
+                *)
+                    SS_CLEAN="$(b64_normalize "$CREDS")"
+                    SS_DECODED="$(printf '%s' "$SS_CLEAN" | base64 -d 2>/dev/null || true)"
+                    [ -z "$SS_DECODED" ] && SS_DECODED="$CREDS"
+                    ;;
+            esac
 
             METHOD="$(printf '%s' "$SS_DECODED" | cut -d':' -f1)"
             PASSWORD="$(printf '%s' "$SS_DECODED" | cut -d':' -f2-)"

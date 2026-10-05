@@ -1,0 +1,410 @@
+From 48a781a5bba187d2af873fa8ac4fabe905a4f467 Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 06:34:42 +0300
+Subject: [PATCH 8/8] XHTTP: Stop growing HTTP/2 download windows into a queue
+
+On Linux the server reads the kernel RTT of each TCP connection. When it
+climbs above the connection's own minimum, download windows stop growing,
+and once the queue is large they shrink by a quarter per round trip, since
+more data in flight would only wait in it. The round trip windows grow by
+still comes from the PING, so a TCP proxy in front leaves this idle.
+---
+ transport/internet/splithttp/h2flow.go        | 69 +++++++++++--
+ .../internet/splithttp/h2flow_ramp_test.go    | 43 ++++++++-
+ .../splithttp/h2flow_tcpinfo_linux.go         | 50 ++++++++++
+ .../splithttp/h2flow_tcpinfo_linux_test.go    | 96 +++++++++++++++++++
+ .../splithttp/h2flow_tcpinfo_other.go         | 12 +++
+ 5 files changed, 261 insertions(+), 9 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_tcpinfo_linux.go
+ create mode 100644 transport/internet/splithttp/h2flow_tcpinfo_linux_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_tcpinfo_other.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 72b44f4f..f4d87204 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -5,6 +5,7 @@ import (
+ 	"net"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common/bytespool"
+@@ -55,6 +56,9 @@ const (
+ 	flowStartWindow  = 256 << 10
+ 	flowSmallCredit  = 64 << 10
+ 	flowShrinkAfter  = 3
++	flowKernelEvery  = 20 * time.Millisecond
++	flowQueueHold    = 15 * time.Millisecond
++	flowQueueShrink  = 40 * time.Millisecond
+ 
+ 	flowUndecided = 0
+ 	flowH2        = 1
+@@ -72,10 +76,14 @@ func (l flowLimit) enabled() bool {
+ // flowEnabled lets XRAY_XHTTP_FLOW=off take the governor out of both roles.
+ var flowEnabled = platform.NewEnvFlag(platform.XHTTPFlow).GetValue(func() string { return "" }) != "off"
+ 
+-// flowDefault starts every stream at the initial window HTTP/2 itself
+-// defines and lets it grow no further than the peer really granted.
++// flowDefault never lets a window shrink below the initial window HTTP/2
++// itself defines, nor grow beyond what the peer really granted.
+ var flowDefault = flowLimit{init: h2InitWindow, max: 1 << 30}
+ 
++type tcpStats struct {
++	rtt, minRTT time.Duration
++}
++
+ type flowListener struct {
+ 	net.Listener
+ 	up, down flowLimit
+@@ -204,6 +212,7 @@ type flowWindow struct {
+ 	prev     int64
+ 	measured bool
+ 	ramped   bool
++	qAt      time.Time
+ }
+ 
+ // adjust sets the cap to twice what the reader consumed over the last round
+@@ -211,13 +220,13 @@ type flowWindow struct {
+ // init, once the reader has kept well under it for flowShrinkAfter round trips.
+ // Until the first round trip is measured the cap opens with every credit, and
+ // while the reader keeps speeding up it also covers the sender doubling its
+-// rate, as Linux receive autotuning does.
+-func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32, shrink bool) {
++// rate, as Linux receive autotuning does. hold keeps the cap from growing.
++func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32, shrink, hold bool) {
+ 	if w.mark.IsZero() {
+ 		w.mark, w.markBase = now, w.returned
+ 		return
+ 	}
+-	if !w.measured {
++	if !w.measured && !hold {
+ 		if open := int64(init) + 2*w.returned; open > int64(w.cap) {
+ 			w.cap = int32(min(open, int64(limit)))
+ 		}
+@@ -234,6 +243,9 @@ func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32,
+ 	if !w.ramped && w.prev > 0 {
+ 		grow += 2 * s * (copied - w.prev) / w.prev
+ 	}
++	if hold {
++		grow = min(grow, int64(w.cap))
++	}
+ 	w.prev, w.measured = copied, true
+ 	w.mark, w.markBase = now, w.returned
+ 	switch {
+@@ -324,10 +336,41 @@ type flowConn struct {
+ 	settingsSent bool
+ 	pingReady    bool
+ 	closed       bool
++
++	tcp   syscall.RawConn
++	kstat tcpStats
++	kAt   time.Time
++	kOK   bool
++}
++
++// queueing tells how far the kernel RTT of this TCP connection has climbed
++// above its own floor: 1 means a queue is building and download windows
++// should not grow, 2 means they should shrink, because more data in flight
++// would only wait in that queue. It compares the socket only with itself, so
++// a TCP proxy in front leaves it quiet; the round trip the windows grow by
++// still comes from the PING, which crosses such a proxy.
++func (c *flowConn) queueing(now time.Time) int {
++	if c.tcp == nil {
++		return 0
++	}
++	if now.Sub(c.kAt) >= flowKernelEvery {
++		c.kAt = now
++		c.kstat, c.kOK = readTCPStats(c.tcp)
++	}
++	if !c.kOK || c.kstat.minRTT <= 0 {
++		return 0
++	}
++	switch q := c.kstat.rtt - c.kstat.minRTT; {
++	case q > max(2*c.kstat.minRTT, flowQueueShrink):
++		return 2
++	case q > max(c.kstat.minRTT, flowQueueHold):
++		return 1
++	}
++	return 0
+ }
+ 
+ func newFlowConn(c net.Conn, up, down flowLimit) *flowConn {
+-	return &flowConn{
++	fc := &flowConn{
+ 		Conn:        c,
+ 		up:          up,
+ 		down:        down,
+@@ -337,6 +380,8 @@ func newFlowConn(c net.Conn, up, down flowLimit) *flowConn {
+ 		serverInit:  h2InitWindow,
+ 		serverShown: h2InitWindow,
+ 	}
++	fc.tcp = rawTCP(c)
++	return fc
+ }
+ 
+ // newFlowClientConn governs the downlink of a connection this side dialed.
+@@ -771,7 +816,15 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if inc < flowSmallCredit {
+ 			c.incremental = true
+ 		}
+-		s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental)
++		q := 0
++		if !c.client {
++			q = c.queueing(now)
++		}
++		s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
++		if q == 2 && now.Sub(s.down.qAt) >= c.currentRTT() {
++			s.down.qAt = now
++			s.down.cap = max(c.down.init, s.down.cap/4*3)
++		}
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+ 		if rel <= 0 {
+@@ -862,7 +915,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		}
+ 		now := time.Now()
+ 		s.up.returned += inc
+-		s.up.adjust(now, c.currentRTT(), c.up.init, c.up.max, true)
++		s.up.adjust(now, c.currentRTT(), c.up.init, c.up.max, true, false)
+ 		c.upLearned.note(now, c.up.init, s.up.cap)
+ 		rel := c.upRelease(s)
+ 		if rel <= 0 {
+diff --git a/transport/internet/splithttp/h2flow_ramp_test.go b/transport/internet/splithttp/h2flow_ramp_test.go
+index 75c9569f..a64d9b77 100644
+--- a/transport/internet/splithttp/h2flow_ramp_test.go
++++ b/transport/internet/splithttp/h2flow_ramp_test.go
+@@ -11,7 +11,7 @@ func TestFlowWindowRamp(t *testing.T) {
+ 	w := flowWindow{cap: flowStartWindow}
+ 	step := func(at time.Duration, credit int64) {
+ 		w.returned += credit
+-		w.adjust(start.Add(at), rtt, h2InitWindow, 1<<30, true)
++		w.adjust(start.Add(at), rtt, h2InitWindow, 1<<30, true, false)
+ 	}
+ 
+ 	step(0, 32<<10)
+@@ -41,3 +41,44 @@ func TestFlowLearnedHalfLife(t *testing.T) {
+ 		t.Fatalf("learned cap after one half-life: got %d, want %d", got, want)
+ 	}
+ }
++
++func TestFlowWindowHold(t *testing.T) {
++	const rtt = 50 * time.Millisecond
++	start := time.Unix(0, 0)
++	w := flowWindow{cap: flowStartWindow}
++	for i, credit := range []int64{32 << 10, 200 << 10, 512 << 10, 1 << 20} {
++		w.returned += credit
++		w.adjust(start.Add(time.Duration(i)*rtt), rtt, h2InitWindow, 1<<30, true, true)
++	}
++	if w.cap != flowStartWindow {
++		t.Fatalf("the cap grew to %d while a queue was building", w.cap)
++	}
++}
++
++func TestFlowQueueing(t *testing.T) {
++	ms := time.Millisecond
++	for _, tc := range []struct {
++		rtt, min time.Duration
++		ok       bool
++		want     int
++	}{
++		{60 * ms, 50 * ms, true, 0},
++		{110 * ms, 50 * ms, true, 1},
++		{160 * ms, 50 * ms, true, 2},
++		{10 * ms, ms, true, 0},
++		{30 * ms, ms, true, 1},
++		{50 * ms, ms, true, 2},
++		{500 * ms, 50 * ms, false, 0},
++	} {
++		c := &flowConn{tcp: fakeRawConn{}, kAt: time.Unix(0, 0), kstat: tcpStats{rtt: tc.rtt, minRTT: tc.min}, kOK: tc.ok}
++		if got := c.queueing(time.Unix(0, 0)); got != tc.want {
++			t.Errorf("rtt %v over min %v (stats %v): got %d, want %d", tc.rtt, tc.min, tc.ok, got, tc.want)
++		}
++	}
++}
++
++type fakeRawConn struct{}
++
++func (fakeRawConn) Control(func(uintptr)) error    { return nil }
++func (fakeRawConn) Read(func(uintptr) bool) error  { return nil }
++func (fakeRawConn) Write(func(uintptr) bool) error { return nil }
+diff --git a/transport/internet/splithttp/h2flow_tcpinfo_linux.go b/transport/internet/splithttp/h2flow_tcpinfo_linux.go
+new file mode 100644
+index 00000000..c94550a1
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_tcpinfo_linux.go
+@@ -0,0 +1,50 @@
++//go:build linux
++
++package splithttp
++
++import (
++	"net"
++	"syscall"
++	"time"
++
++	"github.com/xtls/xray-core/transport/internet/stat"
++	"golang.org/x/sys/unix"
++)
++
++func rawTCP(c net.Conn) syscall.RawConn {
++	for range 8 {
++		switch v := c.(type) {
++		case *net.TCPConn:
++			rc, err := v.SyscallConn()
++			if err != nil {
++				return nil
++			}
++			return rc
++		case *stat.CounterConnection:
++			c = v.Connection
++		case interface{ NetConn() net.Conn }:
++			c = v.NetConn()
++		case interface{ Raw() net.Conn }:
++			c = v.Raw()
++		default:
++			return nil
++		}
++	}
++	return nil
++}
++
++func readTCPStats(rc syscall.RawConn) (s tcpStats, ok bool) {
++	if rc == nil {
++		return
++	}
++	rc.Control(func(fd uintptr) {
++		info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
++		if err != nil {
++			return
++		}
++		s.rtt = time.Duration(info.Rtt) * time.Microsecond
++		s.minRTT = time.Duration(info.Min_rtt) * time.Microsecond
++		ok = s.rtt > 0
++	})
++	return
++}
+diff --git a/transport/internet/splithttp/h2flow_tcpinfo_linux_test.go b/transport/internet/splithttp/h2flow_tcpinfo_linux_test.go
+new file mode 100644
+index 00000000..6f794f87
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_tcpinfo_linux_test.go
+@@ -0,0 +1,96 @@
++//go:build linux
++
++package splithttp
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	gotls "crypto/tls"
++	"crypto/x509"
++	"math/big"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/pires/go-proxyproto"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++func testCert(t *testing.T) gotls.Certificate {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
++	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return gotls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++}
++
++// TestFlowTCPStats checks that the kernel TCP stats are reachable through the
++// wrappers an XHTTP connection really has: TLS, PROXY protocol and stats.
++func TestFlowTCPStats(t *testing.T) {
++	cert := testCert(t)
++	for _, tc := range []struct {
++		name  string
++		proxy bool
++		stats bool
++	}{{"tls", false, false}, {"proxy+tls", true, false}, {"stats+tls", false, true}} {
++		t.Run(tc.name, func(t *testing.T) {
++			ln, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer ln.Close()
++			var l net.Listener = ln
++			if tc.proxy {
++				l = &proxyproto.Listener{Listener: ln}
++			}
++			got := make(chan net.Conn, 1)
++			go func() {
++				c, err := l.Accept()
++				if err != nil {
++					got <- nil
++					return
++				}
++				if tc.stats {
++					c = &stat.CounterConnection{Connection: c}
++				}
++				s := gotls.Server(c, &gotls.Config{Certificates: []gotls.Certificate{cert}})
++				if s.Handshake() != nil {
++					got <- nil
++					return
++				}
++				got <- s
++			}()
++			c, err := net.Dial("tcp", ln.Addr().String())
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer c.Close()
++			if tc.proxy {
++				c.Write([]byte("PROXY TCP4 192.0.2.1 192.0.2.2 1111 2222\r\n"))
++			}
++			cl := gotls.Client(c, &gotls.Config{InsecureSkipVerify: true})
++			if err := cl.Handshake(); err != nil {
++				t.Fatal(err)
++			}
++			s := <-got
++			if s == nil {
++				t.Fatal("server handshake failed")
++			}
++			defer s.Close()
++			rc := rawTCP(s)
++			if rc == nil {
++				t.Fatal("no raw TCP socket under the connection")
++			}
++			st, ok := readTCPStats(rc)
++			if !ok || st.rtt <= 0 || st.minRTT <= 0 {
++				t.Fatalf("no TCP stats: %+v %v", st, ok)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_tcpinfo_other.go b/transport/internet/splithttp/h2flow_tcpinfo_other.go
+new file mode 100644
+index 00000000..ff177769
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_tcpinfo_other.go
+@@ -0,0 +1,12 @@
++//go:build !linux
++
++package splithttp
++
++import (
++	"net"
++	"syscall"
++)
++
++func rawTCP(net.Conn) syscall.RawConn { return nil }
++
++func readTCPStats(syscall.RawConn) (tcpStats, bool) { return tcpStats{}, false }
+-- 
+2.52.0.windows.1
+

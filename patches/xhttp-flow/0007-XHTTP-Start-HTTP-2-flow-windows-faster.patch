@@ -1,0 +1,141 @@
+From 98df204918785f2d0cfe1469a2144b4c7a006123 Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:32:36 +0300
+Subject: [PATCH 7/8] XHTTP: Start HTTP/2 flow windows faster
+
+New streams start at 256 KiB or the window the connection recently
+needed, which now halves every minute instead of every 5 seconds. Before
+the first round trip is measured the window opens with every credit, and
+while the reader keeps speeding up it also covers the sender doubling its
+rate, as Linux receive autotuning does.
+---
+ transport/internet/splithttp/h2flow.go        | 33 +++++++++++---
+ .../internet/splithttp/h2flow_ramp_test.go    | 43 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 6 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_ramp_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index d5a17789..72b44f4f 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -51,7 +51,8 @@ const (
+ 	flowDefaultRTT   = 200 * time.Millisecond
+ 	flowRTTWindow    = 10 * time.Second
+ 	flowMinRTT       = time.Millisecond
+-	flowLearnHalf    = 5 * time.Second
++	flowLearnHalf    = time.Minute
++	flowStartWindow  = 256 << 10
+ 	flowSmallCredit  = 64 << 10
+ 	flowShrinkAfter  = 3
+ 
+@@ -200,24 +201,44 @@ type flowWindow struct {
+ 	markBase int64
+ 	slow     int
+ 	waiting  time.Time
++	prev     int64
++	measured bool
++	ramped   bool
+ }
+ 
+ // adjust sets the cap to twice what the reader consumed over the last round
+ // trip: at once when that is more, and by a quarter at a time, never below
+ // init, once the reader has kept well under it for flowShrinkAfter round trips.
++// Until the first round trip is measured the cap opens with every credit, and
++// while the reader keeps speeding up it also covers the sender doubling its
++// rate, as Linux receive autotuning does.
+ func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32, shrink bool) {
+ 	if w.mark.IsZero() {
+ 		w.mark, w.markBase = now, w.returned
+ 		return
+ 	}
++	if !w.measured {
++		if open := int64(init) + 2*w.returned; open > int64(w.cap) {
++			w.cap = int32(min(open, int64(limit)))
++		}
++	}
+ 	if now.Sub(w.mark) < rtt {
+ 		return
+ 	}
+-	s := 2 * (w.returned - w.markBase)
++	copied := w.returned - w.markBase
++	s := 2 * copied
++	grow := s
++	if w.prev > 0 && copied <= w.prev {
++		w.ramped = true
++	}
++	if !w.ramped && w.prev > 0 {
++		grow += 2 * s * (copied - w.prev) / w.prev
++	}
++	w.prev, w.measured = copied, true
+ 	w.mark, w.markBase = now, w.returned
+ 	switch {
+-	case s > int64(w.cap):
+-		w.cap = int32(min(s, int64(limit)))
++	case grow > int64(w.cap):
++		w.cap = int32(min(grow, int64(limit)))
+ 		w.slow = 0
+ 	case shrink && 2*s < int64(w.cap):
+ 		if w.slow++; w.slow >= flowShrinkAfter {
+@@ -696,8 +717,8 @@ func (r *flowReader) frame(f h2Frame) {
+ 		if s == nil && f.stream%2 == 1 && !c.closed {
+ 			now := time.Now()
+ 			s = &flowStream{}
+-			s.up.cap = c.upLearned.value(now, c.up.init)
+-			s.down.cap = c.downLearned.value(now, c.down.init)
++			s.up.cap = max(c.upLearned.value(now, c.up.init), flowStartWindow)
++			s.down.cap = max(c.downLearned.value(now, c.down.init), flowStartWindow)
+ 			c.streams[f.stream] = s
+ 			c.opened = append(c.opened, f.stream)
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_ramp_test.go b/transport/internet/splithttp/h2flow_ramp_test.go
+new file mode 100644
+index 00000000..75c9569f
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_ramp_test.go
+@@ -0,0 +1,43 @@
++package splithttp
++
++import (
++	"testing"
++	"time"
++)
++
++func TestFlowWindowRamp(t *testing.T) {
++	const rtt = 50 * time.Millisecond
++	start := time.Unix(0, 0)
++	w := flowWindow{cap: flowStartWindow}
++	step := func(at time.Duration, credit int64) {
++		w.returned += credit
++		w.adjust(start.Add(at), rtt, h2InitWindow, 1<<30, true)
++	}
++
++	step(0, 32<<10)
++	step(10*time.Millisecond, 200<<10)
++	if want := int32(h2InitWindow + 2*(232<<10)); w.cap != want {
++		t.Fatalf("before the first round trip the cap should open with every credit: got %d, want %d", w.cap, want)
++	}
++
++	step(rtt, 56<<10)
++	step(2*rtt, 512<<10)
++	if want := int32(3 << 20); w.cap != want {
++		t.Fatalf("a reader doubling its rate should get room for the sender doubling too: got %d, want %d", w.cap, want)
++	}
++
++	step(3*rtt, 512<<10)
++	step(4*rtt, 2<<20)
++	if want := int32(4 << 20); w.cap != want {
++		t.Fatalf("after the reader stopped speeding up the cap should follow twice its rate: got %d, want %d", w.cap, want)
++	}
++}
++
++func TestFlowLearnedHalfLife(t *testing.T) {
++	var l flowLearned
++	start := time.Unix(0, 0)
++	l.note(start, h2InitWindow, 2<<20)
++	if got, want := l.value(start.Add(flowLearnHalf), h2InitWindow), int32(h2InitWindow+(2<<20-h2InitWindow)/2); got != want {
++		t.Fatalf("learned cap after one half-life: got %d, want %d", got, want)
++	}
++}
+-- 
+2.52.0.windows.1
+

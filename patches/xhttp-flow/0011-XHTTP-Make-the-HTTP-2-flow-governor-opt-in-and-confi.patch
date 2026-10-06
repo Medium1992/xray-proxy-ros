@@ -1,0 +1,890 @@
+From 5905737ca10d107eeef93227e2b0de7693820baa Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:21:41 +0300
+Subject: [PATCH 11/12] XHTTP: Make the HTTP/2 flow governor opt-in and
+ configurable
+
+The governor is now off unless XRAY_XHTTP_FLOW=on, and each inbound or
+outbound can decide for itself in "extra":
+
+    "h2Flow": {
+        "enabled": true,
+        "maxStreamReceiveWindow": 6291456,
+        "maxConnectionReceiveWindow": 6291456
+    }
+
+"enabled" overrides the environment. The windows are what this side
+grants for data it receives, for HTTP/2 over TCP only.
+
+Go's server grants 1 MiB per connection, so every upload on one XHTTP
+connection is capped at 1 MiB per round trip. A governed server now
+grants 6 MiB unless configured, the most Linux autotuning lets one TCP
+socket buffer; the governor still holds each stream to what is read.
+Clients keep Go's 4 MiB per stream unless configured, so bridges can
+raise it while small routers do not.
+
+Clients without this change ignore "h2Flow".
+---
+ infra/conf/transport_h2flow_test.go           |  58 +++++
+ infra/conf/transport_method.go                |  51 +++-
+ transport/internet/splithttp/config.pb.go     | 125 +++++++--
+ transport/internet/splithttp/config.proto     |  11 +
+ transport/internet/splithttp/dialer.go        |  22 +-
+ transport/internet/splithttp/h2flow.go        |   5 +-
+ .../internet/splithttp/h2flow_config_test.go  | 240 ++++++++++++++++++
+ .../internet/splithttp/h2flow_transport.go    |  62 +++++
+ .../splithttp/h2flow_transport_legacy.go      |  15 ++
+ .../splithttp/h2flow_transport_wrap.go        |  18 ++
+ transport/internet/splithttp/hub.go           |   3 +-
+ 11 files changed, 572 insertions(+), 38 deletions(-)
+ create mode 100644 infra/conf/transport_h2flow_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_config_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_transport.go
+ create mode 100644 transport/internet/splithttp/h2flow_transport_legacy.go
+ create mode 100644 transport/internet/splithttp/h2flow_transport_wrap.go
+
+diff --git a/infra/conf/transport_h2flow_test.go b/infra/conf/transport_h2flow_test.go
+new file mode 100644
+index 00000000..e3f144c4
+--- /dev/null
++++ b/infra/conf/transport_h2flow_test.go
+@@ -0,0 +1,58 @@
++package conf_test
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++
++	. "github.com/xtls/xray-core/infra/conf"
++	"github.com/xtls/xray-core/transport/internet/splithttp"
++)
++
++func TestXHTTPH2Flow(t *testing.T) {
++	build := func(s string) (*splithttp.Config, error) {
++		var c SplitHTTPConfig
++		if err := json.Unmarshal([]byte(s), &c); err != nil {
++			t.Fatal(err)
++		}
++		m, err := c.Build()
++		if err != nil {
++			return nil, err
++		}
++		return m.(*splithttp.Config), nil
++	}
++
++	for _, tc := range []struct {
++		json         string
++		mode         int32
++		stream, conn int32
++		absent       bool
++	}{
++		{json: `{}`, absent: true},
++		{json: `{"h2Flow": {}}`},
++		{json: `{"h2Flow": {"enabled": true}}`, mode: 1},
++		{json: `{"h2Flow": {"enabled": false}}`, mode: 2},
++		{json: `{"extra": {"h2Flow": {"enabled": true, "maxStreamReceiveWindow": 6291456, "maxConnectionReceiveWindow": 16777216}}}`, mode: 1, stream: 6291456, conn: 16777216},
++	} {
++		c, err := build(tc.json)
++		if err != nil {
++			t.Fatal(tc.json, err)
++		}
++		f := c.GetH2Flow()
++		if tc.absent != (f == nil) {
++			t.Fatalf("%s: h2Flow present = %v", tc.json, f != nil)
++		}
++		if f.GetMode() != tc.mode || f.GetMaxStreamReceiveWindow() != tc.stream || f.GetMaxConnectionReceiveWindow() != tc.conn {
++			t.Errorf("%s: got %v", tc.json, f)
++		}
++	}
++
++	for _, s := range []string{
++		`{"h2Flow": {"maxStreamReceiveWindow": 1000}}`,
++		`{"h2Flow": {"maxConnectionReceiveWindow": 2147483647}}`,
++	} {
++		if _, err := build(s); err == nil || !strings.Contains(err.Error(), "h2Flow") {
++			t.Errorf("%s: expected an h2Flow error, got %v", s, err)
++		}
++	}
++}
+diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
+index eadc0519..ca5e8dfa 100644
+--- a/infra/conf/transport_method.go
++++ b/infra/conf/transport_method.go
+@@ -285,12 +285,57 @@ type SplitHTTPConfig struct {
+ 	ScMinPostsIntervalMs Int32Range        `json:"scMinPostsIntervalMs"`
+ 	ScMaxBufferedPosts   int64             `json:"scMaxBufferedPosts"`
+ 	ScStreamUpServerSecs Int32Range        `json:"scStreamUpServerSecs"`
++	H2Flow               *H2FlowConfig     `json:"h2Flow"`
+ 	ServerMaxHeaderBytes int32             `json:"serverMaxHeaderBytes"`
+ 	Xmux                 XmuxConfig        `json:"xmux"`
+ 	DownloadSettings     *StreamConfig     `json:"downloadSettings"`
+ 	Extra                json.RawMessage   `json:"extra"`
+ }
+ 
++// H2FlowConfig tunes HTTP/2 flow control on XHTTP connections over TCP.
++// "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
++// windows are what this side grants for data it receives.
++type H2FlowConfig struct {
++	Enabled                    *bool `json:"enabled"`
++	MaxStreamReceiveWindow     int32 `json:"maxStreamReceiveWindow"`
++	MaxConnectionReceiveWindow int32 `json:"maxConnectionReceiveWindow"`
++}
++
++// HTTP/2 windows below the protocol's initial window would stall a stream;
++// above 1 GiB they only invite unbounded buffering.
++const (
++	h2FlowMinWindow = 65535
++	h2FlowMaxWindow = 1 << 30
++)
++
++func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
++	if c == nil {
++		return nil, nil
++	}
++	config := &splithttp.H2FlowConfig{
++		MaxStreamReceiveWindow:     c.MaxStreamReceiveWindow,
++		MaxConnectionReceiveWindow: c.MaxConnectionReceiveWindow,
++	}
++	if c.Enabled != nil {
++		config.Mode = 2
++		if *c.Enabled {
++			config.Mode = 1
++		}
++	}
++	for _, w := range []struct {
++		name string
++		size int32
++	}{
++		{"maxStreamReceiveWindow", c.MaxStreamReceiveWindow},
++		{"maxConnectionReceiveWindow", c.MaxConnectionReceiveWindow},
++	} {
++		if w.size != 0 && (w.size < h2FlowMinWindow || w.size > h2FlowMaxWindow) {
++			return nil, errors.New(`"h2Flow": "`, w.name, `" must be between `, h2FlowMinWindow, " and ", h2FlowMaxWindow)
++		}
++	}
++	return config, nil
++}
++
+ type XmuxConfig struct {
+ 	MaxConcurrency   Int32Range `json:"maxConcurrency"`
+ 	MaxConnections   Int32Range `json:"maxConnections"`
+@@ -500,11 +545,15 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
+ 		},
+ 	}
+ 
++	var err error
++	if config.H2Flow, err = c.H2Flow.Build(); err != nil {
++		return nil, err
++	}
++
+ 	if c.DownloadSettings != nil {
+ 		if c.Mode == "stream-one" {
+ 			return nil, errors.New(`Can not use "downloadSettings" in "stream-one" mode.`)
+ 		}
+-		var err error
+ 		if config.DownloadSettings, err = c.DownloadSettings.Build(); err != nil {
+ 			return nil, errors.New(`Failed to build "downloadSettings".`).Base(err)
+ 		}
+diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
+index c7dfe4ce..c733af36 100644
+--- a/transport/internet/splithttp/config.pb.go
++++ b/transport/internet/splithttp/config.pb.go
+@@ -74,6 +74,70 @@ func (x *RangeConfig) GetTo() int32 {
+ 	return 0
+ }
+ 
++// H2FlowConfig tunes HTTP/2 flow control on XHTTP connections over TCP.
++type H2FlowConfig struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	// 0 follows XRAY_XHTTP_FLOW, 1 turns the governor on, 2 turns it off.
++	Mode int32 `protobuf:"varint,1,opt,name=mode,proto3" json:"mode,omitempty"`
++	// Receive windows this side grants: per stream and per connection.
++	// 0 keeps the default.
++	MaxStreamReceiveWindow     int32 `protobuf:"varint,2,opt,name=maxStreamReceiveWindow,proto3" json:"maxStreamReceiveWindow,omitempty"`
++	MaxConnectionReceiveWindow int32 `protobuf:"varint,3,opt,name=maxConnectionReceiveWindow,proto3" json:"maxConnectionReceiveWindow,omitempty"`
++	unknownFields              protoimpl.UnknownFields
++	sizeCache                  protoimpl.SizeCache
++}
++
++func (x *H2FlowConfig) Reset() {
++	*x = H2FlowConfig{}
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[1]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *H2FlowConfig) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*H2FlowConfig) ProtoMessage() {}
++
++func (x *H2FlowConfig) ProtoReflect() protoreflect.Message {
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[1]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use H2FlowConfig.ProtoReflect.Descriptor instead.
++func (*H2FlowConfig) Descriptor() ([]byte, []int) {
++	return file_transport_internet_splithttp_config_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *H2FlowConfig) GetMode() int32 {
++	if x != nil {
++		return x.Mode
++	}
++	return 0
++}
++
++func (x *H2FlowConfig) GetMaxStreamReceiveWindow() int32 {
++	if x != nil {
++		return x.MaxStreamReceiveWindow
++	}
++	return 0
++}
++
++func (x *H2FlowConfig) GetMaxConnectionReceiveWindow() int32 {
++	if x != nil {
++		return x.MaxConnectionReceiveWindow
++	}
++	return 0
++}
++
+ type XmuxConfig struct {
+ 	state            protoimpl.MessageState `protogen:"open.v1"`
+ 	MaxConcurrency   *RangeConfig           `protobuf:"bytes,1,opt,name=maxConcurrency,proto3" json:"maxConcurrency,omitempty"`
+@@ -88,7 +152,7 @@ type XmuxConfig struct {
+ 
+ func (x *XmuxConfig) Reset() {
+ 	*x = XmuxConfig{}
+-	mi := &file_transport_internet_splithttp_config_proto_msgTypes[1]
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[2]
+ 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 	ms.StoreMessageInfo(mi)
+ }
+@@ -100,7 +164,7 @@ func (x *XmuxConfig) String() string {
+ func (*XmuxConfig) ProtoMessage() {}
+ 
+ func (x *XmuxConfig) ProtoReflect() protoreflect.Message {
+-	mi := &file_transport_internet_splithttp_config_proto_msgTypes[1]
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[2]
+ 	if x != nil {
+ 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 		if ms.LoadMessageInfo() == nil {
+@@ -113,7 +177,7 @@ func (x *XmuxConfig) ProtoReflect() protoreflect.Message {
+ 
+ // Deprecated: Use XmuxConfig.ProtoReflect.Descriptor instead.
+ func (*XmuxConfig) Descriptor() ([]byte, []int) {
+-	return file_transport_internet_splithttp_config_proto_rawDescGZIP(), []int{1}
++	return file_transport_internet_splithttp_config_proto_rawDescGZIP(), []int{2}
+ }
+ 
+ func (x *XmuxConfig) GetMaxConcurrency() *RangeConfig {
+@@ -189,13 +253,14 @@ type Config struct {
+ 	ServerMaxHeaderBytes int32                  `protobuf:"varint,27,opt,name=serverMaxHeaderBytes,proto3" json:"serverMaxHeaderBytes,omitempty"`
+ 	SessionIDTable       string                 `protobuf:"bytes,28,opt,name=sessionIDTable,proto3" json:"sessionIDTable,omitempty"`
+ 	SessionIDLength      *RangeConfig           `protobuf:"bytes,29,opt,name=sessionIDLength,proto3" json:"sessionIDLength,omitempty"`
++	H2Flow               *H2FlowConfig          `protobuf:"bytes,32,opt,name=h2Flow,proto3" json:"h2Flow,omitempty"`
+ 	unknownFields        protoimpl.UnknownFields
+ 	sizeCache            protoimpl.SizeCache
+ }
+ 
+ func (x *Config) Reset() {
+ 	*x = Config{}
+-	mi := &file_transport_internet_splithttp_config_proto_msgTypes[2]
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[3]
+ 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 	ms.StoreMessageInfo(mi)
+ }
+@@ -207,7 +272,7 @@ func (x *Config) String() string {
+ func (*Config) ProtoMessage() {}
+ 
+ func (x *Config) ProtoReflect() protoreflect.Message {
+-	mi := &file_transport_internet_splithttp_config_proto_msgTypes[2]
++	mi := &file_transport_internet_splithttp_config_proto_msgTypes[3]
+ 	if x != nil {
+ 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 		if ms.LoadMessageInfo() == nil {
+@@ -220,7 +285,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
+ 
+ // Deprecated: Use Config.ProtoReflect.Descriptor instead.
+ func (*Config) Descriptor() ([]byte, []int) {
+-	return file_transport_internet_splithttp_config_proto_rawDescGZIP(), []int{2}
++	return file_transport_internet_splithttp_config_proto_rawDescGZIP(), []int{3}
+ }
+ 
+ func (x *Config) GetHost() string {
+@@ -426,6 +491,13 @@ func (x *Config) GetSessionIDLength() *RangeConfig {
+ 	return nil
+ }
+ 
++func (x *Config) GetH2Flow() *H2FlowConfig {
++	if x != nil {
++		return x.H2Flow
++	}
++	return nil
++}
++
+ var File_transport_internet_splithttp_config_proto protoreflect.FileDescriptor
+ 
+ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+@@ -433,7 +505,11 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+ 	")transport/internet/splithttp/config.proto\x12!xray.transport.internet.splithttp\x1a\x1ftransport/internet/config.proto\"1\n" +
+ 	"\vRangeConfig\x12\x12\n" +
+ 	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
+-	"\x02to\x18\x02 \x01(\x05R\x02to\"\xf8\x03\n" +
++	"\x02to\x18\x02 \x01(\x05R\x02to\"\x9a\x01\n" +
++	"\fH2FlowConfig\x12\x12\n" +
++	"\x04mode\x18\x01 \x01(\x05R\x04mode\x126\n" +
++	"\x16maxStreamReceiveWindow\x18\x02 \x01(\x05R\x16maxStreamReceiveWindow\x12>\n" +
++	"\x1amaxConnectionReceiveWindow\x18\x03 \x01(\x05R\x1amaxConnectionReceiveWindow\"\xf8\x03\n" +
+ 	"\n" +
+ 	"XmuxConfig\x12V\n" +
+ 	"\x0emaxConcurrency\x18\x01 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0emaxConcurrency\x12V\n" +
+@@ -441,7 +517,7 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+ 	"\x0ecMaxReuseTimes\x18\x03 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0ecMaxReuseTimes\x12Z\n" +
+ 	"\x10hMaxRequestTimes\x18\x04 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxRequestTimes\x12Z\n" +
+ 	"\x10hMaxReusableSecs\x18\x05 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxReusableSecs\x12*\n" +
+-	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xcc\f\n" +
++	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\x95\r\n" +
+ 	"\x06Config\x12\x12\n" +
+ 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
+ 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
+@@ -472,7 +548,8 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+ 	"\x0fuplinkChunkSize\x18\x1a \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fuplinkChunkSize\x122\n" +
+ 	"\x14serverMaxHeaderBytes\x18\x1b \x01(\x05R\x14serverMaxHeaderBytes\x12&\n" +
+ 	"\x0esessionIDTable\x18\x1c \x01(\tR\x0esessionIDTable\x12X\n" +
+-	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x1a:\n" +
++	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12G\n" +
++	"\x06h2Flow\x18  \x01(\v2/.xray.transport.internet.splithttp.H2FlowConfigR\x06h2Flow\x1a:\n" +
+ 	"\fHeadersEntry\x12\x10\n" +
+ 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+ 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x85\x01\n" +
+@@ -490,13 +567,14 @@ func file_transport_internet_splithttp_config_proto_rawDescGZIP() []byte {
+ 	return file_transport_internet_splithttp_config_proto_rawDescData
+ }
+ 
+-var file_transport_internet_splithttp_config_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
++var file_transport_internet_splithttp_config_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+ var file_transport_internet_splithttp_config_proto_goTypes = []any{
+ 	(*RangeConfig)(nil),           // 0: xray.transport.internet.splithttp.RangeConfig
+-	(*XmuxConfig)(nil),            // 1: xray.transport.internet.splithttp.XmuxConfig
+-	(*Config)(nil),                // 2: xray.transport.internet.splithttp.Config
+-	nil,                           // 3: xray.transport.internet.splithttp.Config.HeadersEntry
+-	(*internet.StreamConfig)(nil), // 4: xray.transport.internet.StreamConfig
++	(*H2FlowConfig)(nil),          // 1: xray.transport.internet.splithttp.H2FlowConfig
++	(*XmuxConfig)(nil),            // 2: xray.transport.internet.splithttp.XmuxConfig
++	(*Config)(nil),                // 3: xray.transport.internet.splithttp.Config
++	nil,                           // 4: xray.transport.internet.splithttp.Config.HeadersEntry
++	(*internet.StreamConfig)(nil), // 5: xray.transport.internet.StreamConfig
+ }
+ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
+ 	0,  // 0: xray.transport.internet.splithttp.XmuxConfig.maxConcurrency:type_name -> xray.transport.internet.splithttp.RangeConfig
+@@ -504,20 +582,21 @@ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
+ 	0,  // 2: xray.transport.internet.splithttp.XmuxConfig.cMaxReuseTimes:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 3: xray.transport.internet.splithttp.XmuxConfig.hMaxRequestTimes:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 4: xray.transport.internet.splithttp.XmuxConfig.hMaxReusableSecs:type_name -> xray.transport.internet.splithttp.RangeConfig
+-	3,  // 5: xray.transport.internet.splithttp.Config.headers:type_name -> xray.transport.internet.splithttp.Config.HeadersEntry
++	4,  // 5: xray.transport.internet.splithttp.Config.headers:type_name -> xray.transport.internet.splithttp.Config.HeadersEntry
+ 	0,  // 6: xray.transport.internet.splithttp.Config.xPaddingBytes:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 7: xray.transport.internet.splithttp.Config.scMaxEachPostBytes:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 8: xray.transport.internet.splithttp.Config.scMinPostsIntervalMs:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 9: xray.transport.internet.splithttp.Config.scStreamUpServerSecs:type_name -> xray.transport.internet.splithttp.RangeConfig
+-	1,  // 10: xray.transport.internet.splithttp.Config.xmux:type_name -> xray.transport.internet.splithttp.XmuxConfig
+-	4,  // 11: xray.transport.internet.splithttp.Config.downloadSettings:type_name -> xray.transport.internet.StreamConfig
++	2,  // 10: xray.transport.internet.splithttp.Config.xmux:type_name -> xray.transport.internet.splithttp.XmuxConfig
++	5,  // 11: xray.transport.internet.splithttp.Config.downloadSettings:type_name -> xray.transport.internet.StreamConfig
+ 	0,  // 12: xray.transport.internet.splithttp.Config.uplinkChunkSize:type_name -> xray.transport.internet.splithttp.RangeConfig
+ 	0,  // 13: xray.transport.internet.splithttp.Config.sessionIDLength:type_name -> xray.transport.internet.splithttp.RangeConfig
+-	14, // [14:14] is the sub-list for method output_type
+-	14, // [14:14] is the sub-list for method input_type
+-	14, // [14:14] is the sub-list for extension type_name
+-	14, // [14:14] is the sub-list for extension extendee
+-	0,  // [0:14] is the sub-list for field type_name
++	1,  // 14: xray.transport.internet.splithttp.Config.h2Flow:type_name -> xray.transport.internet.splithttp.H2FlowConfig
++	15, // [15:15] is the sub-list for method output_type
++	15, // [15:15] is the sub-list for method input_type
++	15, // [15:15] is the sub-list for extension type_name
++	15, // [15:15] is the sub-list for extension extendee
++	0,  // [0:15] is the sub-list for field type_name
+ }
+ 
+ func init() { file_transport_internet_splithttp_config_proto_init() }
+@@ -531,7 +610,7 @@ func file_transport_internet_splithttp_config_proto_init() {
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_internet_splithttp_config_proto_rawDesc), len(file_transport_internet_splithttp_config_proto_rawDesc)),
+ 			NumEnums:      0,
+-			NumMessages:   4,
++			NumMessages:   5,
+ 			NumExtensions: 0,
+ 			NumServices:   0,
+ 		},
+diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
+index efe6de03..2f4d24ab 100644
+--- a/transport/internet/splithttp/config.proto
++++ b/transport/internet/splithttp/config.proto
+@@ -13,6 +13,16 @@ message RangeConfig {
+   int32 to = 2;
+ }
+ 
++// H2FlowConfig tunes HTTP/2 flow control on XHTTP connections over TCP.
++message H2FlowConfig {
++  // 0 follows XRAY_XHTTP_FLOW, 1 turns the governor on, 2 turns it off.
++  int32 mode = 1;
++  // Receive windows this side grants: per stream and per connection.
++  // 0 keeps the default.
++  int32 maxStreamReceiveWindow = 2;
++  int32 maxConnectionReceiveWindow = 3;
++}
++
+ message XmuxConfig {
+   RangeConfig maxConcurrency = 1;
+   RangeConfig maxConnections = 2;
+@@ -52,4 +62,5 @@ message Config {
+   int32 serverMaxHeaderBytes = 27;
+   string sessionIDTable = 28;
+   RangeConfig sessionIDLength = 29;
++  H2FlowConfig h2Flow = 32;
+ }
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index 40cd7610..e124db29 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -31,7 +31,6 @@ import (
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+ 	"github.com/xtls/xray-core/transport/pipe"
+-	"golang.org/x/net/http2"
+ )
+ 
+ type dialerConf struct {
+@@ -251,17 +250,18 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 		if keepAlivePeriod < 0 {
+ 			keepAlivePeriod = 0
+ 		}
+-		transport = &http2.Transport{
+-			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
+-				conn, err := dialContext(ctxInner)
+-				if err != nil || !flowEnabled {
+-					return conn, err
+-				}
+-				return newFlowClientConn(conn), nil
+-			},
+-			IdleConnTimeout: net.ConnIdleTimeout,
+-			ReadIdleTimeout: keepAlivePeriod,
++		governed := transportConfig.h2FlowOn()
++		h2 := newH2Transport(transportConfig.h2ReceiveConfig(false))
++		h2.DialTLSContext = func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
++			conn, err := dialContext(ctxInner)
++			if err != nil || !governed {
++				return conn, err
++			}
++			return newFlowClientConn(conn), nil
+ 		}
++		h2.IdleConnTimeout = net.ConnIdleTimeout
++		h2.ReadIdleTimeout = keepAlivePeriod
++		transport = h2
+ 	} else {
+ 		httpDialContext := func(ctxInner context.Context, network string, addr string) (net.Conn, error) {
+ 			return dialContext(ctxInner)
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index b093e5b7..e48b4aff 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -73,8 +73,9 @@ func (l flowLimit) enabled() bool {
+ 	return l.max > 0
+ }
+ 
+-// flowEnabled lets XRAY_XHTTP_FLOW=off take the governor out of both roles.
+-var flowEnabled = platform.NewEnvFlag(platform.XHTTPFlow).GetValue(func() string { return "" }) != "off"
++// flowEnabled is the default for XHTTP connections whose "h2Flow" does not
++// say: off unless XRAY_XHTTP_FLOW=on.
++var flowEnabled = platform.NewEnvFlag(platform.XHTTPFlow).GetValue(func() string { return "" }) == "on"
+ 
+ // flowDefault never lets a window shrink below the initial window HTTP/2
+ // itself defines, nor grow beyond what the peer really granted.
+diff --git a/transport/internet/splithttp/h2flow_config_test.go b/transport/internet/splithttp/h2flow_config_test.go
+new file mode 100644
+index 00000000..4c24eaa4
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_config_test.go
+@@ -0,0 +1,240 @@
++package splithttp
++
++import (
++	"bytes"
++	"context"
++	gotls "crypto/tls"
++	"encoding/binary"
++	"fmt"
++	"io"
++	gonet "net"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++func TestH2FlowMode(t *testing.T) {
++	defer func(v bool) { flowEnabled = v }(flowEnabled)
++	for _, env := range []bool{false, true} {
++		flowEnabled = env
++		for mode, want := range map[int32]bool{0: env, 1: true, 2: false} {
++			c := &Config{H2Flow: &H2FlowConfig{Mode: mode}}
++			if got := c.h2FlowOn(); got != want {
++				t.Errorf("env %v, mode %d: got %v, want %v", env, mode, got, want)
++			}
++		}
++		if got := (&Config{}).h2FlowOn(); got != env {
++			t.Errorf("env %v without h2Flow: got %v", env, got)
++		}
++	}
++}
++
++func TestH2ReceiveConfig(t *testing.T) {
++	defer func(v bool) { flowEnabled = v }(flowEnabled)
++	flowEnabled = false
++	for _, tc := range []struct {
++		name         string
++		flow         *H2FlowConfig
++		server       bool
++		stream, conn int
++	}{
++		{"server, governor off", nil, true, 0, 0},
++		{"server, governor on", &H2FlowConfig{Mode: 1}, true, flowServerReceiveWindow, flowServerReceiveWindow},
++		{"server, governor on, set", &H2FlowConfig{Mode: 1, MaxStreamReceiveWindow: 2 << 20}, true, 2 << 20, flowServerReceiveWindow},
++		{"server, governor off, set", &H2FlowConfig{Mode: 2, MaxConnectionReceiveWindow: 3 << 20}, true, 0, 3 << 20},
++		{"client, governor on", &H2FlowConfig{Mode: 1}, false, 0, 0},
++		{"client, set", &H2FlowConfig{Mode: 1, MaxStreamReceiveWindow: 8 << 20, MaxConnectionReceiveWindow: 16 << 20}, false, 8 << 20, 16 << 20},
++	} {
++		conf := (&Config{H2Flow: tc.flow}).h2ReceiveConfig(tc.server)
++		var stream, conn int
++		if conf != nil {
++			stream, conn = conf.MaxReceiveBufferPerStream, conf.MaxReceiveBufferPerConnection
++		}
++		if stream != tc.stream || conn != tc.conn {
++			t.Errorf("%s: got %d/%d, want %d/%d", tc.name, stream, conn, tc.stream, tc.conn)
++		}
++	}
++}
++
++// readSettings reads frames until it has seen the peer's SETTINGS and the
++// connection-level WINDOW_UPDATE that follows them.
++func readSettings(t *testing.T, r io.Reader) (initialWindow, connIncrement uint32) {
++	t.Helper()
++	header := make([]byte, 9)
++	for connIncrement == 0 {
++		if _, err := io.ReadFull(r, header); err != nil {
++			t.Fatal(err)
++		}
++		payload := make([]byte, int(header[0])<<16|int(header[1])<<8|int(header[2]))
++		if _, err := io.ReadFull(r, payload); err != nil {
++			t.Fatal(err)
++		}
++		stream := binary.BigEndian.Uint32(header[5:]) & 0x7fffffff
++		switch header[3] {
++		case h2Settings:
++			if header[4]&h2FlagAck != 0 {
++				continue
++			}
++			initialWindow = h2InitWindow
++			for i := 0; i+6 <= len(payload); i += 6 {
++				if binary.BigEndian.Uint16(payload[i:]) == 0x4 {
++					initialWindow = binary.BigEndian.Uint32(payload[i+2:])
++				}
++			}
++		case h2WindowUpdate:
++			if stream == 0 {
++				connIncrement = binary.BigEndian.Uint32(payload) & 0x7fffffff
++			}
++		}
++	}
++	return
++}
++
++func TestH2TransportGrantsWindows(t *testing.T) {
++	ln, err := gonet.Listen("tcp", "127.0.0.1:0")
++	common.Must(err)
++	defer ln.Close()
++
++	h2 := newH2Transport(&http.HTTP2Config{MaxReceiveBufferPerStream: 6 << 20, MaxReceiveBufferPerConnection: 16 << 20})
++	h2.DialTLSContext = func(ctx context.Context, network, _ string, _ *gotls.Config) (gonet.Conn, error) {
++		var d gonet.Dialer
++		return d.DialContext(ctx, network, ln.Addr().String())
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	go func() {
++		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
++		if resp, err := h2.RoundTrip(req); err == nil {
++			resp.Body.Close()
++		}
++	}()
++
++	conn, err := ln.Accept()
++	common.Must(err)
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(10 * time.Second))
++	preface := make([]byte, len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
++	if _, err := io.ReadFull(conn, preface); err != nil {
++		t.Fatal(err)
++	}
++	stream, connInc := readSettings(t, conn)
++	if stream != 6<<20 || connInc != 16<<20 {
++		t.Fatalf("client granted %d per stream and %d per connection, want %d and %d", stream, connInc, 6<<20, 16<<20)
++	}
++}
++
++func TestH2ServerGrantsWindows(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		flow          *H2FlowConfig
++		stream, conn  uint32
++		governedShown bool
++	}{
++		{"governor off, set", &H2FlowConfig{Mode: 2, MaxStreamReceiveWindow: 3 << 20, MaxConnectionReceiveWindow: 5 << 20}, 3 << 20, 5 << 20, false},
++		{"governor off, default", &H2FlowConfig{Mode: 2}, 1 << 20, 1 << 20, false},
++		{"governor on, default", &H2FlowConfig{Mode: 1}, flowServerReceiveWindow, flowServerReceiveWindow, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			port := tcp.PickPort()
++			listen, err := ListenXH(context.Background(), net.LocalHostIP, port, &internet.MemoryStreamConfig{
++				ProtocolName:     "splithttp",
++				ProtocolSettings: &Config{Path: "shs", H2Flow: tc.flow},
++			}, func(conn stat.Connection) { conn.Close() })
++			common.Must(err)
++			defer listen.Close()
++
++			conn, err := gonet.Dial("tcp", net.LocalHostIP.String()+":"+port.String())
++			common.Must(err)
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(10 * time.Second))
++			common.Must2(conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")))
++			common.Must2(conn.Write([]byte{0, 0, 0, h2Settings, 0, 0, 0, 0, 0}))
++
++			stream, connInc := readSettings(t, conn)
++			if connWindow := connInc + h2InitWindow; connWindow != tc.conn {
++				t.Errorf("connection window %d, want %d", connWindow, tc.conn)
++			}
++			if tc.governedShown {
++				// The governor shows the client a small window and hands out
++				// the rest of what the server grants as it is read.
++				if stream >= tc.stream {
++					t.Errorf("governed stream window shown as %d, want below %d", stream, tc.stream)
++				}
++			} else if stream != tc.stream {
++				t.Errorf("stream window %d, want %d", stream, tc.stream)
++			}
++		})
++	}
++}
++
++// TestH2WindowsEndToEnd runs governed duplex streams between a server and a
++// client that both grant larger windows than Go does, checking every byte.
++func TestH2WindowsEndToEnd(t *testing.T) {
++	ln, err := gonet.Listen("tcp", "127.0.0.1:0")
++	common.Must(err)
++	tl := &testListener{Listener: ln, up: flowDefault, down: flowDefault}
++	protocols := new(http.Protocols)
++	protocols.SetUnencryptedHTTP2(true)
++	srv := &http.Server{
++		Handler:   http.HandlerFunc(echoHandler),
++		Protocols: protocols,
++		HTTP2:     (&Config{H2Flow: &H2FlowConfig{Mode: 1}}).h2ReceiveConfig(true),
++	}
++	go srv.Serve(tl)
++	defer srv.Close()
++
++	h2 := newH2Transport((&Config{H2Flow: &H2FlowConfig{
++		Mode:                       1,
++		MaxStreamReceiveWindow:     8 << 20,
++		MaxConnectionReceiveWindow: 16 << 20,
++	}}).h2ReceiveConfig(false))
++	h2.AllowHTTP = true
++	h2.DialTLSContext = func(ctx context.Context, network, _ string, _ *gotls.Config) (gonet.Conn, error) {
++		c, err := (&gonet.Dialer{}).DialContext(ctx, network, ln.Addr().String())
++		if err != nil {
++			return nil, err
++		}
++		return newFlowClientConn(c), nil
++	}
++	client := &http.Client{Transport: h2}
++
++	const size = 32 << 20
++	errs := make(chan error, 4)
++	for i := range 4 {
++		go func() {
++			data := make([]byte, size)
++			for j := range data {
++				data[j] = byte(j*7 + i)
++			}
++			pr, pw := io.Pipe()
++			go func() {
++				pw.CloseWithError(func() error {
++					_, err := pw.Write(data)
++					return err
++				}())
++			}()
++			resp, err := client.Post("https://example.com/", "application/octet-stream", pr)
++			if err != nil {
++				errs <- err
++				return
++			}
++			defer resp.Body.Close()
++			got, err := io.ReadAll(resp.Body)
++			if err == nil && !bytes.Equal(got, data) {
++				err = fmt.Errorf("stream %d: echoed %d bytes that differ from the %d sent", i, len(got), size)
++			}
++			errs <- err
++		}()
++	}
++	for range 4 {
++		if err := <-errs; err != nil {
++			t.Fatal(err)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_transport.go b/transport/internet/splithttp/h2flow_transport.go
+new file mode 100644
+index 00000000..49782b64
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_transport.go
+@@ -0,0 +1,62 @@
++package splithttp
++
++import (
++	"net/http"
++
++	"golang.org/x/net/http2"
++)
++
++// flowServerReceiveWindow is what a governed server grants for uploads unless
++// configured otherwise: the most Linux autotuning lets one TCP socket buffer
++// (tcp_rmem). Go's own 1 MiB per connection caps every upload on it at
++// 1 MiB per round trip; the governor still holds the window to what is read.
++const flowServerReceiveWindow = 6 << 20
++
++// h2FlowOn reports whether the governor runs on this inbound or outbound:
++// "h2Flow.enabled" if set, XRAY_XHTTP_FLOW=on otherwise.
++func (c *Config) h2FlowOn() bool {
++	switch c.GetH2Flow().GetMode() {
++	case 1:
++		return true
++	case 2:
++		return false
++	}
++	return flowEnabled
++}
++
++// h2ReceiveConfig returns the HTTP/2 receive windows this side grants, or nil
++// to keep Go's defaults.
++func (c *Config) h2ReceiveConfig(server bool) *http.HTTP2Config {
++	f := c.GetH2Flow()
++	stream, conn := int(f.GetMaxStreamReceiveWindow()), int(f.GetMaxConnectionReceiveWindow())
++	if server && c.h2FlowOn() {
++		if stream == 0 {
++			stream = flowServerReceiveWindow
++		}
++		if conn == 0 {
++			conn = flowServerReceiveWindow
++		}
++	}
++	if stream == 0 && conn == 0 {
++		return nil
++	}
++	return &http.HTTP2Config{
++		MaxReceiveBufferPerStream:     stream,
++		MaxReceiveBufferPerConnection: conn,
++	}
++}
++
++// newH2Transport returns an HTTP/2 transport that grants the given receive
++// windows. x/net takes them only from a linked net/http transport.
++func newH2Transport(conf *http.HTTP2Config) *http2.Transport {
++	if conf == nil {
++		return &http2.Transport{}
++	}
++	t1 := &http.Transport{HTTP2: conf}
++	t2, err := http2.ConfigureTransports(t1)
++	if err != nil {
++		panic(err)
++	}
++	unlinkH2Transport(t1, t2)
++	return t2
++}
+diff --git a/transport/internet/splithttp/h2flow_transport_legacy.go b/transport/internet/splithttp/h2flow_transport_legacy.go
+new file mode 100644
+index 00000000..d8c242d5
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_transport_legacy.go
+@@ -0,0 +1,15 @@
++//go:build !go1.27 || http2legacy
++
++package splithttp
++
++import (
++	"net/http"
++
++	"golang.org/x/net/http2"
++)
++
++// unlinkH2Transport gives t2 its own dialing connection pool: the one
++// ConfigureTransports installs only takes connections net/http dialed.
++func unlinkH2Transport(_ *http.Transport, t2 *http2.Transport) {
++	t2.ConnPool = nil
++}
+diff --git a/transport/internet/splithttp/h2flow_transport_wrap.go b/transport/internet/splithttp/h2flow_transport_wrap.go
+new file mode 100644
+index 00000000..b0e375fa
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_transport_wrap.go
+@@ -0,0 +1,18 @@
++//go:build go1.27 && !http2legacy
++
++package splithttp
++
++import (
++	"net/http"
++
++	"golang.org/x/net/http2"
++)
++
++// unlinkH2Transport leaves t1 as a plain http2.Transport would have created
++// it, apart from the HTTP/2 settings: ConfigureTransports also turns on
++// HTTP/1 and sets a TLS config, which a transport that dials its own
++// connections does not want.
++func unlinkH2Transport(t1 *http.Transport, _ *http2.Transport) {
++	t1.Protocols = nil
++	t1.TLSClientConfig = nil
++}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index 62aa7afe..f7a93014 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -562,8 +562,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 			ReadHeaderTimeout: time.Second * 4,
+ 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+ 			Protocols:         protocols,
++			HTTP2:             l.config.h2ReceiveConfig(true),
+ 		}
+-		if flowEnabled {
++		if l.config.h2FlowOn() {
+ 			l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
+ 		}
+ 		go func() {
+-- 
+2.52.0.windows.1
+

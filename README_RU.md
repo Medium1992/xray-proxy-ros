@@ -72,7 +72,7 @@ Xray запускается с `/etc/xray/` как директорией multi-
 | `TPROXY` | `true` | С NFTables: `true` использует Redirect TCP + TProxy UDP, `false` использует Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` добавляет в Xray routing правило блокировки UDP/443. |
 | `HY2_HOP_INTERVAL` | `30` | Секунд между сменами удалённого порта, когда ссылка Hysteria2 просит port hopping (`mport` или диапазон портов). Не меньше 5. |
-| `XRAY_XHTTP_FLOW` | пусто | `off` отключает регулятор окон HTTP/2 для XHTTP: окно приёма снова фиксированные 4 МиБ на стрим. |
+| `XRAY_XHTTP_FLOW` | пусто | `on` включает регулятор окон HTTP/2 для XHTTP поверх TCP: окно загрузки следует за тем, что реально вычитано, а не фиксированные 4 МиБ на стрим. По умолчанию выключен. Ссылка может включить или выключить его для себя через `"h2Flow": {"enabled": true}` в `extra` XHTTP. |
 
 ## 🛠 Установка в RouterOS
 

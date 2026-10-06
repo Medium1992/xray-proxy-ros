@@ -1,0 +1,26 @@
+From f6bc870986e85b5adb6eac756cff1f6b6a10094e Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 23:26:36 +0300
+Subject: [PATCH 10/12] XHTTP: Format a flow governor test for gofumpt
+
+---
+ transport/internet/splithttp/h2flow_client_test.go | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index 250e1e6d..a77effb7 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -157,7 +157,8 @@ func TestFlowClientIntegrityDuplex(t *testing.T) {
+ func clientDownloadRate(t *testing.T, sc struct {
+ 	name     string
+ 	up, down flowLimit
+-}, governed bool, rtt time.Duration) (float64, time.Duration) {
++}, governed bool, rtt time.Duration,
++) (float64, time.Duration) {
+ 	const size = 64 << 20
+ 	_, addr := startFlowServer(t, sc.up, sc.down, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		buf := make([]byte, 32<<10)
+-- 
+2.52.0.windows.1
+

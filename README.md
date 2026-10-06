@@ -72,7 +72,7 @@ Xray is started with `/etc/xray/` as a multi-file config directory, so additiona
 | `TPROXY` | `true` | With NFTables: `true` uses Redirect TCP + TProxy UDP, `false` uses Redirect TCP + TUN UDP. |
 | `QUIC_DROP` | `false` | `true` adds an Xray routing rule that blocks UDP/443. |
 | `HY2_HOP_INTERVAL` | `30` | Seconds between remote port changes when a Hysteria2 link asks for port hopping (`mport` or a port range). Must be at least 5. |
-| `XRAY_XHTTP_FLOW` | empty | `off` disables the HTTP/2 window governor for XHTTP: the receive window goes back to a fixed 4 MiB per stream. |
+| `XRAY_XHTTP_FLOW` | empty | `on` enables the HTTP/2 window governor for XHTTP over TCP: the download window follows what is actually read instead of a fixed 4 MiB per stream. Off by default. A link can also turn it on or off for itself with `"h2Flow": {"enabled": true}` in its XHTTP `extra`. |
 
 ## 🛠 RouterOS Install
 

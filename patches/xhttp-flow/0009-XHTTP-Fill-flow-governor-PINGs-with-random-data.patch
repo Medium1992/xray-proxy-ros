@@ -1,0 +1,127 @@
+From 0601b3de08581e1321384cd36eeda59626fe85d2 Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 23:26:36 +0300
+Subject: [PATCH 09/12] XHTTP: Fill flow governor PINGs with random data
+
+The governor's PINGs carried a fixed tag and a counter, which anything
+that terminates TLS in front of the server could match. They now carry
+random data, as Go's own HTTP/2 health checks do; the ACK is recognized
+by matching the data last sent.
+---
+ transport/internet/splithttp/h2flow.go        | 24 +++++++-------
+ .../internet/splithttp/h2flow_ping_test.go    | 33 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 12 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_ping_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index f4d87204..b093e5b7 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -2,6 +2,7 @@ package splithttp
+ 
+ import (
+ 	"encoding/binary"
++	"math/rand/v2"
+ 	"net"
+ 	"sync"
+ 	"sync/atomic"
+@@ -46,7 +47,6 @@ const (
+ 	h2SettingMaxFrameSize      = 0x5
+ 	h2MinMaxFrameSize          = 16384
+ 
+-	flowPingMagic    = 0x78666c77
+ 	flowPingInterval = time.Second
+ 	flowPingTimeout  = 10 * time.Second
+ 	flowDefaultRTT   = 200 * time.Millisecond
+@@ -315,7 +315,7 @@ type flowConn struct {
+ 	rtt         time.Duration
+ 	rttPrev     time.Duration
+ 	rttSince    time.Time
+-	pingSeq     uint32
++	pingData    uint64
+ 	pingSentAt  time.Time
+ 	lastPing    time.Time
+ 
+@@ -605,17 +605,21 @@ func (c *flowConn) appendPing(out []byte) []byte {
+ 		(!c.pingSentAt.IsZero() && now.Sub(c.pingSentAt) < flowPingTimeout) {
+ 		return out
+ 	}
+-	c.pingSeq++
+ 	c.pingSentAt, c.lastPing = now, now
++	return c.appendPingFrame(out)
++}
++
++// appendPingFrame adds a PING carrying fresh random data, as Go's own HTTP/2
++// health checks do, and remembers it to recognize the ACK.
++func (c *flowConn) appendPingFrame(out []byte) []byte {
++	c.pingData = rand.Uint64()
+ 	out = append(out, 0, 0, 8, h2Ping, 0, 0, 0, 0, 0)
+-	out = binary.BigEndian.AppendUint32(out, flowPingMagic)
+-	return binary.BigEndian.AppendUint32(out, c.pingSeq)
++	return binary.BigEndian.AppendUint64(out, c.pingData)
+ }
+ 
+ // pingAck reports whether a PING ACK answers ours, taking its round trip.
+ func (c *flowConn) pingAck(f h2Frame, payload []byte) bool {
+-	if f.flags&h2FlagAck == 0 || binary.BigEndian.Uint32(payload) != flowPingMagic ||
+-		binary.BigEndian.Uint32(payload[4:]) != c.pingSeq || c.pingSentAt.IsZero() {
++	if f.flags&h2FlagAck == 0 || binary.BigEndian.Uint64(payload) != c.pingData || c.pingSentAt.IsZero() {
+ 		return false
+ 	}
+ 	now := time.Now()
+@@ -664,12 +668,8 @@ func (c *flowConn) fireGuard() {
+ 		return
+ 	}
+ 	c.guardProbe = true
+-	c.pingSeq++
+ 	c.pingSentAt = time.Now()
+-	var ping []byte
+-	ping = append(ping, 0, 0, 8, h2Ping, 0, 0, 0, 0, 0)
+-	ping = binary.BigEndian.AppendUint32(ping, flowPingMagic)
+-	ping = binary.BigEndian.AppendUint32(ping, c.pingSeq)
++	ping := c.appendPingFrame(nil)
+ 	c.mu.Unlock()
+ 	c.injectToClient(ping)
+ }
+diff --git a/transport/internet/splithttp/h2flow_ping_test.go b/transport/internet/splithttp/h2flow_ping_test.go
+new file mode 100644
+index 00000000..e20e8c64
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_ping_test.go
+@@ -0,0 +1,33 @@
++package splithttp
++
++import (
++	"encoding/binary"
++	"testing"
++	"time"
++)
++
++func TestFlowPingIsRandom(t *testing.T) {
++	c := &flowConn{}
++	seen := map[uint64]bool{}
++	for range 64 {
++		frame := c.appendPingFrame(nil)
++		if len(frame) != 17 || frame[3] != h2Ping || frame[4] != 0 {
++			t.Fatalf("not a PING frame: %x", frame)
++		}
++		payload := binary.BigEndian.Uint64(frame[9:])
++		if seen[payload] {
++			t.Fatalf("PING payload %x repeated", payload)
++		}
++		seen[payload] = true
++	}
++
++	c.pingSentAt = time.Now()
++	ack := h2Frame{typ: h2Ping, flags: h2FlagAck}
++	other := binary.BigEndian.AppendUint64(nil, c.pingData+1)
++	if c.pingAck(ack, other) {
++		t.Fatal("took the ACK of someone else's PING for ours")
++	}
++	if !c.pingAck(ack, binary.BigEndian.AppendUint64(nil, c.pingData)) {
++		t.Fatal("did not recognize the ACK of our PING")
++	}
++}
+-- 
+2.52.0.windows.1
+

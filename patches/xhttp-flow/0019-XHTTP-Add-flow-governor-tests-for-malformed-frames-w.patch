@@ -1,0 +1,2069 @@
+From 1492833cb19fa533f5d7e7e0c7f6ca382c8b9d56 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 01:50:26 +0300
+Subject: [PATCH 19/19] XHTTP: Add flow governor tests for malformed frames,
+ window changes and memory bounds
+
+---
+ .../internet/splithttp/h2flow_config_test.go  |   4 +-
+ .../internet/splithttp/h2flow_conn_test.go    |  97 +++++
+ .../internet/splithttp/h2flow_fuzz_test.go    |   2 +-
+ .../internet/splithttp/h2flow_model_test.go   | 120 +++++-
+ transport/internet/splithttp/h2flow_test.go   |  17 +-
+ .../splithttp/h2flow_verify_bench_test.go     | 162 ++++++++
+ .../splithttp/h2flow_verify_control_test.go   | 237 +++++++++++
+ .../splithttp/h2flow_verify_cr_test.go        |  29 ++
+ .../splithttp/h2flow_verify_ended_test.go     |  89 ++++
+ .../splithttp/h2flow_verify_harness_test.go   | 276 +++++++++++++
+ .../splithttp/h2flow_verify_inject_test.go    |  94 +++++
+ .../splithttp/h2flow_verify_memory_test.go    | 387 ++++++++++++++++++
+ .../splithttp/h2flow_verify_off_test.go       |  46 +++
+ .../splithttp/h2flow_verify_settings_test.go  | 289 +++++++++++++
+ 14 files changed, 1836 insertions(+), 13 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_conn_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_bench_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_control_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_cr_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_ended_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_harness_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_inject_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_memory_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_off_test.go
+ create mode 100644 transport/internet/splithttp/h2flow_verify_settings_test.go
+
+diff --git a/transport/internet/splithttp/h2flow_config_test.go b/transport/internet/splithttp/h2flow_config_test.go
+index 4c24eaa4..5f8b5d23 100644
+--- a/transport/internet/splithttp/h2flow_config_test.go
++++ b/transport/internet/splithttp/h2flow_config_test.go
+@@ -138,7 +138,9 @@ func TestH2ServerGrantsWindows(t *testing.T) {
+ 	}{
+ 		{"governor off, set", &H2FlowConfig{Mode: 2, MaxStreamReceiveWindow: 3 << 20, MaxConnectionReceiveWindow: 5 << 20}, 3 << 20, 5 << 20, false},
+ 		{"governor off, default", &H2FlowConfig{Mode: 2}, 1 << 20, 1 << 20, false},
+-		{"governor on, default", &H2FlowConfig{Mode: 1}, flowServerReceiveWindow, flowServerReceiveWindow, true},
++		// The server grants flowServerReceiveWindow on the connection; the
++		// governor shows Go's default until readers take more.
++		{"governor on, default", &H2FlowConfig{Mode: 1}, flowServerReceiveWindow, flowConnFloor, true},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			port := tcp.PickPort()
+diff --git a/transport/internet/splithttp/h2flow_conn_test.go b/transport/internet/splithttp/h2flow_conn_test.go
+new file mode 100644
+index 00000000..484f88f2
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_conn_test.go
+@@ -0,0 +1,97 @@
++package splithttp
++
++import (
++	"bytes"
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// connCredit sums the connection-level credit in frames read by the client.
++func connCredit(t *testing.T, b []byte) int64 {
++	t.Helper()
++	var n int64
++	fr := http2.NewFramer(nil, bytes.NewReader(b))
++	for {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			return n
++		}
++		if w, ok := f.(*http2.WindowUpdateFrame); ok && w.StreamID == 0 {
++			n += int64(w.Increment)
++		}
++	}
++}
++
++// TestFlowUploadConnectionWindow checks the connection window the client is
++// shown for uploads: Go's 1 MiB while no reader has taken anything, whatever
++// the server grants, and room for the streams whose readers do take data on
++// top of that once they do, never beyond what the server really granted.
++func TestFlowUploadConnectionWindow(t *testing.T) {
++	const granted = 6 << 20
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	credit := connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, granted-h2InitWindow) }))
++	sent, returned := int64(0), int64(granted-h2InitWindow)
++	shown := func() int64 { return h2InitWindow + credit - sent }
++	if got := shown(); got != flowConnFloor {
++		t.Fatalf("client shown a connection window of %d before any read, want %d", got, flowConnFloor)
++	}
++
++	const chunk = 200 << 10
++	h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, chunk) })
++	sent += chunk
++	if got := shown(); got != flowConnFloor-chunk {
++		t.Fatalf("client shown %d after sending %d, want %d", got, chunk, flowConnFloor-chunk)
++	}
++
++	// The handler reads what came; its stream then may hold 4 MiB.
++	credit += connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, chunk) }))
++	h.c.mu.Lock()
++	h.c.streams[1].up.cap = 4 << 20
++	h.c.mu.Unlock()
++	credit += connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, chunk) }))
++	returned += chunk
++	if got, want := shown(), int64(flowConnFloor+4<<20); got != want {
++		t.Fatalf("client shown %d with a reader that keeps up, want %d", got, want)
++	}
++	if real := h2InitWindow + returned - sent; shown() > real {
++		t.Fatalf("client shown %d, server accepts %d", shown(), real)
++	}
++}
++
++// TestFlowSlowReaderLeavesConnectionRoom fills eight streams whose readers
++// are slow to their caps, together more than Go's 1 MiB: a new stream must
++// still get connection credit, or slow uploads would hold up every request
++// behind them on the connection.
++func TestFlowSlowReaderLeavesConnectionRoom(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	credit := connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 6<<20-h2InitWindow) }))
++	var sent, held int64
++	for id := uint32(1); id <= 15; id += 2 {
++		if id > 1 {
++			h.fromClient(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x82}, EndHeaders: true})
++			})
++		}
++		// The reader takes a little, then stalls with its stream full.
++		h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, 16<<10) })
++		sent += 16 << 10
++		credit += connCredit(t, h.fromServer(func(fr *http2.Framer) {
++			fr.WriteWindowUpdate(id, 16<<10)
++			fr.WriteWindowUpdate(0, 16<<10)
++		}))
++		h.c.mu.Lock()
++		full := int64(h.c.streams[id].up.cap)
++		h.c.mu.Unlock()
++		h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, int(full)) })
++		sent += full
++		held += full
++	}
++	credit += connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 1) }))
++
++	if room := h2InitWindow + credit - sent; room < flowConnFloor/2 {
++		t.Fatalf("slow readers holding %d leave %d of connection window for new streams", held, room)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_fuzz_test.go b/transport/internet/splithttp/h2flow_fuzz_test.go
+index 64915bd4..1b7e053e 100644
+--- a/transport/internet/splithttp/h2flow_fuzz_test.go
++++ b/transport/internet/splithttp/h2flow_fuzz_test.go
+@@ -47,7 +47,7 @@ func FuzzFlowConn(f *testing.F) {
+ 		c.wmu.Lock()
+ 		c.wmu.Unlock()
+ 		c.mu.Lock()
+-		streams, queued := len(c.streams), len(c.wqueue)+len(c.toClient)
++		streams, queued := len(c.streams), queuedBytes(c)
+ 		c.mu.Unlock()
+ 		if streams > len(fromClient)/h2FrameHeader+1 {
+ 			t.Fatalf("%d streams tracked from %d input bytes", streams, len(fromClient))
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index 4fad8099..2c6ad179 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -65,8 +65,14 @@ type flowModel struct {
+ 	steps    int
+ 	cliConn  int64 // connection window the client believes it has
+ 	srvConn  int64 // connection window the server really has left
++	resize   bool  // the client changes its initial window now and then
++	changes  int   // mid-connection client window changes applied
++	failed   bool  // the governor gave up the connection
++	lenient  bool  // do not require a give-up; let the invariants judge
+ }
+ 
++var modelWindows = []int64{h2InitWindow, 128 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20}
++
+ func newFlowModel(t *testing.T, seed uint64, up, down flowLimit, frozen bool) *flowModel {
+ 	capture := &captureConn{}
+ 	m := &flowModel{
+@@ -77,9 +83,8 @@ func newFlowModel(t *testing.T, seed uint64, up, down flowLimit, frozen bool) *f
+ 		cliSees: h2InitWindow, srvSees: h2InitWindow,
+ 		up: up, down: down,
+ 	}
+-	sizes := []int64{h2InitWindow, 128 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20}
+-	m.cliInit = sizes[m.rnd.IntN(len(sizes))]
+-	m.srvInit = sizes[m.rnd.IntN(len(sizes))]
++	m.cliInit = modelWindows[m.rnd.IntN(len(modelWindows))]
++	m.srvInit = modelWindows[m.rnd.IntN(len(modelWindows))]
+ 	m.fromClient(func(fr *http2.Framer) {
+ 		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: uint32(m.cliInit)})
+ 	}, true)
+@@ -212,7 +217,10 @@ func (m *flowModel) deliverToClient() {
+ 			n := int64(f.Length)
+ 			s.client.recvAvail -= n
+ 			s.client.buffered += n
+-			if s.client.recvAvail < 0 {
++			// A window may be negative after the client lowers its initial
++			// window; only data that lands there overruns it, not an empty
++			// DATA frame that ends the stream.
++			if n > 0 && s.client.recvAvail < 0 {
+ 				m.t.Fatalf("stream %d: client received %d bytes beyond its window", f.StreamID, -s.client.recvAvail)
+ 			}
+ 			if limit := m.limit(f.StreamID, false); limit > 0 && s.client.buffered > limit+16<<10 {
+@@ -286,6 +294,47 @@ func (m *flowModel) open() {
+ 	}, false)
+ }
+ 
++// changeClientWindow announces a new initial window from the client in the
++// middle of the connection. Every stream's real window moves with it, and the
++// server must end up with no more credit than that on any stream it may still
++// send on. Credit the governor already handed out cannot be taken back, so
++// the change can only be expressed while no such stream holds more of it
++// than the new window covers; otherwise the governor must give up.
++func (m *flowModel) changeClientWindow() {
++	next := modelWindows[m.rnd.IntN(len(modelWindows))]
++	expressible := true
++	for _, s := range m.streams {
++		// What the governor forwarded beyond what the client returned.
++		ahead := s.server.sendView - s.client.recvAvail + m.cliInit - m.srvSees
++		if m.down.enabled() && !s.server.done && next < ahead {
++			expressible = false
++		}
++		s.client.recvAvail += next - m.cliInit
++	}
++	m.cliInit = next
++	m.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: uint32(next)})
++	}, false)
++	// Adapted to bdbac60e: it has no broken flag; a governor that gives up
++	// releases its state, which sets closed.
++	m.c.mu.Lock()
++	broken := m.c.closed
++	m.c.mu.Unlock()
++	if m.lenient {
++		// Giving up is allowed here, but not required.
++		m.failed = broken
++		m.changes++
++		return
++	}
++	if broken == expressible {
++		m.t.Fatalf("client window to %d: governor gave up %v, change expressible %v", next, broken, expressible)
++	}
++	m.failed = !expressible
++	if expressible {
++		m.changes++
++	}
++}
++
+ func (m *flowModel) pick() (uint32, *modelStream) {
+ 	for id, s := range m.streams {
+ 		return id, s
+@@ -354,6 +403,8 @@ func (m *flowModel) step() {
+ 		s.server.done = true
+ 		m.fromServer(func(fr *http2.Framer) { fr.WriteData(id, true, nil) })
+ 		m.maybeForget(id, s)
++	case m.resize && r == 99:
++		m.changeClientWindow()
+ 	default:
+ 		m.fromClient(func(fr *http2.Framer) { fr.WritePing(false, [8]byte{1}) }, false)
+ 		m.fromServer(func(fr *http2.Framer) { fr.WritePing(false, [8]byte{2}) })
+@@ -414,7 +465,10 @@ func (m *flowModel) drain() {
+ 		if !s.client.done && s.client.sendView <= 0 && s.server.buffered == 0 && s.server.unsent < 4<<10 {
+ 			m.t.Fatalf("stream %d: client stalled with no window after the server drained", id)
+ 		}
+-		if !s.server.done && s.server.sendView <= 0 && s.client.buffered == 0 && s.client.unsent < 4<<10 {
++		// The stall is the governor's only while the client still allows
++		// data: a client that lowered its window below what it holds stalls
++		// the stream with stock HTTP/2 too.
++		if !s.server.done && s.server.sendView <= 0 && s.client.recvAvail > 0 && s.client.buffered == 0 && s.client.unsent < 4<<10 {
+ 			m.t.Fatalf("stream %d: server stalled with no window after the client drained", id)
+ 		}
+ 	}
+@@ -433,11 +487,45 @@ func TestFlowModelInvariants(t *testing.T) {
+ 		{flowLimit{init: 256 << 10, max: 32 << 20}, testDown, true},
+ 	}
+ 	for i, l := range limits {
+-		t.Run(fmt.Sprintf("limits%d", i), func(t *testing.T) { runModel(t, i, l.up, l.down, l.frozen) })
++		t.Run(fmt.Sprintf("limits%d", i), func(t *testing.T) { runModel(t, i, l.up, l.down, l.frozen, false) })
++	}
++}
++
++// TestFlowModelWindowChanges runs the same model with a client that changes
++// its initial window in the middle of the connection.
++func TestFlowModelWindowChanges(t *testing.T) {
++	for i, l := range []struct{ up, down flowLimit }{
++		{testUp, testDown},
++		{flowLimit{init: h2InitWindow, max: 1 << 20}, flowLimit{init: h2InitWindow, max: 1 << 20}},
++		{flowLimit{init: 1 << 20, max: 32 << 20}, flowLimit{}},
++		{flowLimit{}, flowLimit{init: 512 << 10, max: 2 << 20}},
++	} {
++		t.Run(fmt.Sprintf("limits%d", i), func(t *testing.T) { runModel(t, i, l.up, l.down, false, true) })
+ 	}
+ }
+ 
+-func runModel(t *testing.T, i int, up, down flowLimit, frozen bool) {
++// TestFlowModelWindowChangesLenient (added for bdbac60e) runs the window-change
++// model without requiring the governor to give up an inexpressible change:
++// only the stock invariants judge, i.e. the server never sends beyond the
++// client's real window and no stream stalls after both readers drain.
++func TestFlowModelWindowChangesLenient(t *testing.T) {
++	for i, l := range []struct{ up, down flowLimit }{
++		{testUp, testDown},
++		{flowLimit{init: h2InitWindow, max: 1 << 20}, flowLimit{init: h2InitWindow, max: 1 << 20}},
++		{flowLimit{init: 1 << 20, max: 32 << 20}, flowLimit{}},
++		{flowLimit{}, flowLimit{init: 512 << 10, max: 2 << 20}},
++	} {
++		t.Run(fmt.Sprintf("limits%d", i), func(t *testing.T) {
++			lenientModel = true
++			defer func() { lenientModel = false }()
++			runModel(t, i, l.up, l.down, false, true)
++		})
++	}
++}
++
++var lenientModel bool
++
++func runModel(t *testing.T, i int, up, down flowLimit, frozen, resize bool) {
+ 	l := struct {
+ 		up, down flowLimit
+ 		frozen   bool
+@@ -447,14 +535,22 @@ func runModel(t *testing.T, i int, up, down flowLimit, frozen bool) {
+ 		if testing.Short() {
+ 			seeds = 8
+ 		}
++		changes, failures := 0, 0
+ 		for seed := uint64(0); seed < seeds; seed++ {
+ 			m := newFlowModel(t, seed*97+uint64(i), l.up, l.down, l.frozen)
+-			for n := 0; n < 3000; n++ {
++			m.resize = resize
++			m.lenient = lenientModel
++			for n := 0; n < 3000 && !m.failed; n++ {
+ 				m.step()
+-				if n%500 == 499 {
++				if n%500 == 499 && !m.failed {
+ 					m.drain()
+ 				}
+ 			}
++			changes += m.changes
++			if m.failed {
++				failures++
++				continue
++			}
+ 			m.drain()
+ 			m.c.mu.Lock()
+ 			for id := range m.c.streams {
+@@ -464,5 +560,11 @@ func runModel(t *testing.T, i int, up, down flowLimit, frozen bool) {
+ 			}
+ 			m.c.mu.Unlock()
+ 		}
++		if resize {
++			if changes == 0 {
++				t.Fatalf("limits %d: no client window change was applied in %d seeds", i, seeds)
++			}
++			t.Logf("limits %d: %d client window changes applied, %d connections given up", i, changes, failures)
++		}
+ 	}
+ }
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index e57ae91c..d31c35f3 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -316,7 +316,14 @@ func TestFlowSlowUplinkHandlerBounded(t *testing.T) {
+ 			}
+ 		}()
+ 		req, _ := http.NewRequest("POST", "http://x/up", pr)
+-		go h2Client(addr).Do(req)
++		client := h2Client(addr)
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			if resp, err := client.Do(req); err == nil {
++				resp.Body.Close()
++			}
++		}()
+ 		time.Sleep(3 * time.Second)
+ 		var unread int64
+ 		tl.each(func(c *flowConn) {
+@@ -327,6 +334,12 @@ func TestFlowSlowUplinkHandlerBounded(t *testing.T) {
+ 		t.Logf("%s: client wrote %d, handler read %d, gap %d, unread at server %d", tc.name, written.Load(), consumed.Load(), written.Load()-consumed.Load(), unread)
+ 		close(stop)
+ 		pw.CloseWithError(io.ErrClosedPipe)
++		select {
++		case <-done:
++		case <-time.After(5 * time.Second):
++			t.Errorf("%s: upload request still running after its body was closed", tc.name)
++		}
++		client.CloseIdleConnections()
+ 		if tc.max > 0 && unread > tc.max {
+ 			t.Fatalf("%s: unread at server %d exceeds %d", tc.name, unread, tc.max)
+ 		}
+@@ -735,7 +748,7 @@ func TestFlowChurnLeaves(t *testing.T) {
+ 		left := 0
+ 		tl.each(func(c *flowConn) {
+ 			if !c.closed {
+-				left += len(c.streams) + len(c.wqueue) + len(c.opened)
++				left += len(c.streams) + queuedBytes(c) + len(c.opened)
+ 			}
+ 		})
+ 		if left == 0 {
+diff --git a/transport/internet/splithttp/h2flow_verify_bench_test.go b/transport/internet/splithttp/h2flow_verify_bench_test.go
+new file mode 100644
+index 00000000..00f74973
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_bench_test.go
+@@ -0,0 +1,162 @@
++package splithttp
++
++import (
++	"bytes"
++	"io"
++	"net"
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// replayConn serves the same byte stream to Read over and over and
++// discards whatever is written, so a benchmark measures only the code
++// between the HTTP/2 stack and the socket.
++type replayConn struct {
++	net.Conn
++	data []byte
++	off  int
++}
++
++func (c *replayConn) Read(b []byte) (int, error) {
++	if c.off == len(c.data) {
++		c.off = 0
++	}
++	n := copy(b, c.data[c.off:])
++	c.off += n
++	return n, nil
++}
++
++func (c *replayConn) Write(b []byte) (int, error) { return len(b), nil }
++func (c *replayConn) Close() error                { return nil }
++
++const benchChunk = 1 << 20
++
++// uploadFrames is 1 MiB of client DATA on stream 1 in default-size frames,
++// followed by the credit a client hands back for a download.
++func uploadFrames() []byte {
++	return frames(func(fr *http2.Framer) {
++		writeDataSplit(fr, 1, benchChunk)
++		fr.WriteWindowUpdate(0, benchChunk)
++		fr.WriteWindowUpdate(1, benchChunk)
++	})
++}
++
++// downloadFrames is 1 MiB of server DATA on stream 1 in default-size
++// frames, followed by the credit a server hands back for an upload.
++func downloadFrames() []byte {
++	return frames(func(fr *http2.Framer) {
++		writeDataSplit(fr, 1, benchChunk)
++		fr.WriteWindowUpdate(0, benchChunk)
++		fr.WriteWindowUpdate(1, benchChunk)
++	})
++}
++
++// benchFlowConn returns a server-side governor whose connection already has
++// SETTINGS exchanged and stream 1 open, reading from inner. Its client hands
++// back credit in small steps, as Go clients do, so no guard probe runs.
++func benchFlowConn(tb testing.TB, inner *replayConn) *flowConn {
++	tb.Helper()
++	setup := &scriptConn{}
++	c := newFlowConn(setup, flowDefault, flowDefault)
++	h := &flowHarness{t: tb, conn: setup, c: c}
++	h.fromClientRaw([]byte(h2Preface))
++	h.openStream(4 << 20)
++	if h.readErr != nil {
++		tb.Fatal(h.readErr)
++	}
++	c.mu.Lock()
++	c.lastPing = c.lastPing.AddDate(100, 0, 0) // keep PINGs out of the measurement
++	c.incremental = true
++	c.mu.Unlock()
++	c.Conn = inner
++	return c
++}
++
++// BenchmarkFlowRead measures reading 1 MiB of client frames into 16 KiB
++// buffers, as the HTTP/2 server's reads come in, with and without the
++// governor.
++func BenchmarkFlowRead(b *testing.B) {
++	data := uploadFrames()
++	for _, governed := range []bool{false, true} {
++		name := "stock"
++		if governed {
++			name = "governed"
++		}
++		b.Run(name, func(b *testing.B) {
++			inner := &replayConn{data: data}
++			var r io.Reader = inner
++			if governed {
++				r = benchFlowConn(b, inner)
++			}
++			buf := make([]byte, 16<<10)
++			b.SetBytes(int64(len(data)))
++			b.ReportAllocs()
++			b.ResetTimer()
++			for range b.N {
++				for got := 0; got < len(data); {
++					n, err := r.Read(buf)
++					if err != nil {
++						b.Fatal(err)
++					}
++					got += n
++				}
++			}
++		})
++	}
++}
++
++// BenchmarkFlowWrite measures writing 1 MiB of server frames in 16 KiB
++// writes, with and without the governor.
++func BenchmarkFlowWrite(b *testing.B) {
++	data := downloadFrames()
++	for _, governed := range []bool{false, true} {
++		name := "stock"
++		if governed {
++			name = "governed"
++		}
++		b.Run(name, func(b *testing.B) {
++			inner := &replayConn{}
++			var w io.Writer = inner
++			if governed {
++				w = benchFlowConn(b, inner)
++			}
++			b.SetBytes(int64(len(data)))
++			b.ReportAllocs()
++			b.ResetTimer()
++			for range b.N {
++				for in := data; len(in) > 0; {
++					n := min(len(in), 16<<10)
++					if _, err := w.Write(in[:n]); err != nil {
++						b.Fatal(err)
++					}
++					in = in[n:]
++				}
++			}
++		})
++	}
++}
++
++// TestFlowBenchStreamsAreGoverned guards the benchmarks: the governed
++// connection must really parse and count the replayed frames.
++func TestFlowBenchStreamsAreGoverned(t *testing.T) {
++	inner := &replayConn{data: uploadFrames()}
++	c := benchFlowConn(t, inner)
++	buf := make([]byte, 16<<10)
++	for got := 0; got < len(inner.data); {
++		n, err := c.Read(buf)
++		if err != nil {
++			t.Fatal(err)
++		}
++		got += n
++	}
++	if _, err := c.Write(downloadFrames()); err != nil {
++		t.Fatal(err)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	s := c.streams[1]
++	if s == nil || s.upSent != benchChunk || s.downSent != benchChunk || !bytes.Equal(c.rpending, nil) {
++		t.Fatalf("governor did not account the replayed frames: %+v", s)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_control_test.go b/transport/internet/splithttp/h2flow_verify_control_test.go
+new file mode 100644
+index 00000000..7e8c0ae8
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_control_test.go
+@@ -0,0 +1,237 @@
++package splithttp
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// governorPing opens stream 1 and returns the payload of the PING the
++// governor then sends the client.
++func governorPing(t *testing.T, h *flowHarness) [8]byte {
++	t.Helper()
++	h.dueForPing()
++	ps := pings(t, h.fromServer(func(fr *http2.Framer) { fr.WriteData(1, false, make([]byte, 10)) }))
++	if len(ps) != 1 {
++		t.Fatalf("governor sent %d PINGs at a due frame boundary, want 1", len(ps))
++	}
++	return ps[0]
++}
++
++// TestFlowControlFramesInHeaderBlockPassVerbatim puts control frames the
++// governor would otherwise rewrite or swallow between a HEADERS frame without
++// END_HEADERS and its CONTINUATION. Stock HTTP/2 rejects any such frame, so
++// the governor must hand the whole sequence on unchanged for the server's
++// framer to fail it.
++func TestFlowControlFramesInHeaderBlockPassVerbatim(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		inner func(fr *http2.Framer, ours [8]byte)
++	}{
++		{"governor PING ACK", func(fr *http2.Framer, ours [8]byte) { fr.WritePing(true, ours) }},
++		// The stream has handed back credit once already, so the governor
++		// would answer this one with a larger, rewritten increment.
++		{"WINDOW_UPDATE", func(fr *http2.Framer, _ [8]byte) { fr.WriteWindowUpdate(1, 1<<20) }},
++		{"SETTINGS", func(fr *http2.Framer, _ [8]byte) {
++			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++		}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			h := newFlowHarness(t)
++			h.openStream(4 << 20)
++			ours := governorPing(t, h)
++			h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, 10) })
++			in := frames(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: []byte{0x82}})
++				tc.inner(fr, ours)
++				fr.WriteContinuation(3, true, []byte{0x84})
++			})
++			got := h.fromClientRaw(in)
++			if !bytes.HasPrefix(got, in) {
++				t.Fatalf("server read\n%x\nclient sent\n%x", got, in)
++			}
++			fr := http2.NewFramer(nil, bytes.NewReader(got))
++			if _, err := fr.ReadFrame(); err != nil {
++				t.Fatal(err)
++			}
++			var ce http2.ConnectionError
++			if _, err := fr.ReadFrame(); !errors.As(err, &ce) || http2.ErrCode(ce) != http2.ErrCodeProtocol {
++				t.Fatalf("stock framer read %v after HEADERS, want PROTOCOL_ERROR", err)
++			}
++		})
++	}
++}
++
++// TestFlowPingAckOnStreamPassesVerbatim answers the governor's PING with an
++// ACK on stream 1, which stock HTTP/2 rejects: it is not the governor's.
++func TestFlowPingAckOnStreamPassesVerbatim(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	ours := governorPing(t, h)
++	in := frames(func(fr *http2.Framer) { fr.WriteRawFrame(http2.FramePing, http2.FlagPingAck, 1, ours[:]) })
++	if got := h.fromClientRaw(in); !bytes.HasPrefix(got, in) {
++		t.Fatalf("server read %x, client sent %x", got, in)
++	}
++}
++
++// TestFlowNoInjectionInsidePushPromise has the server start a PUSH_PROMISE
++// header block while a governor PING is due. Nothing may reach the client
++// between that frame and its CONTINUATION.
++func TestFlowNoInjectionInsidePushPromise(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	h.dueForPing()
++	h.conn.take() // credit for stream 1, sent before the header block
++	in := frames(func(fr *http2.Framer) {
++		fr.WritePushPromise(http2.PushPromiseParam{StreamID: 1, PromiseID: 2, BlockFragment: []byte{0x82}})
++	})
++	got, err := h.fromServerRaw(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(got, in) {
++		t.Fatalf("client read %x inside a header block, server sent %x", got, in)
++	}
++}
++
++// TestFlowPingPayloadIsUnpredictable checks that a TLS-terminating observer
++// cannot tell the governor's PINGs by their payload, and that the governor
++// still recognises exactly its own ACKs.
++func TestFlowPingPayloadIsUnpredictable(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	var seen [][8]byte
++	for range 3 {
++		p := governorPing(t, h)
++		if string(p[:4]) == "xflw" {
++			t.Fatalf("PING payload %x carries the governor's fixed tag", p)
++		}
++		for _, q := range seen {
++			if bytes.Equal(p[:4], q[:4]) {
++				t.Fatalf("PING payloads %x and %x share a fixed prefix", q, p)
++			}
++		}
++		seen = append(seen, p)
++
++		forged := p
++		forged[7] ^= 1
++		ack := frames(func(fr *http2.Framer) { fr.WritePing(true, p) })
++		other := frames(func(fr *http2.Framer) { fr.WritePing(true, forged) })
++		got := h.fromClientRaw(append(append([]byte(nil), other...), ack...))
++		if !bytes.Contains(got, other) {
++			t.Fatal("an ACK that is not the governor's did not reach the server")
++		}
++		if bytes.Contains(got, ack) {
++			t.Fatal("the governor passed on the ACK of its own PING")
++		}
++	}
++}
++
++// TestFlowRecognisesEveryOutstandingPing keeps a periodic PING and a guard
++// probe in flight together: the ACK of each is the governor's own.
++func TestFlowRecognisesEveryOutstandingPing(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	periodic := governorPing(t, h)
++	// The guard probes only while a stream waits for credit (item E).
++	h.c.mu.Lock()
++	h.c.streams[1].down.waiting = time.Now()
++	h.c.mu.Unlock()
++	h.c.fireGuard()
++	h.sync()
++	probes := pings(t, h.conn.take())
++	if len(probes) != 1 {
++		t.Fatalf("guard sent %d PINGs, want 1", len(probes))
++	}
++	for _, p := range [][8]byte{periodic, probes[0]} {
++		ack := frames(func(fr *http2.Framer) { fr.WritePing(true, p) })
++		if got := h.fromClientRaw(ack); bytes.Contains(got, ack) {
++			t.Fatalf("the governor did not recognise the ACK of its PING %x", p)
++		}
++	}
++}
++
++// TestFlowForgetsOldestPings is not transplanted: it tests flowPingSlots, a
++// mechanism of the pr17-fixes branch that bdbac60e does not have.
++
++// pingReaction connects to a server, answers the first PING it sends (or uses
++// a fixed payload when it sends none) with the frames build returns, and
++// reports how the server reacts, as h2Reaction does.
++func pingReaction(t *testing.T, addr string, build func(ping [8]byte) []byte) string {
++	t.Helper()
++	conn, err := net.Dial("tcp", addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(3 * time.Second))
++	conn.Write(append([]byte(h2Preface), frames(func(fr *http2.Framer) { fr.WriteSettings() })...))
++	fr := http2.NewFramer(nil, conn)
++	ping := [8]byte{'n', 'o', 'n', 'e'}
++	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
++	for {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			break
++		}
++		if p, ok := f.(*http2.PingFrame); ok && !p.IsAck() {
++			ping = p.Data
++			break
++		}
++	}
++	conn.SetDeadline(time.Now().Add(2 * time.Second))
++	conn.Write(build(ping))
++	goaway := "none"
++	for {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			end := "closed"
++			if ne, ok := err.(net.Error); ok && ne.Timeout() {
++				end = "left open"
++			}
++			return fmt.Sprintf("goaway %s, connection %s", goaway, end)
++		}
++		if g, ok := f.(*http2.GoAwayFrame); ok {
++			goaway = g.ErrCode.String()
++		}
++	}
++}
++
++// TestFlowPingViolationsGetStockErrors (added for bdbac60e) answers the
++// governor's PING with an ACK that stock HTTP/2 rejects, on a stock and a
++// governed server: on stream 1, and between HEADERS and its CONTINUATION.
++func TestFlowPingViolationsGetStockErrors(t *testing.T) {
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
++	_, stock := startFlowServer(t, flowLimit{}, flowLimit{}, false, handler)
++	_, governed := startFlowServer(t, testUp, testDown, false, handler)
++	for _, tc := range []struct {
++		name  string
++		build func(ping [8]byte) []byte
++	}{
++		{"PING ACK on stream 1", func(p [8]byte) []byte {
++			return frames(func(fr *http2.Framer) { fr.WriteRawFrame(http2.FramePing, http2.FlagPingAck, 1, p[:]) })
++		}},
++		{"PING ACK inside a header block", func(p [8]byte) []byte {
++			return frames(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}})
++				fr.WritePing(true, p)
++				fr.WriteContinuation(1, true, []byte{0x86, 0x84, 0x01, 0x01, 'x'})
++			})
++		}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			want := pingReaction(t, stock, tc.build)
++			got := pingReaction(t, governed, tc.build)
++			t.Logf("stock: %s; governed: %s", want, got)
++			if got != want {
++				t.Fatalf("governed server: %s; stock: %s", got, want)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_cr_test.go b/transport/internet/splithttp/h2flow_verify_cr_test.go
+new file mode 100644
+index 00000000..56bbf284
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_cr_test.go
+@@ -0,0 +1,29 @@
++package splithttp
++
++import (
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++)
++
++// TestFlowCodeRabbitUplinkLeak (added for bdbac60e) checks CodeRabbit comment
++// 4199461853: whether TestFlowSlowUplinkHandlerBounded leaves HTTP/2 client
++// goroutines behind while it runs and after its cleanup.
++func TestFlowCodeRabbitUplinkLeak(t *testing.T) {
++	count := func() int {
++		buf := make([]byte, 1<<22)
++		stacks := string(buf[:runtime.Stack(buf, true)])
++		return strings.Count(stacks, "readLoop")
++	}
++	before := count()
++	t.Run("inner", TestFlowSlowUplinkHandlerBounded)
++	deadline := time.Now().Add(2 * time.Second)
++	for count() > before && time.Now().Before(deadline) {
++		time.Sleep(50 * time.Millisecond)
++	}
++	t.Logf("client readLoop goroutines: before %d, after the test's cleanup %d", before, count())
++	if count() > before {
++		t.Fatalf("%d client readLoop goroutines outlive the test", count()-before)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_ended_test.go b/transport/internet/splithttp/h2flow_verify_ended_test.go
+new file mode 100644
+index 00000000..f8b76d1c
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_ended_test.go
+@@ -0,0 +1,89 @@
++package splithttp
++
++import (
++	"bytes"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++	"golang.org/x/net/http2/hpack"
++)
++
++// A request whose HEADERS carry END_STREAM has no body. Stock never sends a
++// stream WINDOW_UPDATE once the peer has closed its side (noteBodyRead skips
++// half-closed (remote) streams), so the governor must not grant upload credit
++// to such a request either: every GET would otherwise answer with a frame
++// stock never sends.
++func TestFlowNoUploadCreditForEndedRequest(t *testing.T) {
++	_, addr := startFlowServer(t, testUp, testDown, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write([]byte("ok"))
++	}))
++	c, err := net.Dial("tcp", addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer c.Close()
++	c.SetDeadline(time.Now().Add(5 * time.Second))
++	c.Write([]byte(http2.ClientPreface))
++	fr := http2.NewFramer(c, c)
++	fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	// Open the stream only once the server's SETTINGS, and with them the
++	// window it really grants, have passed the governor.
++	for {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if s, ok := f.(*http2.SettingsFrame); ok && !s.IsAck() {
++			fr.WriteSettingsAck()
++			break
++		}
++	}
++	var block bytes.Buffer
++	enc := hpack.NewEncoder(&block)
++	for _, f := range [][2]string{{":method", "GET"}, {":scheme", "http"}, {":authority", "x"}, {":path", "/"}} {
++		enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
++	}
++	fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block.Bytes(), EndStream: true, EndHeaders: true})
++	for {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if wu, ok := f.(*http2.WindowUpdateFrame); ok && wu.StreamID == 1 {
++			t.Fatalf("server granted %d bytes of upload credit on stream 1, whose request already ended", wu.Increment)
++		}
++		if f.Header().StreamID == 1 && f.Header().Flags.Has(http2.FlagDataEndStream) {
++			return
++		}
++	}
++}
++
++// TestFlowGuardProbesOnlyWaitingStreams fires the guard with no stream
++// waiting for credit any more, then with one waiting: only the second may
++// send a PING.
++func TestFlowGuardProbesOnlyWaitingStreams(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	h.conn.take()
++	h.c.mu.Lock()
++	h.c.incremental = false
++	h.c.mu.Unlock()
++
++	h.c.fireGuard()
++	h.sync()
++	if got := len(pings(t, h.conn.take())); got != 0 || queuedBytes(h.c) != 0 {
++		t.Fatalf("guard sent %d PINGs (%d bytes queued) with no stream waiting", got, queuedBytes(h.c))
++	}
++
++	h.c.mu.Lock()
++	h.c.streams[1].down.waiting = time.Now()
++	h.c.mu.Unlock()
++	h.c.fireGuard()
++	h.sync()
++	if got := len(pings(t, h.conn.take())); got != 1 {
++		t.Fatalf("guard sent %d PINGs for a waiting stream, want 1", got)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_harness_test.go b/transport/internet/splithttp/h2flow_verify_harness_test.go
+new file mode 100644
+index 00000000..af91f6ae
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_harness_test.go
+@@ -0,0 +1,276 @@
++package splithttp
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"sync"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// scriptConn stands in for the TLS connection under a server-side governor:
++// Read serves the bytes the test queued as the client's and then reports a
++// timeout, Write records what reaches the client, and Close is observable.
++type scriptConn struct {
++	net.Conn
++	mu       sync.Mutex
++	in       bytes.Buffer
++	out      bytes.Buffer
++	closed   bool
++	failNext bool
++}
++
++func (c *scriptConn) Read(b []byte) (int, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed {
++		return 0, net.ErrClosed
++	}
++	if c.in.Len() == 0 {
++		return 0, os.ErrDeadlineExceeded
++	}
++	return c.in.Read(b)
++}
++
++// Write accepts everything except, once failNext is set, a single write that
++// lands only in part, the way a socket reports a short write.
++func (c *scriptConn) Write(b []byte) (int, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed {
++		return 0, net.ErrClosed
++	}
++	if c.failNext {
++		c.failNext = false
++		n := len(b) / 2
++		c.out.Write(b[:n])
++		return n, io.ErrShortWrite
++	}
++	return c.out.Write(b)
++}
++
++func (c *scriptConn) Close() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.closed = true
++	return nil
++}
++
++func (c *scriptConn) feed(b []byte) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.in.Write(b)
++}
++
++func (c *scriptConn) take() []byte {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	b := append([]byte(nil), c.out.Bytes()...)
++	c.out.Reset()
++	return b
++}
++
++func (c *scriptConn) isClosed() bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.closed
++}
++
++// flowHarness drives a server-side governor through its real Read and Write
++// paths: the client's frames go in through Read, the server's through Write.
++type flowHarness struct {
++	t       testing.TB
++	conn    *scriptConn
++	c       *flowConn
++	readErr error
++
++	// toServer and toClient, once track is called, follow the send windows
++	// of the server and the client from the frames each one reads.
++	toServer, toClient *sendView
++}
++
++func (h *flowHarness) track() {
++	h.toServer, h.toClient = newSendView(), newSendView()
++}
++
++func newFlowHarness(t *testing.T) *flowHarness {
++	t.Helper()
++	sc := &scriptConn{}
++	h := &flowHarness{t: t, conn: sc, c: newFlowConn(sc, flowDefault, flowDefault)}
++	if got := h.fromClientRaw([]byte(h2Preface)); string(got) != h2Preface {
++		t.Fatalf("preface reached the server as %q", got)
++	}
++	return h
++}
++
++func frames(f func(fr *http2.Framer)) []byte {
++	var b bytes.Buffer
++	fr := http2.NewFramer(&b, nil)
++	fr.AllowIllegalWrites = true
++	f(fr)
++	return b.Bytes()
++}
++
++// fromClientRaw hands b to the governor as bytes the client sent and returns
++// what the server's HTTP/2 stack reads. A read error other than the script
++// running dry is kept in readErr.
++func (h *flowHarness) fromClientRaw(b []byte) []byte {
++	h.conn.feed(b)
++	var got []byte
++	buf := make([]byte, 64<<10)
++	for {
++		n, err := h.c.Read(buf)
++		got = append(got, buf[:n]...)
++		if err != nil {
++			if !errors.Is(err, os.ErrDeadlineExceeded) && h.readErr == nil {
++				h.readErr = err
++			}
++			break
++		}
++	}
++	h.sync()
++	if h.toServer != nil {
++		h.toServer.receive(h.t, got)
++	}
++	return got
++}
++
++func (h *flowHarness) fromClient(f func(fr *http2.Framer)) []byte {
++	return h.fromClientRaw(frames(f))
++}
++
++// fromServerRaw writes b as the server's HTTP/2 stack would and returns what
++// reaches the client, injected frames included.
++func (h *flowHarness) fromServerRaw(b []byte) ([]byte, error) {
++	_, err := h.c.Write(b)
++	h.sync()
++	got := h.conn.take()
++	if h.toClient != nil {
++		h.toClient.receive(h.t, got)
++	}
++	return got, err
++}
++
++func (h *flowHarness) fromServer(f func(fr *http2.Framer)) []byte {
++	got, err := h.fromServerRaw(frames(f))
++	if err != nil {
++		h.t.Fatalf("server write: %v", err)
++	}
++	return got
++}
++
++// sync waits for a frame injection that is holding the write side.
++func (h *flowHarness) sync() {
++	h.c.wmu.Lock()
++	//nolint:staticcheck // empty critical section: only waits for the holder
++	h.c.wmu.Unlock()
++}
++
++// dueForPing lets the next frame boundary towards the client carry a PING.
++// Adapted to bdbac60e: the governor now sends a PING with its first SETTINGS
++// and keeps a single outstanding PING, so the earlier one is treated as timed
++// out, which is what the governor itself does after flowPingTimeout.
++func (h *flowHarness) dueForPing() {
++	h.c.mu.Lock()
++	h.c.lastPing = time.Time{}
++	h.c.pingSentAt = time.Time{}
++	h.c.mu.Unlock()
++}
++
++// openStream runs the usual start of a connection: the client announces
++// clientWindow, the server announces 1 MiB, and the client opens stream 1.
++// It returns what reached the server when the stream opened.
++func (h *flowHarness) openStream(clientWindow uint32) []byte {
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: clientWindow})
++	})
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(
++			http2.Setting{ID: http2.SettingMaxFrameSize, Val: 1 << 20},
++			http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20},
++		)
++	})
++	return h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++}
++
++// sendView follows the send windows of one peer the way a stock HTTP/2 stack
++// does: streams start at the initial window it was told, WINDOW_UPDATE adds,
++// and a new SETTINGS_INITIAL_WINDOW_SIZE moves every open stream at once.
++type sendView struct {
++	init    int64
++	streams map[uint32]int64
++	frames  []http2.Frame
++}
++
++func newSendView() *sendView {
++	return &sendView{init: h2InitWindow, streams: map[uint32]int64{}}
++}
++
++// receive applies frames the peer read, in order, and keeps them.
++func (v *sendView) receive(t testing.TB, b []byte) {
++	t.Helper()
++	fr := http2.NewFramer(nil, bytes.NewReader(b))
++	fr.SetMaxReadFrameSize(1 << 24)
++	for {
++		frame, err := fr.ReadFrame()
++		if errors.Is(err, io.EOF) {
++			return
++		}
++		if err != nil {
++			t.Fatalf("peer could not read the governor's output: %v", err)
++		}
++		v.frames = append(v.frames, frame)
++		switch f := frame.(type) {
++		case *http2.SettingsFrame:
++			if val, ok := f.Value(http2.SettingInitialWindowSize); ok && !f.IsAck() {
++				delta := int64(val) - v.init
++				v.init = int64(val)
++				for id := range v.streams {
++					v.streams[id] += delta
++				}
++			}
++		case *http2.HeadersFrame:
++			if _, ok := v.streams[f.StreamID]; !ok {
++				v.streams[f.StreamID] = v.init
++			}
++		case *http2.WindowUpdateFrame:
++			if f.StreamID != 0 {
++				v.streams[f.StreamID] += int64(f.Increment)
++			}
++		}
++	}
++}
++
++// open starts a stream on this peer's own initiative.
++func (v *sendView) open(id uint32) {
++	v.streams[id] = v.init
++}
++
++// pings returns the payloads of the non-ACK PINGs in b.
++func pings(t *testing.T, b []byte) [][8]byte {
++	t.Helper()
++	var out [][8]byte
++	fr := http2.NewFramer(nil, bytes.NewReader(b))
++	fr.SetMaxReadFrameSize(1 << 24)
++	for {
++		frame, err := fr.ReadFrame()
++		if err != nil {
++			return out
++		}
++		if p, ok := frame.(*http2.PingFrame); ok && !p.IsAck() {
++			out = append(out, p.Data)
++		}
++	}
++}
++
++// queuedBytes is what the governor holds back for the client, as frames.
++func queuedBytes(c *flowConn) int {
++	return len(c.wqueue) + (h2FrameHeader+4)*len(c.wcredit)
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_inject_test.go b/transport/internet/splithttp/h2flow_verify_inject_test.go
+new file mode 100644
+index 00000000..673653d1
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_inject_test.go
+@@ -0,0 +1,94 @@
++package splithttp
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// TestFlowInjectedWriteFailureIsTerminal makes the socket take only part of
++// the credit the governor injects for a new upload stream. The client would
++// then read a torn frame followed by whatever the server writes next, so the
++// governor must close the connection and drop its state instead of carrying
++// on.
++func TestFlowInjectedWriteFailureIsTerminal(t *testing.T) {
++	h := newFlowHarness(t)
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++	})
++
++	h.conn.mu.Lock()
++	h.conn.failNext = true
++	h.conn.mu.Unlock()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	h.conn.mu.Lock()
++	injected := !h.conn.failNext
++	h.conn.mu.Unlock()
++	if !injected {
++		t.Fatal("the governor injected no credit for the new upload stream")
++	}
++
++	if !h.conn.isClosed() {
++		t.Fatal("connection still open after the socket took only part of the governor's frames")
++	}
++	h.c.mu.Lock()
++	streams, queued := len(h.c.streams), queuedBytes(h.c)
++	h.c.mu.Unlock()
++	if streams != 0 || queued != 0 {
++		t.Fatalf("%d streams and %d queued bytes kept after the connection failed", streams, queued)
++	}
++	if _, err := h.fromServerRaw(frames(func(fr *http2.Framer) { fr.WriteData(1, false, make([]byte, 100)) })); err == nil {
++		t.Fatal("the server could still write after a torn frame")
++	}
++}
++
++// TestFlowInjectedWriteFailureTearsStream (added for bdbac60e) shows what the
++// client reads after a short write of the governor's own frames. The torn
++// half is already on the wire, so the client sees the connection end inside a
++// frame, as with a stock stack whose socket fails mid-write; nothing the
++// server writes afterwards may follow it.
++func TestFlowInjectedWriteFailureTearsStream(t *testing.T) {
++	h := newFlowHarness(t)
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	settings := h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++	})
++	h.conn.mu.Lock()
++	h.conn.failNext = true
++	h.conn.mu.Unlock()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	torn := h.conn.take()
++	next, err := h.fromServerRaw(frames(func(fr *http2.Framer) { fr.WriteData(1, false, []byte("payload")) }))
++	if err == nil || len(next) > 0 {
++		t.Fatalf("server wrote %d bytes after the torn frame (err=%v)", len(next), err)
++	}
++	wire := append(append(append([]byte(nil), settings...), torn...), next...)
++	t.Logf("client reads %x", wire)
++	fr := http2.NewFramer(nil, bytes.NewReader(wire))
++	fr.SetMaxReadFrameSize(1 << 24)
++	for {
++		f, err := fr.ReadFrame()
++		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++			return
++		}
++		if err != nil {
++			t.Fatalf("stock framer on the client side: %v", err)
++		}
++		if d, ok := f.(*http2.DataFrame); ok && string(d.Data()) != "payload" {
++			t.Fatalf("DATA arrives as %q", d.Data())
++		}
++		t.Logf("frame %v", f.Header())
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_memory_test.go b/transport/internet/splithttp/h2flow_verify_memory_test.go
+new file mode 100644
+index 00000000..5e522b56
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_memory_test.go
+@@ -0,0 +1,387 @@
++package splithttp
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++	"google.golang.org/protobuf/proto"
++)
++
++// rawH2Client is a greedy HTTP/2 client: it sends DATA on its streams as far
++// as the server's credit allows and counts every byte the server accepted.
++type rawH2Client struct {
++	t        *testing.T
++	conn     net.Conn
++	fr       *http2.Framer
++	init     int64
++	connWin  int64
++	streams  map[uint32]int64
++	accepted int64
++}
++
++func dialRawH2(t *testing.T, addr string) *rawH2Client {
++	t.Helper()
++	conn, err := net.Dial("tcp", addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { conn.Close() })
++	c := &rawH2Client{t: t, conn: conn, fr: http2.NewFramer(conn, conn), init: h2InitWindow, connWin: h2InitWindow, streams: map[uint32]int64{}}
++	c.fr.SetMaxReadFrameSize(1 << 24)
++	if _, err := conn.Write([]byte(h2Preface)); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.fr.WriteSettings(); err != nil {
++		t.Fatal(err)
++	}
++	return c
++}
++
++// rawPostHeaders is a minimal header block: :method POST, :scheme http, :path /,
++// :authority x (literal without indexing).
++var rawPostHeaders = []byte{0x83, 0x86, 0x84, 0x01, 0x01, 'x'}
++
++func (c *rawH2Client) open(id uint32) {
++	if err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: rawPostHeaders, EndHeaders: true}); err != nil {
++		c.t.Fatal(err)
++	}
++	c.streams[id] = c.init
++}
++
++// pump reads what the server sends and spends all credit until nothing has
++// moved for quiet.
++func (c *rawH2Client) pump(quiet time.Duration) {
++	last := time.Now()
++	chunk := make([]byte, h2MinMaxFrameSize)
++	for time.Since(last) < quiet {
++		for id, w := range c.streams {
++			for w > 0 && c.connWin > 0 {
++				n := min(w, c.connWin, int64(len(chunk)))
++				if err := c.fr.WriteData(id, false, chunk[:n]); err != nil {
++					c.t.Fatal(err)
++				}
++				w -= n
++				c.connWin -= n
++				c.accepted += n
++				last = time.Now()
++			}
++			c.streams[id] = w
++		}
++		c.conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
++		f, err := c.fr.ReadFrame()
++		if err != nil {
++			var ne net.Error
++			if errors.As(err, &ne) && ne.Timeout() {
++				continue
++			}
++			c.t.Fatalf("read: %v", err)
++		}
++		switch f := f.(type) {
++		case *http2.SettingsFrame:
++			if f.IsAck() {
++				continue
++			}
++			if v, ok := f.Value(http2.SettingInitialWindowSize); ok {
++				for id := range c.streams {
++					c.streams[id] += int64(v) - c.init
++				}
++				c.init = int64(v)
++			}
++			c.fr.WriteSettingsAck()
++		case *http2.PingFrame:
++			if !f.IsAck() {
++				c.fr.WritePing(true, f.Data)
++			}
++		case *http2.WindowUpdateFrame:
++			if f.StreamID == 0 {
++				c.connWin += int64(f.Increment)
++			} else if _, ok := c.streams[f.StreamID]; ok {
++				c.streams[f.StreamID] += int64(f.Increment)
++			}
++			last = time.Now()
++		}
++	}
++}
++
++// TestFlowServerUnreadPerConnection (added for bdbac60e) opens 32 upload
++// streams whose handlers never read and counts what the server accepts on
++// the connection. Stock Go holds that to its 1 MiB connection window; the
++// PR states that a governed server reaches its 6 MiB only "while the outbound
++// keeps up" and that behind a proxy or without TCP_INFO windows never exceed
++// Go's 1 MiB. Neither holds for the connection: the governor caps streams,
++// not their sum.
++func TestFlowServerUnreadPerConnection(t *testing.T) {
++	results := map[bool]int64{}
++	for _, governed := range []bool{false, true} {
++		t.Run(fmt.Sprintf("governed=%v", governed), func(t *testing.T) {
++			saved := flowEnabled
++			flowEnabled = governed
++			defer func() { flowEnabled = saved }()
++			block := make(chan struct{})
++			defer close(block)
++			ln, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			var listener net.Listener = ln
++			cfg := &Config{}
++			if cfg.h2FlowOn() {
++				listener = &flowListener{Listener: ln, up: flowDefault, down: flowDefault}
++			}
++			protocols := new(http.Protocols)
++			protocols.SetHTTP1(true)
++			protocols.SetUnencryptedHTTP2(true)
++			srv := &http.Server{
++				Handler:   http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-block }),
++				Protocols: protocols,
++				HTTP2:     cfg.h2ReceiveConfig(true),
++			}
++			go srv.Serve(listener)
++			defer srv.Close()
++
++			c := dialRawH2(t, ln.Addr().String())
++			for i := uint32(0); i < 32; i++ {
++				c.open(2*i + 1)
++			}
++			c.pump(time.Second)
++			results[governed] = c.accepted
++			t.Logf("server accepted %d bytes on 32 streams nobody reads", c.accepted)
++		})
++	}
++	if results[true] > 1<<20+64<<10 {
++		t.Fatalf("governed server holds %d unread bytes on one connection, stock %d (Go's 1 MiB)", results[true], results[false])
++	}
++}
++
++// blockingListener shrinks the send buffer of accepted connections so a
++// client that stops reading blocks the server's writes after a few KiB.
++type blockingListener struct {
++	net.Listener
++	mu    sync.Mutex
++	conns []*flowConn
++	wrap  bool
++}
++
++func (l *blockingListener) Accept() (net.Conn, error) {
++	c, err := l.Listener.Accept()
++	if err != nil {
++		return nil, err
++	}
++	c.(*net.TCPConn).SetWriteBuffer(4096)
++	if !l.wrap {
++		return c, nil
++	}
++	fc := newFlowConn(c, flowDefault, flowDefault)
++	l.mu.Lock()
++	l.conns = append(l.conns, fc)
++	l.mu.Unlock()
++	return fc, nil
++}
++
++// TestFlowInjectedQueueBounded (added for bdbac60e) stops reading on the
++// client so the server's writes block, then opens and resets streams. Every
++// new stream makes the governor queue a WINDOW_UPDATE for the client in
++// wqueue, outside net/http's own control-frame limit, and nothing drains it
++// while the write is blocked: the queue grows with what the client sends.
++func TestFlowInjectedQueueBounded(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	bl := &blockingListener{Listener: ln, wrap: true}
++	protocols := new(http.Protocols)
++	protocols.SetHTTP1(true)
++	protocols.SetUnencryptedHTTP2(true)
++	srv := &http.Server{
++		Handler:   http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }),
++		Protocols: protocols,
++		HTTP2:     (&Config{H2Flow: &H2FlowConfig{Mode: 1}}).h2ReceiveConfig(true),
++	}
++	go srv.Serve(bl)
++	defer srv.Close()
++
++	conn, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	conn.(*net.TCPConn).SetReadBuffer(4096)
++	var b bytes.Buffer
++	fr := http2.NewFramer(&b, nil)
++	b.WriteString(h2Preface)
++	fr.WriteSettings()
++	// PINGs the server answers until its writes block; well under net/http's
++	// limit of 10000 queued control frames.
++	for i := 0; i < 3000; i++ {
++		fr.WritePing(false, [8]byte{byte(i), byte(i >> 8)})
++	}
++	if _, err := conn.Write(b.Bytes()); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(200 * time.Millisecond)
++
++	queued := func() (n int, blocked bool) {
++		bl.mu.Lock()
++		defer bl.mu.Unlock()
++		for _, c := range bl.conns {
++			c.mu.Lock()
++			n += queuedBytes(c)
++			c.mu.Unlock()
++			if c.wmu.TryLock() {
++				c.wmu.Unlock()
++			} else {
++				blocked = true
++			}
++		}
++		return
++	}
++	id := uint32(1)
++	send := func(pairs int) {
++		b.Reset()
++		for i := 0; i < pairs; i++ {
++			fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: rawPostHeaders, EndHeaders: true})
++			fr.WriteRSTStream(id, http2.ErrCodeCancel)
++			id += 2
++		}
++		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
++		if _, err := conn.Write(b.Bytes()); err != nil {
++			t.Fatalf("client write: %v", err)
++		}
++	}
++	var sizes []int
++	sent := 0
++	for _, pairs := range []int{20000, 20000, 20000} {
++		send(pairs)
++		sent += pairs * (len(b.Bytes()) / pairs)
++		time.Sleep(300 * time.Millisecond)
++		n, blocked := queued()
++		sizes = append(sizes, n)
++		t.Logf("after %d client bytes: %d bytes queued in wqueue, server write blocked %v", sent, n, blocked)
++	}
++	if sizes[len(sizes)-1] > 64<<10 {
++		t.Fatalf("wqueue holds %v bytes after the client sent %d bytes and stopped reading; it grows without bound", sizes, sent)
++	}
++}
++
++// TestFlowProtoField32 (added for bdbac60e) checks the generated descriptor
++// for the new field and a wire round trip.
++func TestFlowProtoField32(t *testing.T) {
++	fd := (&Config{}).ProtoReflect().Descriptor().Fields().ByNumber(32)
++	if fd == nil || fd.Name() != "h2Flow" || fd.Message().FullName() != "xray.transport.internet.splithttp.H2FlowConfig" {
++		t.Fatalf("field 32: %v", fd)
++	}
++	in := &Config{H2Flow: &H2FlowConfig{Mode: 1, MaxStreamReceiveWindow: 1 << 20, MaxConnectionReceiveWindow: 2 << 20}}
++	raw, err := proto.Marshal(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	out := &Config{}
++	if err := proto.Unmarshal(raw, out); err != nil || !proto.Equal(in, out) {
++		t.Fatalf("round trip: %v, %v", out, err)
++	}
++}
++
++// TestFlowInjectedQueueHeapVsStock (added for bdbac60e) runs the
++// TestFlowInjectedQueueBounded client against a stock and a governed server
++// and compares live heap growth after the stream churn, so the queue is not
++// mistaken for memory net/http would hold anyway.
++func TestFlowInjectedQueueHeapVsStock(t *testing.T) {
++	if raceEnabled {
++		t.Skip("heap growth under the race detector says nothing, and the churn outlasts its write deadlines")
++	}
++	// Measured on bdbac60e: stock grows ~2.7 MB at both 2 and 10 rounds
++	// (bounded); governed grows ~3.3 MB at 2 rounds and ~7.6 MB at 10,
++	// about 13.5 bytes per stream: the injected WINDOW_UPDATEs in wqueue.
++	const churnRounds = 10
++	growth := map[bool]int64{}
++	for _, governed := range []bool{false, true} {
++		t.Run(fmt.Sprintf("governed=%v", governed), func(t *testing.T) {
++			// A stock server whose writes block stops reading once the
++			// handlers it started cannot finish, depending on how the
++			// resets interleave with them; that attempt says nothing about
++			// the governor, so it is run again.
++			attempt := func() bool {
++				ln, err := net.Listen("tcp", "127.0.0.1:0")
++				if err != nil {
++					t.Fatal(err)
++				}
++				bl := &blockingListener{Listener: ln, wrap: governed}
++				protocols := new(http.Protocols)
++				protocols.SetHTTP1(true)
++				protocols.SetUnencryptedHTTP2(true)
++				mode := int32(2)
++				if governed {
++					mode = 1
++				}
++				srv := &http.Server{
++					Handler:   http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }),
++					Protocols: protocols,
++					HTTP2:     (&Config{H2Flow: &H2FlowConfig{Mode: mode}}).h2ReceiveConfig(true),
++				}
++				go srv.Serve(bl)
++				defer srv.Close()
++				conn, err := net.Dial("tcp", ln.Addr().String())
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer conn.Close()
++				conn.(*net.TCPConn).SetReadBuffer(4096)
++				var b bytes.Buffer
++				fr := http2.NewFramer(&b, nil)
++				b.WriteString(h2Preface)
++				fr.WriteSettings()
++				for i := 0; i < 3000; i++ {
++					fr.WritePing(false, [8]byte{byte(i), byte(i >> 8)})
++				}
++				conn.Write(b.Bytes())
++				time.Sleep(200 * time.Millisecond)
++				heap := func() int64 {
++					runtime.GC()
++					var ms runtime.MemStats
++					runtime.ReadMemStats(&ms)
++					return int64(ms.HeapAlloc)
++				}
++				before := heap()
++				id := uint32(1)
++				for round := 0; round < churnRounds; round++ {
++					b.Reset()
++					for i := 0; i < 40000; i++ {
++						fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: rawPostHeaders, EndHeaders: true})
++						fr.WriteRSTStream(id, http2.ErrCodeCancel)
++						id += 2
++					}
++					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
++					if _, err := conn.Write(b.Bytes()); err != nil {
++						t.Logf("client write in round %d: %v; the server stopped reading", round, err)
++						return false
++					}
++				}
++				time.Sleep(500 * time.Millisecond)
++				growth[governed] = heap() - before
++				// The connection must still be up: probe with one more frame.
++				b.Reset()
++				fr.WritePing(false, [8]byte{9})
++				_, werr := conn.Write(b.Bytes())
++				t.Logf("%d streams opened and reset: live heap grew by %d bytes; connection still writable: %v", churnRounds*40000, growth[governed], werr == nil)
++				return true
++			}
++			for i := 0; !attempt(); i++ {
++				if i == 2 {
++					// Slow instrumented builds (checkptr) stall every time.
++					t.Skip("the server stopped reading in every attempt; heap not compared")
++				}
++			}
++		})
++	}
++	if growth[true]-growth[false] > 1<<20 {
++		t.Fatalf("governed server holds %d more live heap than stock after the same stream churn", growth[true]-growth[false])
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_off_test.go b/transport/internet/splithttp/h2flow_verify_off_test.go
+new file mode 100644
+index 00000000..4735138e
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_off_test.go
+@@ -0,0 +1,46 @@
++package splithttp
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++// TestFlowOffLeavesStockWiring (added for bdbac60e) checks the default: with
++// XRAY_XHTTP_FLOW unset and no "h2Flow", ListenXH does not wrap its listener,
++// net/http gets Go's HTTP/2 windows, and the client transport is Go's.
++func TestFlowOffLeavesStockWiring(t *testing.T) {
++	if flowEnabled {
++		t.Skip("XRAY_XHTTP_FLOW=on in the environment")
++	}
++	for _, tc := range []struct {
++		flow    *H2FlowConfig
++		wrapped bool
++	}{{nil, false}, {&H2FlowConfig{Mode: 2}, false}, {&H2FlowConfig{Mode: 1}, true}} {
++		t.Run(fmt.Sprintf("%v", tc.flow), func(t *testing.T) {
++			cfg := &Config{Path: "shs", H2Flow: tc.flow}
++			port := tcp.PickPort()
++			ln, err := ListenXH(context.Background(), xnet.LocalHostIP, port, &internet.MemoryStreamConfig{ProtocolName: "splithttp", ProtocolSettings: cfg}, func(stat.Connection) {})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer ln.Close()
++			l := ln.(*Listener)
++			_, wrapped := l.listener.(*flowListener)
++			if wrapped != tc.wrapped {
++				t.Fatalf("listener wrapped %v, want %v", wrapped, tc.wrapped)
++			}
++			if !tc.wrapped && l.server.HTTP2 != nil {
++				t.Fatalf("ungoverned server HTTP2 config %+v, want Go's defaults", l.server.HTTP2)
++			}
++			if !tc.wrapped && cfg.h2ReceiveConfig(false) != nil {
++				t.Fatal("ungoverned client gets a non-default HTTP/2 config")
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_settings_test.go b/transport/internet/splithttp/h2flow_verify_settings_test.go
+new file mode 100644
+index 00000000..8ecd9af3
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_verify_settings_test.go
+@@ -0,0 +1,289 @@
++package splithttp
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// writeDataSplit writes n bytes of DATA on stream id in default-size frames.
++func writeDataSplit(fr *http2.Framer, id uint32, n int) {
++	for n > 0 {
++		m := min(n, h2MinMaxFrameSize)
++		fr.WriteData(id, false, make([]byte, m))
++		n -= m
++	}
++}
++
++// TestFlowInitialWindowDecrease lowers the client's initial window after the
++// governor has handed the server credit beyond the window it shows. The real
++// window of the stream drops with it, so what the server may still send has
++// to drop as far; when no SETTINGS value can take it that far, the governor
++// must give up the connection instead of letting the server overrun the
++// client.
++func TestFlowInitialWindowDecrease(t *testing.T) {
++	const sent = 32 << 10
++	for _, tc := range []struct {
++		lowered    uint32
++		expressive bool
++	}{
++		{200000, true},
++		{0, false},
++	} {
++		t.Run(fmt.Sprintf("to %d", tc.lowered), func(t *testing.T) {
++			h := newFlowHarness(t)
++			h.track()
++			h.openStream(4 << 20)
++			if got := h.toServer.streams[1]; got != flowStartWindow {
++				t.Fatalf("server opened stream 1 with %d of credit, want %d", got, flowStartWindow)
++			}
++			h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, 1, sent) })
++			h.toServer.streams[1] -= sent
++
++			h.fromClient(func(fr *http2.Framer) {
++				fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: tc.lowered})
++			})
++			real := int64(tc.lowered) - sent
++			if !tc.expressive {
++				if h.readErr == nil || !h.conn.isClosed() {
++					t.Fatalf("server may still send %d on stream 1 while the client allows %d, and the connection is still up (read error %v)",
++						h.toServer.streams[1], real, h.readErr)
++				}
++				if _, err := h.fromServerRaw(frames(func(fr *http2.Framer) { fr.WriteData(1, false, make([]byte, 100)) })); err == nil {
++					t.Fatal("the server could still send after the governor gave up the connection")
++				}
++				return
++			}
++			if h.readErr != nil {
++				t.Fatalf("governor failed a change it can express: %v", h.readErr)
++			}
++			if view := h.toServer.streams[1]; view > real {
++				t.Fatalf("server may still send %d on stream 1 while the client allows %d", view, real)
++			}
++		})
++	}
++}
++
++// TestFlowInitialWindowIncrease raises the client's initial window after the
++// server used up the default one. The client then counts on the server
++// having room and owes no credit, so the governor has to hand the server its
++// share of the new window, after the SETTINGS frame that funds it.
++func TestFlowInitialWindowIncrease(t *testing.T) {
++	h := newFlowHarness(t)
++	h.track()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 100})
++	})
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++	})
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, 1, h2InitWindow) })
++	h.toServer.streams[1] -= h2InitWindow
++	if view := h.toServer.streams[1]; view != 0 {
++		t.Fatalf("server has %d left on stream 1 after using the default window", view)
++	}
++
++	before := len(h.toServer.frames)
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	real := int64(4<<20) - h2InitWindow
++	view := h.toServer.streams[1]
++	if view <= 0 {
++		t.Fatalf("stream 1 stalls: the server has %d of credit while the client allows %d and owes none", view, real)
++	}
++	if view > real {
++		t.Fatalf("server may send %d on stream 1 while the client allows %d", view, real)
++	}
++	settingsAt, creditAt := -1, -1
++	for i, frame := range h.toServer.frames[before:] {
++		switch f := frame.(type) {
++		case *http2.SettingsFrame:
++			if settingsAt < 0 {
++				settingsAt = i
++			}
++		case *http2.WindowUpdateFrame:
++			if f.StreamID == 1 && creditAt < 0 {
++				creditAt = i
++			}
++		}
++	}
++	if settingsAt < 0 || creditAt < settingsAt {
++		t.Fatalf("credit for stream 1 at frame %d reaches the server before the SETTINGS that funds it at %d", creditAt, settingsAt)
++	}
++}
++
++// TestFlowInitialWindowChangeOrdering lets the governor grant upload credit
++// to a new stream while the server is half way through a SETTINGS frame that
++// lowers its window. The credit waits behind that frame, so the client
++// applies the lower window first and the credit after it; together they must
++// not exceed what the server really accepts.
++func TestFlowInitialWindowChangeOrdering(t *testing.T) {
++	const lowered = 200000
++	h := newFlowHarness(t)
++	h.track()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++	})
++
++	lower := frames(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: lowered})
++	})
++	if _, err := h.fromServerRaw(lower[:5]); err != nil {
++		t.Fatal(err)
++	}
++	h.toClient.open(1)
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	if _, err := h.fromServerRaw(lower[5:]); err != nil {
++		t.Fatal(err)
++	}
++	if view := h.toClient.streams[1]; view > lowered {
++		t.Fatalf("client may send %d on stream 1 while the server accepts %d", view, lowered)
++	}
++	if view := h.toClient.streams[1]; view <= 0 {
++		t.Fatalf("client has %d of credit on stream 1 while the server accepts %d", view, lowered)
++	}
++}
++
++func settingsPayload(entries ...[2]uint32) []byte {
++	var p []byte
++	for _, e := range entries {
++		p = binary.BigEndian.AppendUint16(p, uint16(e[0]))
++		p = binary.BigEndian.AppendUint32(p, e[1])
++	}
++	return p
++}
++
++var malformedSettings = []struct {
++	name   string
++	stream uint32
++	values [][2]uint32
++}{
++	{"initial window above 2^31-1", 0, [][2]uint32{{h2SettingInitialWindowSize, 0x80000000}}},
++	{"max frame size above 2^24-1", 0, [][2]uint32{{h2SettingMaxFrameSize, 0x01000000}}},
++	{"invalid ENABLE_PUSH beside a window", 0, [][2]uint32{{h2SettingInitialWindowSize, 4 << 20}, {0x2, 2}}},
++	{"SETTINGS on a stream", 1, [][2]uint32{{h2SettingInitialWindowSize, 4 << 20}, {h2SettingMaxFrameSize, 1 << 20}}},
++}
++
++// TestFlowMalformedSettingsPassVerbatim sends SETTINGS that stock HTTP/2
++// rejects in both directions: the governor must hand them on byte for byte,
++// so the receiving stack fails them as it would without the governor.
++func TestFlowMalformedSettingsPassVerbatim(t *testing.T) {
++	for _, tc := range malformedSettings {
++		in := frames(func(fr *http2.Framer) {
++			fr.WriteRawFrame(http2.FrameSettings, 0, tc.stream, settingsPayload(tc.values...))
++		})
++		t.Run("client "+tc.name, func(t *testing.T) {
++			h := newFlowHarness(t)
++			if got := h.fromClientRaw(in); !bytes.Equal(got, in) {
++				t.Fatalf("server read %x, client sent %x", got, in)
++			}
++		})
++		t.Run("server "+tc.name, func(t *testing.T) {
++			h := newFlowHarness(t)
++			got, err := h.fromServerRaw(in)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !bytes.Equal(got, in) {
++				t.Fatalf("client read %x, server sent %x", got, in)
++			}
++		})
++	}
++}
++
++// An oversized SETTINGS frame passes on as it is: net/http rejects more than
++// 100 settings in one frame, so the real window inside it never takes effect,
++// and the peer sees the stock GOAWAY (TestFlowOversizedSettingsGetStockErrors).
++// Failing the connection in the governor instead would change that answer.
++
++// h2Reaction sends the preface and frames to a server and reports whether it
++// acknowledged the client's SETTINGS, which GOAWAY code it sent, and whether
++// it closed the connection or left it open.
++func h2Reaction(t *testing.T, addr string, in []byte) string {
++	t.Helper()
++	conn, err := net.Dial("tcp", addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(2 * time.Second))
++	if _, err := conn.Write(append([]byte(h2Preface), in...)); err != nil {
++		t.Fatal(err)
++	}
++	fr := http2.NewFramer(nil, conn)
++	acked, goaway := false, "none"
++	for {
++		frame, err := fr.ReadFrame()
++		if err != nil {
++			end := "closed"
++			if ne, ok := err.(net.Error); ok && ne.Timeout() {
++				end = "left open"
++			}
++			return fmt.Sprintf("settings acked %v, goaway %s, connection %s", acked, goaway, end)
++		}
++		switch f := frame.(type) {
++		case *http2.SettingsFrame:
++			acked = acked || f.IsAck()
++		case *http2.GoAwayFrame:
++			goaway = f.ErrCode.String()
++		}
++	}
++}
++
++// TestFlowMalformedSettingsGetStockErrors sends the same malformed SETTINGS
++// to a stock and a governed server and expects the same answer.
++func TestFlowMalformedSettingsGetStockErrors(t *testing.T) {
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
++	_, stock := startFlowServer(t, flowLimit{}, flowLimit{}, false, handler)
++	_, governed := startFlowServer(t, testUp, testDown, false, handler)
++	for _, tc := range malformedSettings {
++		t.Run(tc.name, func(t *testing.T) {
++			in := frames(func(fr *http2.Framer) {
++				fr.WriteRawFrame(http2.FrameSettings, 0, tc.stream, settingsPayload(tc.values...))
++			})
++			want := h2Reaction(t, stock, in)
++			if got := h2Reaction(t, governed, in); got != want {
++				t.Fatalf("governed server: %s; stock: %s", got, want)
++			}
++		})
++	}
++}
++
++// TestFlowOversizedSettingsGetStockErrors (added for bdbac60e) sends the
++// oversized SETTINGS of TestFlowOversizedSettingsFailClosed to a stock and a
++// governed server: net/http rejects more than 100 settings itself, so the
++// governor's pass-through does not change what a peer observes.
++func TestFlowOversizedSettingsGetStockErrors(t *testing.T) {
++	values := make([][2]uint32, h2MinMaxFrameSize/6)
++	for i := range values {
++		values[i] = [2]uint32{0x1, 4096}
++	}
++	values = append(values, [2]uint32{h2SettingInitialWindowSize, 4 << 20})
++	in := frames(func(fr *http2.Framer) {
++		fr.WriteRawFrame(http2.FrameSettings, 0, 0, settingsPayload(values...))
++	})
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
++	_, stock := startFlowServer(t, flowLimit{}, flowLimit{}, false, handler)
++	_, governed := startFlowServer(t, testUp, testDown, false, handler)
++	want := h2Reaction(t, stock, in)
++	got := h2Reaction(t, governed, in)
++	t.Logf("stock: %s; governed: %s", want, got)
++	if got != want {
++		t.Fatalf("governed server: %s; stock: %s", got, want)
++	}
++}
+-- 
+2.52.0.windows.1
+

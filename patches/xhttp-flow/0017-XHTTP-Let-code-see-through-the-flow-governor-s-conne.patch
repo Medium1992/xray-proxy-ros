@@ -1,0 +1,59 @@
+From 6511b92c78dcda8e717bf8233a459670c00777aa Mon Sep 17 00:00:00 2001
+From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 22:02:34 +0300
+Subject: [PATCH 17/19] XHTTP: Let code see through the flow governor's
+ connection wrapper
+
+The governor wraps the accepted connection without NetConn, so code
+that looks through wrappers stopped at it. It now returns the accepted
+connection, as connection wrappers do.
+---
+ transport/internet/splithttp/h2flow.go         |  6 ++++++
+ .../internet/splithttp/h2flow_netconn_test.go  | 18 ++++++++++++++++++
+ 2 files changed, 24 insertions(+)
+ create mode 100644 transport/internet/splithttp/h2flow_netconn_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index a3de54b5..a54a9048 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -550,6 +550,12 @@ func (c *flowConn) queueShrink(w *flowWindow, now time.Time, init int32) {
+ 	w.cap = int32(max(int64(init), int64(w.cap)/4*3, keep))
+ }
+ 
++// NetConn returns the accepted connection, so that code which looks through
++// connection wrappers still finds it behind the governor.
++func (c *flowConn) NetConn() net.Conn {
++	return c.Conn
++}
++
+ func newFlowConn(c net.Conn, up, down flowLimit) *flowConn {
+ 	fc := &flowConn{
+ 		Conn:        c,
+diff --git a/transport/internet/splithttp/h2flow_netconn_test.go b/transport/internet/splithttp/h2flow_netconn_test.go
+new file mode 100644
+index 00000000..1cfd2380
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_netconn_test.go
+@@ -0,0 +1,18 @@
++package splithttp
++
++import (
++	"net"
++	"testing"
++)
++
++// Code that looks through connection wrappers must reach the accepted
++// connection behind the governor.
++func TestFlowConnNetConn(t *testing.T) {
++	a, b := net.Pipe()
++	defer a.Close()
++	defer b.Close()
++	fc := newFlowConn(a, flowDefault, flowDefault)
++	if got := fc.NetConn(); got != a {
++		t.Fatalf("NetConn returned %v, want the accepted connection", got)
++	}
++}
+-- 
+2.52.0.windows.1
+

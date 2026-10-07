@@ -1,0 +1,185 @@
+From 2fb4ce3bb9614bec9287979942e04b55f9b17f0c Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:09:03 +0300
+Subject: [PATCH] XHTTP: Show Go's initial HTTP/2 window for uploads in the
+ flow governor
+
+A governed server advertises SETTINGS_INITIAL_WINDOW_SIZE 1048576, as stock
+Go does, instead of 65535 followed by a WINDOW_UPDATE on every new stream.
+The upload connection window still holds what nobody reads to 1 MiB.
+Clients keep 65535: with both ends governing the download, a larger shown
+window let each hold back credit the other counted as in flight.
+---
+ transport/internet/splithttp/h2flow.go        | 20 +++++++++++---
+ .../internet/splithttp/h2flow_conn_test.go    | 27 +++++++++++++++++++
+ .../internet/splithttp/h2flow_model_test.go   |  4 ++-
+ transport/internet/splithttp/h2flow_test.go   |  4 ++-
+ .../splithttp/h2flow_verify_inject_test.go    | 13 +++++++--
+ 5 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index ec60e0f3..1f26ad4b 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -91,6 +91,18 @@ var flowEnabled = platform.NewEnvFlag(platform.XHTTPFlow).GetValue(func() string
+ // itself defines, nor grow beyond what the peer really granted.
+ var flowDefault = flowLimit{init: h2InitWindow, max: 1 << 30}
+ 
++// The initial window each side is shown, where the receiver grants that
++// much. A server shows Go's own 1 MiB, so its SETTINGS carry the stock value
++// and new upload streams need no credit at once; the upload connection
++// window still holds everything nobody reads to 1 MiB. A client keeps the
++// protocol default: when both ends govern the download, a larger value lets
++// the two hold back credit each counts as the other's, and a duplex stream
++// can stall.
++const (
++	flowShownUp   = 1 << 20
++	flowShownDown = h2InitWindow
++)
++
+ type tcpStats struct {
+ 	rtt, minRTT, rttVar time.Duration
+ }
+@@ -1107,8 +1119,8 @@ func rewriteInitialWindow(payload []byte, limit int32) (real, shown int32, found
+ // for each stream shown + forwarded <= real + returned. Where no value is
+ // low enough, ok is false and the connection has to go. Streams the sender
+ // has finished do not count: nothing more is sent on them.
+-func (c *flowConn) changeInitialWindow(payload []byte, l flowLimit, init, shown *int32, credit func(*flowStream) (returned, forwarded int64, done bool)) (ok bool) {
+-	real, show, found := rewriteInitialWindow(payload, l.init)
++func (c *flowConn) changeInitialWindow(payload []byte, l flowLimit, start int32, init, shown *int32, credit func(*flowStream) (returned, forwarded int64, done bool)) (ok bool) {
++	real, show, found := rewriteInitialWindow(payload, max(l.init, start))
+ 	if !found {
+ 		return true
+ 	}
+@@ -1197,7 +1209,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	switch f.typ {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+-			if c.down.enabled() && !c.changeInitialWindow(payload, c.down, &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
++			if c.down.enabled() && !c.changeInitialWindow(payload, c.down, flowShownDown, &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.down.returned, s.downForwarded, s.serverDone
+ 			}) {
+ 				c.giveUp()
+@@ -1343,7 +1355,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 	switch f.typ {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+-			if c.up.enabled() && !c.changeInitialWindow(payload, c.up, &c.serverInit, &c.serverShown, func(s *flowStream) (int64, int64, bool) {
++			if c.up.enabled() && !c.changeInitialWindow(payload, c.up, flowShownUp, &c.serverInit, &c.serverShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.up.returned, s.upForwarded, s.clientDone
+ 			}) {
+ 				c.giveUp()
+diff --git a/transport/internet/splithttp/h2flow_conn_test.go b/transport/internet/splithttp/h2flow_conn_test.go
+index 484f88f2..a386f25b 100644
+--- a/transport/internet/splithttp/h2flow_conn_test.go
++++ b/transport/internet/splithttp/h2flow_conn_test.go
+@@ -95,3 +95,30 @@ func TestFlowSlowReaderLeavesConnectionRoom(t *testing.T) {
+ 		t.Fatalf("slow readers holding %d leave %d of connection window for new streams", held, room)
+ 	}
+ }
++
++// TestFlowNoCreditAtStreamOpen checks the upload window a server shows: Go's
++// own 1 MiB, so the client gets no WINDOW_UPDATE the moment a stream opens.
++func TestFlowNoCreditAtStreamOpen(t *testing.T) {
++	h := newFlowHarness(t)
++	h.track()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 6 << 20})
++	})
++	if h.toClient.init != flowShownUp {
++		t.Fatalf("server SETTINGS show %d, want Go's %d", h.toClient.init, flowShownUp)
++	}
++	before := len(h.toClient.frames)
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	h.sync()
++	h.toClient.receive(t, h.conn.take())
++	for _, f := range h.toClient.frames[before:] {
++		if w, ok := f.(*http2.WindowUpdateFrame); ok && w.StreamID == 1 {
++			t.Fatalf("client got %d of credit as stream 1 opened", w.Increment)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index 2c6ad179..0834afe2 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -261,7 +261,9 @@ func (m *flowModel) limit(id uint32, up bool) int64 {
+ 	case s == nil:
+ 		return 0
+ 	case up && m.up.enabled():
+-		return s.peakUp
++		// The client may send the initial window the server shows before
++		// the governor holds anything back.
++		return max(s.peakUp, min(int64(flowShownUp), m.srvInit))
+ 	case !up && m.down.enabled():
+ 		return s.peakDown
+ 	}
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index d31c35f3..53d851a1 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -295,7 +295,9 @@ func TestFlowSlowUplinkHandlerBounded(t *testing.T) {
+ 		up   flowLimit
+ 		max  int64
+ 	}{
+-		{"governed", testUp, int64(testUp.init) + 64<<10},
++		// The client may send the 1 MiB a governed server shows at once;
++		// stock lets the handler fall a whole MiB behind on every round.
++		{"governed", testUp, int64(flowShownUp) + 64<<10},
+ 		{"stock", flowLimit{}, 0},
+ 	} {
+ 		var consumed atomic.Int64
+diff --git a/transport/internet/splithttp/h2flow_verify_inject_test.go b/transport/internet/splithttp/h2flow_verify_inject_test.go
+index 673653d1..f4915639 100644
+--- a/transport/internet/splithttp/h2flow_verify_inject_test.go
++++ b/transport/internet/splithttp/h2flow_verify_inject_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"io"
+ 	"testing"
++	"time"
+ 
+ 	"golang.org/x/net/http2"
+ )
+@@ -16,11 +17,15 @@ import (
+ // on.
+ func TestFlowInjectedWriteFailureIsTerminal(t *testing.T) {
+ 	h := newFlowHarness(t)
++	// Since the server shows Go's 1 MiB, the governor credits a new upload
++	// stream at once only when the connection learned a larger window, out
++	// of the 6 MiB a governed server grants.
++	h.c.upLearned = flowLearned{cap: 4 << 20, at: time.Now()}
+ 	h.fromClient(func(fr *http2.Framer) {
+ 		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
+ 	})
+ 	h.fromServer(func(fr *http2.Framer) {
+-		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 6 << 20})
+ 	})
+ 
+ 	h.conn.mu.Lock()
+@@ -57,11 +62,15 @@ func TestFlowInjectedWriteFailureIsTerminal(t *testing.T) {
+ // server writes afterwards may follow it.
+ func TestFlowInjectedWriteFailureTearsStream(t *testing.T) {
+ 	h := newFlowHarness(t)
++	// Since the server shows Go's 1 MiB, the governor credits a new upload
++	// stream at once only when the connection learned a larger window, out
++	// of the 6 MiB a governed server grants.
++	h.c.upLearned = flowLearned{cap: 4 << 20, at: time.Now()}
+ 	h.fromClient(func(fr *http2.Framer) {
+ 		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
+ 	})
+ 	settings := h.fromServer(func(fr *http2.Framer) {
+-		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 6 << 20})
+ 	})
+ 	h.conn.mu.Lock()
+ 	h.conn.failNext = true
+-- 
+2.52.0.windows.1
+

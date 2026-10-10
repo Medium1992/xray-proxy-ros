@@ -1,0 +1,253 @@
+From 25dcdbea6f1bb918357f97371b14524118831b94 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:41:52 +0300
+Subject: [PATCH 27/28] XHTTP: Hand flow governor credit on in larger pieces,
+ read the clock less often
+
+A reader returns credit a few KiB at a time. The governor passed every piece
+on, and for each the sender wrote one small frame: a system call and a TLS
+record. Credit now waits until a quantum has gathered (an eighth of the
+stream's cap, 16 to 32 KiB) while the sender still has a quantum of window;
+once it has less, all credit goes out at once. No cap changes.
+
+The PING check at every frame boundary read the clock. Where the kernel
+vouches for the path no PING is due, so the clock is read once in 64
+boundaries.
+---
+ transport/internet/splithttp/h2flow.go        | 55 ++++++++++--
+ .../internet/splithttp/h2flow_hold_test.go    | 88 +++++++++++++++++++
+ .../internet/splithttp/h2flow_ping_test.go    | 23 +++++
+ 3 files changed, 159 insertions(+), 7 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_hold_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index ddc7131d..8dcdf55f 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -67,6 +67,15 @@ const (
+ 	// before its readers prove they need more: Go's default.
+ 	flowConnFloor   = 1 << 20
+ 	flowSmallCredit = 64 << 10
++	// Credit is handed on in pieces of at least flowQuantumMin and at most
++	// flowQuantumMax where the sender is not about to run dry, see hold. The
++	// larger stays under flowSmallCredit, so a governor at the other end
++	// still sees a peer that credits in small steps.
++	flowQuantumMin = 16 << 10
++	flowQuantumMax = 32 << 10
++	// flowPingRecheck is how many frame boundaries pass between looks at
++	// the clock on a connection that needs no PING.
++	flowPingRecheck = 64
+ 	flowShrinkAfter = 3
+ 	flowKernelEvery = 20 * time.Millisecond
+ 	flowQueueHold   = 15 * time.Millisecond
+@@ -556,6 +565,7 @@ type flowConn struct {
+ 	wpending     atomic.Bool
+ 	settingsSent bool
+ 	pingReady    bool
++	pingSkip     int
+ 	closed       bool
+ 	broken       bool
+ 
+@@ -998,11 +1008,28 @@ func (c *flowConn) upConnRelease() int64 {
+ }
+ 
+ func (c *flowConn) appendUpConnRelease(out []byte) []byte {
+-	if rel := c.upConnRelease(); rel > 0 {
+-		c.upConnForwarded += rel
+-		out = appendWindowUpdate(out, 0, rel)
++	rel := c.upConnRelease()
++	if rel <= 0 || hold(rel, h2InitWindow+c.upConnForwarded-c.upConnSent, flowQuantumMax) {
++		return out
+ 	}
+-	return out
++	c.upConnForwarded += rel
++	return appendWindowUpdate(out, 0, rel)
++}
++
++// quantum is the least credit worth handing on for a window of cap: an
++// eighth of it, between one and two default frames.
++func quantum(cap int32) int64 {
++	return min(max(int64(cap)/8, flowQuantumMin), flowQuantumMax)
++}
++
++// hold reports whether credit rel should wait for more. A reader returns
++// credit a few KiB at a time; handed on like that, each piece makes the
++// sender write one small frame, a system call and a TLS record each. While
++// the sender still has a quantum of window it loses nothing by waiting, and
++// what it sends then brings the next credit; once it has less, all credit
++// goes out at once. No cap changes, so the reader holds no more than before.
++func hold(rel, window, quantum int64) bool {
++	return rel < quantum && window >= quantum
+ }
+ 
+ // currentRTT is the kernel's min_rtt where it vouches for the path, otherwise
+@@ -1043,8 +1070,22 @@ func (c *flowConn) sampleRTT(now time.Time, sample time.Duration) {
+ // connection learns the round trip of the empty path. Once the kernel vouches
+ // for that round trip, no more are needed.
+ func (c *flowConn) appendPing(out []byte) []byte {
++	if !c.pingReady {
++		return out
++	}
++	// This runs at every frame boundary. Where the kernel vouches for the
++	// path no PING is due, so the clock is read only now and then, to see
++	// that it still does.
++	if c.pingSkip > 0 {
++		c.pingSkip--
++		return out
++	}
+ 	now := time.Now()
+-	if !c.pingReady || (len(c.streams) == 0 && c.rttBase != 0) || c.modelled(now) || now.Sub(c.lastPing) < flowPingInterval ||
++	if c.modelled(now) {
++		c.pingSkip = flowPingRecheck
++		return out
++	}
++	if (len(c.streams) == 0 && c.rttBase != 0) || now.Sub(c.lastPing) < flowPingInterval ||
+ 		(!c.pingSentAt.IsZero() && now.Sub(c.pingSentAt) < flowPingTimeout) {
+ 		return out
+ 	}
+@@ -1390,7 +1431,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		}
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+-		if rel <= 0 {
++		if rel <= 0 || hold(rel, int64(c.clientShown)+s.downForwarded-s.downSent, quantum(s.down.cap)) {
+ 			return out
+ 		}
+ 		s.downForwarded += rel
+@@ -1519,7 +1560,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 			s.up.cap = min(s.up.cap, flowUnconfirmedUp)
+ 		}
+ 		c.upLearned.note(now, c.up.init, s.up.cap)
+-		if rel := c.upRelease(s); rel > 0 {
++		if rel := c.upRelease(s); rel > 0 && !hold(rel, int64(c.serverShown)+s.upForwarded-s.upSent, quantum(s.up.cap)) {
+ 			s.upForwarded += rel
+ 			out = appendWindowUpdate(out, f.stream, rel)
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_hold_test.go b/transport/internet/splithttp/h2flow_hold_test.go
+new file mode 100644
+index 00000000..edec850a
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_hold_test.go
+@@ -0,0 +1,88 @@
++package splithttp
++
++import (
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// TestFlowHold checks when credit waits: only while it is under a quantum and
++// the sender still has one.
++func TestFlowHold(t *testing.T) {
++	for _, tc := range []struct {
++		cap  int32
++		want int64
++	}{{h2InitWindow, flowQuantumMin}, {flowStartWindow, flowQuantumMax}, {8 << 20, flowQuantumMax}, {160 << 10, 20 << 10}} {
++		if got := quantum(tc.cap); got != tc.want {
++			t.Errorf("quantum(%d) = %d, want %d", tc.cap, got, tc.want)
++		}
++	}
++	const q = flowQuantumMax
++	for _, tc := range []struct {
++		rel, window int64
++		want        bool
++	}{
++		{4 << 10, 256 << 10, true}, // small credit, sender has plenty
++		{q, 256 << 10, false},      // a whole quantum goes out
++		{4 << 10, q - 1, false},    // sender about to run dry
++		{4 << 10, 0, false},        // sender has nothing left
++		{1, q, true},
++	} {
++		if got := hold(tc.rel, tc.window, q); got != tc.want {
++			t.Errorf("hold(%d, %d) = %v, want %v", tc.rel, tc.window, got, tc.want)
++		}
++	}
++	if flowQuantumMax >= flowSmallCredit {
++		t.Fatal("a quantum must stay below flowSmallCredit, or a governor at the other end stops seeing small steps")
++	}
++}
++
++// TestFlowCreditWaitsForAQuantum returns a server's data to it as a Go client
++// does, 4 KiB at a time. While the server has a quantum of window left the
++// pieces wait and go out as one; once it has less, a piece goes out at once.
++func TestFlowCreditWaitsForAQuantum(t *testing.T) {
++	const id, piece = 1, 4 << 10
++	h := newFlowHarness(t)
++	h.c.down.max = flowStartWindow // the cap stays where it starts
++	h.track()
++	h.openStream(4 << 20)
++	q := quantum(flowStartWindow)
++	sent := int64(0)
++	window := func() int64 { return h.toServer.streams[id] - sent }
++	send := func(n int64) {
++		h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, id, int(n)) })
++		sent += n
++	}
++	read := func() int64 {
++		before := h.toServer.streams[id]
++		h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(id, piece) })
++		return h.toServer.streams[id] - before
++	}
++	if window() != flowStartWindow {
++		t.Fatalf("the stream opened with a window of %d, want %d", window(), flowStartWindow)
++	}
++
++	send(flowStartWindow / 2)
++	updates := 0
++	for returned := int64(piece); returned <= flowStartWindow/2; returned += piece {
++		had := window()
++		switch got := read(); {
++		case got == 0:
++		case got < q:
++			t.Fatalf("credit of %d handed on while the server had a window of %d", got, had)
++		default:
++			updates++
++		}
++	}
++	if want := int(flowStartWindow / 2 / q); updates != want {
++		t.Fatalf("%d KiB of credit went out in %d pieces, want %d", flowStartWindow/2>>10, updates, want)
++	}
++	if owed := flowStartWindow - window(); owed >= q {
++		t.Fatalf("%d of credit is still held after the client read everything", owed)
++	}
++
++	send(window() - q/2)
++	if got := read(); got < piece {
++		t.Fatalf("with a window of %d the server was handed %d, want the piece at once", q/2, got)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_ping_test.go b/transport/internet/splithttp/h2flow_ping_test.go
+index 29ae4103..531de2d1 100644
+--- a/transport/internet/splithttp/h2flow_ping_test.go
++++ b/transport/internet/splithttp/h2flow_ping_test.go
+@@ -146,3 +146,26 @@ func TestFlowFloorConfirmed(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowPingClockRecheck runs the PING check of a frame boundary on a path
++// the kernel vouches for: it reads the clock once and leaves the next
++// flowPingRecheck boundaries alone. When the kernel's view is lost meanwhile,
++// the PING goes out at the first boundary after those.
++func TestFlowPingClockRecheck(t *testing.T) {
++	ms := time.Millisecond
++	c := &flowConn{pingReady: true, rttBase: 50 * ms, streams: map[uint32]*flowStream{1: {}}}
++	c.tcp, c.kAt, c.kOK = fakeRawConn{}, time.Now(), true
++	c.kstat = tcpStats{rtt: 50 * ms, minRTT: 50 * ms}
++	if out := c.appendPing(nil); len(out) != 0 || c.pingSkip != flowPingRecheck {
++		t.Fatalf("modelled path: %d bytes written, %d boundaries to skip, want 0 and %d", len(out), c.pingSkip, flowPingRecheck)
++	}
++	c.tcp = nil
++	for i := 0; i < flowPingRecheck; i++ {
++		if out := c.appendPing(nil); len(out) != 0 {
++			t.Fatalf("PING at boundary %d of the %d to skip", i+1, flowPingRecheck)
++		}
++	}
++	if out := c.appendPing(nil); len(out) == 0 {
++		t.Fatal("no PING once the skipped boundaries had passed")
++	}
++}
+-- 
+2.52.0.windows.1
+

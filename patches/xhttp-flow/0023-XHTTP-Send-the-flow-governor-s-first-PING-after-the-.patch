@@ -1,0 +1,119 @@
+From 3b2e30d7e2bd4fd1c64ddabe8524234a59d1131b Mon Sep 17 00:00:00 2001
+From: Jolymmiles <75259437+Jolymmiles@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:05:09 +0300
+Subject: [PATCH] XHTTP: Send the flow governor's first PING after the client
+ preface
+
+On a TLS inbound the server writes its SETTINGS before the client preface;
+the governor then sent its first PING at once, which a silent prober could
+see while stock sends nothing but SETTINGS. The first PING now waits for
+the client preface; it still goes out before any data.
+---
+ transport/internet/splithttp/h2flow.go        |  7 ++-
+ .../splithttp/h2flow_verify_listener_test.go  | 58 +++++++++++++++++++
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 17e02c45..22ede3b4 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -800,6 +800,9 @@ func (c *flowConn) readFrames(in, out []byte) []byte {
+ 		c.mode.Store(flowH2)
+ 	}
+ 	c.mu.Lock()
++	// A server pings only once the client preface is in: until then stock
++	// sends nothing but its SETTINGS.
++	c.pingReady = c.pingReady || (!c.client && c.settingsSent)
+ 	out = c.rp.feed(in, out, (*flowReader)(c))
+ 	credit := len(c.wcredit) > 0
+ 	c.mu.Unlock()
+@@ -1022,7 +1025,7 @@ func (c *flowConn) sampleRTT(now time.Time, sample time.Duration) {
+ 
+ // appendPing adds a PING for the remote peer once a second while streams are
+ // open, so the connection knows its round trip. The first goes out as soon as
+-// the connection is up, before data can queue in front of its ACK, so the
++// both prefaces are through, before data can queue in front of its ACK, so the
+ // connection learns the round trip of the empty path. Once the kernel vouches
+ // for that round trip, no more are needed.
+ func (c *flowConn) appendPing(out []byte) []byte {
+@@ -1450,7 +1453,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 			}
+ 			capFrameSize(payload)
+ 			c.settingsSent = true
+-			c.pingReady = c.pingReady || !c.client
++			c.pingReady = c.pingReady || (!c.client && c.mode.Load() == flowH2)
+ 			out = append(out, header...)
+ 			out = append(out, payload...)
+ 			if c.up.enabled() {
+diff --git a/transport/internet/splithttp/h2flow_verify_listener_test.go b/transport/internet/splithttp/h2flow_verify_listener_test.go
+index acb42d9c..6d5ec8e5 100644
+--- a/transport/internet/splithttp/h2flow_verify_listener_test.go
++++ b/transport/internet/splithttp/h2flow_verify_listener_test.go
+@@ -280,6 +280,64 @@ func TestFlowListenerSendsSettingsBeforePreface(t *testing.T) {
+ 	}
+ }
+ 
++// TestFlowListenerSendsOnlySettingsBeforePreface looks at everything a prober
++// gets after TLS with ALPN h2 when it sends nothing more: stock sends its
++// SETTINGS and nothing else, so the governed listener must not add its PING
++// before the client preface. Once the preface is in, the governor still sends
++// its first PING, so it learns the round trip of the empty path.
++func TestFlowListenerSendsOnlySettingsBeforePreface(t *testing.T) {
++	dial := func(t *testing.T, addr string) (net.Conn, *gotls.Conn) {
++		t.Helper()
++		raw, err := net.Dial("tcp", addr)
++		if err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() { raw.Close() })
++		raw.SetDeadline(time.Now().Add(2 * time.Second))
++		tc := gotls.Client(raw, &gotls.Config{ServerName: "localhost", InsecureSkipVerify: true, NextProtos: []string{"h2"}})
++		if err := tc.Handshake(); err != nil {
++			t.Fatal(err)
++		}
++		return raw, tc
++	}
++	for _, governed := range []bool{false, true} {
++		t.Run(fmt.Sprintf("governed=%v", governed), func(t *testing.T) {
++			addr := listenGovernedXH(t, governed, false, func(c stat.Connection) { c.Close() })
++
++			raw, tc := dial(t, addr)
++			raw.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
++			fr := http2.NewFramer(nil, tc)
++			var sent []http2.FrameType
++			for {
++				frame, err := fr.ReadFrame()
++				if err != nil {
++					break
++				}
++				sent = append(sent, frame.Header().Type)
++			}
++			if len(sent) != 1 || sent[0] != http2.FrameSettings {
++				t.Fatalf("before the client preface the server sent %v, want only SETTINGS", sent)
++			}
++
++			if !governed {
++				return
++			}
++			_, tc = dial(t, addr)
++			tc.Write(append([]byte(h2Preface), frames(func(fr *http2.Framer) { fr.WriteSettings() })...))
++			fr = http2.NewFramer(nil, tc)
++			for {
++				frame, err := fr.ReadFrame()
++				if err != nil {
++					t.Fatalf("no PING from the governor after the client preface: %v", err)
++				}
++				if ping, ok := frame.(*http2.PingFrame); ok && !ping.IsAck() {
++					return
++				}
++			}
++		})
++	}
++}
++
+ // TestFlowListenerGovernsTLSHTTP2AfterPreface (added for bdbac60e) is
+ // TestFlowListenerGovernsTLSHTTP2 with the client preface sent first, to
+ // separate whether the governor rewrites the SETTINGS from when they leave.
+-- 
+2.52.0.windows.1
+

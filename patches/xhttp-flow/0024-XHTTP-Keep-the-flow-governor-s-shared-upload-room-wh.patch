@@ -1,0 +1,102 @@
+From d9f49341687ec4de88facba7094641f4855d8137 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 12:11:31 +0300
+Subject: [PATCH] XHTTP: Keep the flow governor's shared upload room when
+ stalled streams' caps shrink
+
+While a reader stays slow its stream's cap shrinks, but the data taken under
+the earlier cap stays unread. The connection allowance counted only the
+cap, so that excess came out of the 1 MiB the other streams share, and a
+request opened meanwhile got no connection credit until the slow ones
+drained. A reading stream is now allowed what it already holds.
+---
+ transport/internet/splithttp/h2flow.go        |  7 ++-
+ .../internet/splithttp/h2flow_conn_test.go    | 52 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 22ede3b4..4e76b448 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -964,13 +964,16 @@ func (c *flowConn) drop(id uint32) {
+ // yet read under what the streams whose readers return credit may hold, plus
+ // flowConnFloor for the rest. Streams nobody reads thus share Go's 1 MiB, as
+ // they would without the governor, whatever the server's own window, and
+-// slow readers holding their caps leave that room to new streams.
++// slow readers holding their caps leave that room to new streams. A stream
++// that holds more than its cap, because the cap shrank while its reader
++// stalled, is allowed what it holds: its own window lets it send no more, and
++// the excess must not come out of the room the others share.
+ func (c *flowConn) upConnRelease() int64 {
+ 	var reading int64
+ 	for _, s := range c.streams {
+ 		// A finished upload needs no room, even while its response waits.
+ 		if !s.clientDone && s.up.returned > 0 {
+-			reading += int64(s.up.cap)
++			reading += max(int64(s.up.cap), s.upSent-s.up.returned)
+ 		}
+ 	}
+ 	// What the server has not read, from the connection's own counters: it
+diff --git a/transport/internet/splithttp/h2flow_conn_test.go b/transport/internet/splithttp/h2flow_conn_test.go
+index a386f25b..fc73ebac 100644
+--- a/transport/internet/splithttp/h2flow_conn_test.go
++++ b/transport/internet/splithttp/h2flow_conn_test.go
+@@ -122,3 +122,55 @@ func TestFlowNoCreditAtStreamOpen(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowShrunkCapsLeaveConnectionRoom stalls sixteen readers with their
++// streams full and then lets their caps shrink, as they do while a reader
++// stays slow. What those streams already hold is theirs: it must not count
++// against the room other streams share, or a request opened meanwhile gets
++// no connection credit until the slow ones drain.
++func TestFlowShrunkCapsLeaveConnectionRoom(t *testing.T) {
++	h := newFlowHarness(t)
++	h.openStream(4 << 20)
++	credit := connCredit(t, h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 6<<20-h2InitWindow) }))
++	var sent int64
++	for id := uint32(1); id <= 31; id += 2 {
++		if id > 1 {
++			h.fromClient(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x82}, EndHeaders: true})
++			})
++		}
++		h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, 16<<10) })
++		sent += 16 << 10
++		credit += connCredit(t, h.fromServer(func(fr *http2.Framer) {
++			fr.WriteWindowUpdate(id, 16<<10)
++			fr.WriteWindowUpdate(0, 16<<10)
++		}))
++		h.c.mu.Lock()
++		full := int64(h.c.streams[id].up.cap)
++		h.c.mu.Unlock()
++		h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, int(full)) })
++		sent += full
++	}
++	h.c.mu.Lock()
++	for _, s := range h.c.streams {
++		s.up.cap = h2InitWindow
++	}
++	h.c.mu.Unlock()
++
++	// Another request uploads 512 KiB twice; its handler reads each at once.
++	const id, chunk = 33, 512 << 10
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	for range 2 {
++		h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, chunk) })
++		sent += chunk
++		credit += connCredit(t, h.fromServer(func(fr *http2.Framer) {
++			fr.WriteWindowUpdate(id, chunk)
++			fr.WriteWindowUpdate(0, chunk)
++		}))
++	}
++	if room := h2InitWindow + credit - sent; room < flowConnFloor/2 {
++		t.Fatalf("with the slow streams' caps shrunk, %d of connection window is left for the others", room)
++	}
++}
+-- 
+2.52.0.windows.1
+

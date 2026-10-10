@@ -151,6 +151,14 @@ RUN set -eu; \
       || { echo "pipe buffer patch did not apply (features/policy/policy.go)" >&2; exit 1; }; \
     echo "Dispatcher pipe buffer set to ${PIPE_BUFFER_KB} KiB (non-ARM branch)"
 
+# Поднимает golang.org/x/net до XNET_MIN, если в go.mod апстрима версия ниже.
+ARG XNET_MIN=v0.61.0
+RUN set -eu; \
+    cur=$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod); \
+    if [ "$(printf '%s\n%s\n' "$cur" "$XNET_MIN" | sort -V | head -n1)" != "$XNET_MIN" ]; then \
+      go get "golang.org/x/net@${XNET_MIN}"; \
+    fi
+
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
       go mod download && exit 0; \

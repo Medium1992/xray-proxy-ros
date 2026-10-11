@@ -115,7 +115,22 @@ RUN set -eu; \
     echo "XHTTP flow governor: included"
 
 COPY patches/xhttp-mux /patches/xhttp-mux
-RUN set -eu;     case "$XHTTP_MUX" in       off) echo "XHTTP Mux.Cool: off"; exit 0 ;;       required) ;;       *) echo "XHTTP_MUX must be required or off, got '$XHTTP_MUX'" >&2; exit 1 ;;     esac;     [ "$XHTTP_FLOW" = required ]       || { echo "XHTTP_MUX=required needs XHTTP_FLOW=required" >&2; exit 1; };     for p in /patches/xhttp-mux/*.patch; do       git apply "$p"         || { echo "XHTTP Mux.Cool patch $(basename "$p") no longer applies" >&2; exit 1; };     done;     grep -q 'MuxKeepAliveSecs' infra/conf/transport_method.go       && grep -q 'KeepAlive' common/mux/server.go       || { echo "XHTTP Mux.Cool hooks are missing after patching" >&2; exit 1; };     echo "XHTTP Mux.Cool: included"
+RUN set -eu; \
+    case "$XHTTP_MUX" in \
+      off) echo "XHTTP Mux.Cool: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "XHTTP_MUX must be required or off, got '$XHTTP_MUX'" >&2; exit 1 ;; \
+    esac; \
+    [ "$XHTTP_FLOW" = required ] \
+      || { echo "XHTTP_MUX=required needs XHTTP_FLOW=required" >&2; exit 1; }; \
+    for p in /patches/xhttp-mux/*.patch; do \
+      git apply "$p" \
+        || { echo "XHTTP Mux.Cool patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'MuxKeepAliveSecs' infra/conf/transport_method.go \
+      && grep -q 'KeepAlive' common/mux/server.go \
+      || { echo "XHTTP Mux.Cool hooks are missing after patching" >&2; exit 1; }; \
+    echo "XHTTP Mux.Cool: included"
 
 # Единственное место, по которому панель может увидеть, что ядро не
 # официальное. Version_x/y/z объявлены как byte, поэтому -X до них не

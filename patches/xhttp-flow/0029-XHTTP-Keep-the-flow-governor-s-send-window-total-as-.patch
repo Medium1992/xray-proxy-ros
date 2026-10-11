@@ -1,0 +1,809 @@
+From b1c0f904390177aec9530c3bd25969fb99bdb31f Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 03:33:01 +0300
+Subject: [PATCH] XHTTP: Keep the flow governor's send window total as
+ counters, let the guard lift it
+
+downRelease walked every stream of the connection for each stream it looked
+at, so one SETTINGS frame cost the square of the open streams, on a path an
+unauthenticated client reaches. What the client holds is now kept as three
+counters that change with the streams.
+
+A client that returns credit only once half of its window is read never got
+that half at the limit, and the guard handed out nothing: the downloads
+stopped for good. The guard now lifts the limit on a connection whose client
+has returned nothing in small steps.
+
+The limit covers the streams the server has not finished; the comments said
+"in all". The clock skip in the PING check is taken out again: it had no
+measurement of its own, and it let a PING that was due wait.
+---
+ infra/conf/transport_method.go                |   2 +-
+ transport/internet/splithttp/config.pb.go     |   6 +-
+ transport/internet/splithttp/config.proto     |   6 +-
+ transport/internet/splithttp/h2flow.go        | 119 +++++++-----
+ .../internet/splithttp/h2flow_client_test.go  | 106 ++++++++++-
+ .../internet/splithttp/h2flow_ping_test.go    |  23 ---
+ .../splithttp/h2flow_sendwindow_test.go       | 179 +++++++++++++++++-
+ transport/internet/splithttp/h2flow_test.go   |   3 +
+ .../internet/splithttp/h2flow_transport.go    |   7 +-
+ .../splithttp/h2flow_verify_harness_test.go   |  23 +++
+ 10 files changed, 385 insertions(+), 89 deletions(-)
+
+diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
+index 2592ee51..753ec7c3 100644
+--- a/infra/conf/transport_method.go
++++ b/infra/conf/transport_method.go
+@@ -303,7 +303,7 @@ type SplitHTTPConfig struct {
+ // "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
+ // receive windows are what this side grants for data it receives.
+ // "maxConnectionSendWindow" is what a governed server lets one connection's
+-// client hold of its data in all; -1 lifts that limit.
++// client hold of its data on unfinished streams; -1 lifts that limit.
+ type H2FlowConfig struct {
+ 	Enabled                    *bool `json:"enabled"`
+ 	MaxStreamReceiveWindow     int32 `json:"maxStreamReceiveWindow"`
+diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
+index 667faac9..a0e0e9be 100644
+--- a/transport/internet/splithttp/config.pb.go
++++ b/transport/internet/splithttp/config.pb.go
+@@ -83,9 +83,9 @@ type H2FlowConfig struct {
+ 	// 0 keeps the default.
+ 	MaxStreamReceiveWindow     int32 `protobuf:"varint,2,opt,name=maxStreamReceiveWindow,proto3" json:"maxStreamReceiveWindow,omitempty"`
+ 	MaxConnectionReceiveWindow int32 `protobuf:"varint,3,opt,name=maxConnectionReceiveWindow,proto3" json:"maxConnectionReceiveWindow,omitempty"`
+-	// What one connection's client may hold of this server's data in all:
+-	// unread data plus unused window, over every stream. 0 keeps the default,
+-	// -1 lifts the limit.
++	// What one connection's client may hold of this server's data: unread
++	// data plus unused window, over the streams the server has not finished.
++	// 0 keeps the default, -1 lifts the limit.
+ 	MaxConnectionSendWindow int32 `protobuf:"varint,4,opt,name=maxConnectionSendWindow,proto3" json:"maxConnectionSendWindow,omitempty"`
+ 	unknownFields           protoimpl.UnknownFields
+ 	sizeCache               protoimpl.SizeCache
+diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
+index dc8ce919..52dd771d 100644
+--- a/transport/internet/splithttp/config.proto
++++ b/transport/internet/splithttp/config.proto
+@@ -21,9 +21,9 @@ message H2FlowConfig {
+   // 0 keeps the default.
+   int32 maxStreamReceiveWindow = 2;
+   int32 maxConnectionReceiveWindow = 3;
+-  // What one connection's client may hold of this server's data in all:
+-  // unread data plus unused window, over every stream. 0 keeps the default,
+-  // -1 lifts the limit.
++  // What one connection's client may hold of this server's data: unread
++  // data plus unused window, over the streams the server has not finished.
++  // 0 keeps the default, -1 lifts the limit.
+   int32 maxConnectionSendWindow = 4;
+ }
+ 
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index d379138b..f27bd641 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -71,11 +71,8 @@ const (
+ 	// flowQuantumMax where the sender is not about to run dry, see hold. The
+ 	// larger stays under flowSmallCredit, so a governor at the other end
+ 	// still sees a peer that credits in small steps.
+-	flowQuantumMin = 16 << 10
+-	flowQuantumMax = 32 << 10
+-	// flowPingRecheck is how many frame boundaries pass between looks at
+-	// the clock on a connection that needs no PING.
+-	flowPingRecheck = 64
++	flowQuantumMin  = 16 << 10
++	flowQuantumMax  = 32 << 10
+ 	flowShrinkAfter = 3
+ 	flowKernelEvery = 20 * time.Millisecond
+ 	flowQueueHold   = 15 * time.Millisecond
+@@ -132,7 +129,7 @@ type flowListener struct {
+ 	up, down flowLimit
+ 	// connWindow is the connection receive window the local server grants.
+ 	connWindow int32
+-	// sendWindow is what one connection's client may hold in all, 0 for no
++	// sendWindow is what one connection's client may hold, 0 for no
+ 	// limit, see flowConn.downRelease.
+ 	sendWindow int64
+ }
+@@ -569,7 +566,6 @@ type flowConn struct {
+ 	wpending     atomic.Bool
+ 	settingsSent bool
+ 	pingReady    bool
+-	pingSkip     int
+ 	closed       bool
+ 	broken       bool
+ 
+@@ -585,9 +581,14 @@ type flowConn struct {
+ 	upConnGrant      int64
+ 	upConnGrantKnown bool
+ 
+-	// sendWindow is what this connection's client may hold in all, 0 for no
+-	// limit, see downRelease.
+-	sendWindow int64
++	// sendWindow is what this connection's client may hold, 0 for no
++	// limit, see downRelease. The counters under it say what it holds now,
++	// see clientHolds: over the streams the server has not finished, how many
++	// there are, what the server was forwarded and what the client returned.
++	sendWindow        int64
++	downOpen          int64
++	downOpenForwarded int64
++	downOpenReturned  int64
+ 
+ 	tcp   syscall.RawConn
+ 	kstat tcpStats
+@@ -793,6 +794,7 @@ func (c *flowConn) release() {
+ 
+ func (c *flowConn) releaseLocked() {
+ 	c.streams = map[uint32]*flowStream{}
++	c.downOpen, c.downOpenForwarded, c.downOpenReturned = 0, 0, 0
+ 	c.opened = nil
+ 	c.wqueue = nil
+ 	clear(c.wcredit)
+@@ -982,10 +984,43 @@ func (c *flowConn) finish(id uint32, s *flowStream) {
+ }
+ 
+ func (c *flowConn) drop(id uint32) {
++	if s := c.streams[id]; s != nil {
++		c.endDown(s)
++	}
+ 	delete(c.streams, id)
+ 	delete(c.wcredit, id)
+ }
+ 
++// endDown takes s out of what the server may still send: it has finished the
++// stream, or the stream is gone.
++func (c *flowConn) endDown(s *flowStream) {
++	if s.serverDone {
++		return
++	}
++	s.serverDone = true
++	c.downOpen--
++	c.downOpenForwarded -= s.downForwarded
++	c.downOpenReturned -= s.down.returned
++}
++
++// forwardDown hands the server rel of credit on s.
++func (c *flowConn) forwardDown(s *flowStream, rel int64) {
++	s.downForwarded += rel
++	if !s.serverDone {
++		c.downOpenForwarded += rel
++	}
++}
++
++// clientHolds is what the connection's client holds of the server's data on
++// the streams the server has not finished, as the server may still send it:
++// data the client has not returned stream credit for, and the window left.
++// A stream the server has ended is not in it, read or not: a Go client
++// returns the last of such a body through the connection only, so its stream
++// credit would never tell.
++func (c *flowConn) clientHolds() int64 {
++	return c.downOpen*int64(c.clientShown) + c.downOpenForwarded - c.downOpenReturned
++}
++
+ // upConnRelease is how much connection credit the client may be given: no
+ // more than the server granted, and no more than keeps the data sent and not
+ // yet read under what the streams whose readers return credit may hold, plus
+@@ -1078,22 +1113,8 @@ func (c *flowConn) sampleRTT(now time.Time, sample time.Duration) {
+ // connection learns the round trip of the empty path. Once the kernel vouches
+ // for that round trip, no more are needed.
+ func (c *flowConn) appendPing(out []byte) []byte {
+-	if !c.pingReady {
+-		return out
+-	}
+-	// This runs at every frame boundary. Where the kernel vouches for the
+-	// path no PING is due, so the clock is read only now and then, to see
+-	// that it still does.
+-	if c.pingSkip > 0 {
+-		c.pingSkip--
+-		return out
+-	}
+ 	now := time.Now()
+-	if c.modelled(now) {
+-		c.pingSkip = flowPingRecheck
+-		return out
+-	}
+-	if (len(c.streams) == 0 && c.rttBase != 0) || now.Sub(c.lastPing) < flowPingInterval ||
++	if !c.pingReady || (len(c.streams) == 0 && c.rttBase != 0) || c.modelled(now) || now.Sub(c.lastPing) < flowPingInterval ||
+ 		(!c.pingSentAt.IsZero() && now.Sub(c.pingSentAt) < flowPingTimeout) {
+ 		return out
+ 	}
+@@ -1215,10 +1236,17 @@ func (c *flowConn) unstick(now time.Time, out []byte) []byte {
+ 			again = true
+ 			continue
+ 		}
++		// A client that waits for half of its window never gets it on a
++		// connection at its limit, where the streams share less than that
++		// each. This one has returned nothing in small steps, so it may be
++		// such a client: the limit cannot hold for it.
++		if !c.incremental {
++			c.sendWindow = 0
++		}
+ 		s.down.cap = int32(min(int64(c.down.max), max(2*int64(s.down.cap), int64(c.clientInit)/2+flowSmallCredit)))
+ 		s.down.waiting = time.Time{}
+ 		if rel := c.downRelease(s); rel > 0 {
+-			s.downForwarded += rel
++			c.forwardDown(s, rel)
+ 			out = appendWindowUpdate(out, id, rel)
+ 		}
+ 	}
+@@ -1240,16 +1268,15 @@ func (c *flowConn) upRelease(s *flowStream) int64 {
+ // downRelease is how much credit the server may be given on s: no more than
+ // the client granted, and no more than keeps the client's unread data under cap.
+ //
+-// On a server the streams of one connection also share sendWindow. A cap
+-// follows its own reader, but many streams starting at once on a fast link
+-// each look fast for a moment, and the client has to hold their sum: twenty
+-// of them took a client past 40 MiB within a second. What the client holds is
+-// counted as the server may still send it: unread data and unused window. A
+-// client that itself grants one stream more than sendWindow has that room, so
+-// its own window is the limit then; that is how a bridge with raised windows
+-// differs from a phone on the same inbound. A stream always has the
+-// protocol's default window, which SETTINGS already gave it, so none waits
+-// for the others; streams opened once the limit is used up add that much each.
++// On a server the unfinished streams of one connection also share
++// sendWindow. A cap follows its own reader, but many streams starting at once
++// on a fast link each look fast for a moment, and the client has to hold
++// their sum: twenty of them took a client past 40 MiB within a second. What
++// the client holds of them is clientHolds. A client that itself announces a
++// stream window above sendWindow has that room, so its window is the limit
++// then. A stream always has the protocol's default window, which SETTINGS
++// already gave it, so none waits for the others; streams opened once the
++// limit is used up add that much each.
+ func (c *flowConn) downRelease(s *flowStream) int64 {
+ 	bank := int64(c.clientInit) + s.down.returned - int64(c.clientShown) - s.downForwarded
+ 	held := int64(c.clientShown) + s.downForwarded - s.down.returned
+@@ -1257,14 +1284,8 @@ func (c *flowConn) downRelease(s *flowStream) int64 {
+ 	if rel <= 0 || c.client || c.sendWindow == 0 {
+ 		return rel
+ 	}
+-	total := int64(0)
+-	for _, o := range c.streams {
+-		if !o.serverDone {
+-			total += int64(c.clientShown) + o.downForwarded - o.down.returned
+-		}
+-	}
+ 	limit := max(c.sendWindow, int64(c.clientInit))
+-	return min(rel, max(limit-total, h2InitWindow-held))
++	return min(rel, max(limit-c.clientHolds(), h2InitWindow-held))
+ }
+ 
+ func appendWindowUpdate(out []byte, stream uint32, n int64) []byte {
+@@ -1358,6 +1379,7 @@ func (r *flowReader) frame(f h2Frame) {
+ 			s.up.cap = max(c.upLearned.value(now, c.up.init), flowStartWindow)
+ 			s.down.cap = max(c.downLearned.value(now, c.down.init), flowStartWindow)
+ 			c.streams[f.stream] = s
++			c.downOpen++
+ 			c.opened = append(c.opened, f.stream)
+ 		}
+ 		if s != nil && f.flags&h2FlagEndStream != 0 {
+@@ -1400,7 +1422,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 						continue
+ 					}
+ 					if rel := c.downRelease(s); rel > 0 {
+-						s.downForwarded += rel
++						c.forwardDown(s, rel)
+ 						out = appendWindowUpdate(out, id, rel)
+ 					}
+ 				}
+@@ -1422,6 +1444,9 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		}
+ 		now := time.Now()
+ 		s.down.returned += inc
++		if !s.serverDone {
++			c.downOpenReturned += inc
++		}
+ 		s.down.waiting = time.Time{}
+ 		if inc < flowSmallCredit {
+ 			c.incremental = true
+@@ -1463,7 +1488,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if rel <= 0 || hold(rel, int64(c.clientShown)+s.downForwarded-s.downSent, quantum(s.down.cap)) {
+ 			return out
+ 		}
+-		s.downForwarded += rel
++		c.forwardDown(s, rel)
+ 		return appendWindowUpdate(out, f.stream, rel)
+ 	}
+ 	out = append(out, header...)
+@@ -1479,7 +1504,7 @@ func (r *flowReader) boundary(out []byte) []byte {
+ 		}
+ 		if c.down.enabled() {
+ 			if rel := c.downRelease(s); rel > 0 {
+-				s.downForwarded += rel
++				c.forwardDown(s, rel)
+ 				out = appendWindowUpdate(out, id, rel)
+ 			}
+ 		}
+@@ -1516,7 +1541,7 @@ func (w *flowWriter) frame(f h2Frame) {
+ 		fallthrough
+ 	case h2Headers:
+ 		if s != nil && f.flags&h2FlagEndStream != 0 {
+-			s.serverDone = true
++			c.endDown(s)
+ 			c.finish(f.stream, s)
+ 		}
+ 	case h2RSTStream:
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index 2bc7eb59..bc3f3003 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -7,6 +7,7 @@ import (
+ 	gotls "crypto/tls"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	mrand "math/rand/v2"
+ 	"net"
+ 	"net/http"
+@@ -300,9 +301,47 @@ func TestFlowClientStreamStateReleased(t *testing.T) {
+ // stops and starts, so the caps shrink at both ends while each holds credit
+ // back. Every download must still complete: with the client showing more than
+ // the lowest cap (see flowShownDown) the two governors wait for each other.
++// It runs without the server's send window and with the default one.
+ func TestFlowChainedGovernorsSlowReaders(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		sendWindow int64
++	}{{"no send window", 0}, {"default send window", flowServerSendWindow}} {
++		t.Run(tc.name, func(t *testing.T) { chainedSlowReaders(t, tc.sendWindow) })
++	}
++}
++
++// lowestDownCap is the smallest download cap among the streams of conns.
++func lowestDownCap(conns []*flowConn) int32 {
++	lowest := int32(math.MaxInt32)
++	for _, c := range conns {
++		c.mu.Lock()
++		for _, s := range c.streams {
++			lowest = min(lowest, s.down.cap)
++		}
++		c.mu.Unlock()
++	}
++	return lowest
++}
++
++// logDownState writes what each stream of conns holds, for a download that
++// has stopped.
++func logDownState(t *testing.T, end string, conns []*flowConn) {
++	for n, c := range conns {
++		c.mu.Lock()
++		t.Logf("%s connection %d: client window %d shown %d, incremental %v, send window %d, client holds %d, %d streams",
++			end, n, c.clientInit, c.clientShown, c.incremental, c.sendWindow, c.clientHolds(), len(c.streams))
++		for id, s := range c.streams {
++			t.Logf("  stream %d: cap %d, sent %d, forwarded %d, returned %d, server done %v, waiting %v",
++				id, s.down.cap, s.downSent, s.downForwarded, s.down.returned, s.serverDone, !s.down.waiting.IsZero())
++		}
++		c.mu.Unlock()
++	}
++}
++
++func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 	const size = 3 << 20
+-	_, addr := startFlowServer(t, testUp, testDown, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	tl, addr := startFlowServer(t, testUp, testDown, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		buf := make([]byte, 16<<10)
+ 		for left := size; left > 0; left -= len(buf) {
+ 			if _, err := w.Write(buf); err != nil {
+@@ -310,15 +349,54 @@ func TestFlowChainedGovernorsSlowReaders(t *testing.T) {
+ 			}
+ 		}
+ 	}))
++	tl.mu.Lock()
++	tl.sendWindow = sendWindow
++	tl.mu.Unlock()
+ 	client := newFlowTestClient(addr, true)
++	serverConns := func() []*flowConn {
++		tl.mu.Lock()
++		defer tl.mu.Unlock()
++		return append([]*flowConn(nil), tl.conns...)
++	}
++	clientConns := func() []*flowConn {
++		client.mu.Lock()
++		defer client.mu.Unlock()
++		return append([]*flowConn(nil), client.conns...)
++	}
++
++	// The pauses of each reader come from the seed, so a failing pacing can
++	// be run again.
++	seed := uint64(time.Now().UnixNano())
++	t.Logf("seed %d", seed)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+ 	defer cancel()
++
++	// Watch the caps: the test means nothing unless they shrink at both ends.
++	lowServer, lowClient := int32(math.MaxInt32), int32(math.MaxInt32)
++	watched := make(chan struct{})
++	stop := make(chan struct{})
++	go func() {
++		defer close(watched)
++		tick := time.NewTicker(2 * time.Millisecond)
++		defer tick.Stop()
++		for {
++			select {
++			case <-stop:
++				return
++			case <-tick.C:
++				lowServer = min(lowServer, lowestDownCap(serverConns()))
++				lowClient = min(lowClient, lowestDownCap(clientConns()))
++			}
++		}
++	}()
++
+ 	var wg sync.WaitGroup
+ 	errs := make(chan error, 12)
+ 	for i := 0; i < 12; i++ {
+ 		wg.Add(1)
+ 		go func() {
+ 			defer wg.Done()
++			rng := mrand.New(mrand.NewPCG(seed, uint64(i)))
+ 			req, _ := http.NewRequestWithContext(ctx, "GET", "http://x/down", nil)
+ 			resp, err := client.Do(req)
+ 			if err != nil {
+@@ -335,22 +413,36 @@ func TestFlowChainedGovernorsSlowReaders(t *testing.T) {
+ 					break
+ 				}
+ 				if err != nil {
+-					errs <- fmt.Errorf("after %d of %d bytes: %w", got, size, err)
++					errs <- fmt.Errorf("download %d after %d of %d bytes: %w", i, got, size, err)
+ 					return
+ 				}
+-				// Stop and start for the first two thirds, at random.
+-				if got < size*2/3 && mrand.IntN(8) == 0 {
+-					time.Sleep(time.Duration(mrand.IntN(60)) * time.Millisecond)
++				// Stop and start for the first two thirds.
++				if got < size*2/3 && rng.IntN(8) == 0 {
++					time.Sleep(time.Duration(rng.IntN(60)) * time.Millisecond)
+ 				}
+ 			}
+ 			if got != size {
+-				errs <- fmt.Errorf("read %d bytes, want %d", got, size)
++				errs <- fmt.Errorf("download %d read %d bytes, want %d", i, got, size)
+ 			}
+ 		}()
+ 	}
+ 	wg.Wait()
++	close(stop)
++	<-watched
+ 	close(errs)
++	failed := false
+ 	for err := range errs {
+-		t.Fatal(err)
++		t.Error(err)
++		failed = true
++	}
++	if failed {
++		logDownState(t, "server", serverConns())
++		logDownState(t, "client", clientConns())
++		t.FailNow()
++	}
++	if lowServer >= flowStartWindow || lowClient >= flowStartWindow {
++		t.Fatalf("lowest cap seen: server %d, client %d; both must fall under the starting %d for the two governors to hold credit at once",
++			lowServer, lowClient, flowStartWindow)
+ 	}
++	t.Logf("lowest cap seen: server %d, client %d", lowServer, lowClient)
+ }
+diff --git a/transport/internet/splithttp/h2flow_ping_test.go b/transport/internet/splithttp/h2flow_ping_test.go
+index 531de2d1..29ae4103 100644
+--- a/transport/internet/splithttp/h2flow_ping_test.go
++++ b/transport/internet/splithttp/h2flow_ping_test.go
+@@ -146,26 +146,3 @@ func TestFlowFloorConfirmed(t *testing.T) {
+ 		}
+ 	}
+ }
+-
+-// TestFlowPingClockRecheck runs the PING check of a frame boundary on a path
+-// the kernel vouches for: it reads the clock once and leaves the next
+-// flowPingRecheck boundaries alone. When the kernel's view is lost meanwhile,
+-// the PING goes out at the first boundary after those.
+-func TestFlowPingClockRecheck(t *testing.T) {
+-	ms := time.Millisecond
+-	c := &flowConn{pingReady: true, rttBase: 50 * ms, streams: map[uint32]*flowStream{1: {}}}
+-	c.tcp, c.kAt, c.kOK = fakeRawConn{}, time.Now(), true
+-	c.kstat = tcpStats{rtt: 50 * ms, minRTT: 50 * ms}
+-	if out := c.appendPing(nil); len(out) != 0 || c.pingSkip != flowPingRecheck {
+-		t.Fatalf("modelled path: %d bytes written, %d boundaries to skip, want 0 and %d", len(out), c.pingSkip, flowPingRecheck)
+-	}
+-	c.tcp = nil
+-	for i := 0; i < flowPingRecheck; i++ {
+-		if out := c.appendPing(nil); len(out) != 0 {
+-			t.Fatalf("PING at boundary %d of the %d to skip", i+1, flowPingRecheck)
+-		}
+-	}
+-	if out := c.appendPing(nil); len(out) == 0 {
+-		t.Fatal("no PING once the skipped boundaries had passed")
+-	}
+-}
+diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
+index 8088e3ee..7b0a6d7a 100644
+--- a/transport/internet/splithttp/h2flow_sendwindow_test.go
++++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
+@@ -1,7 +1,12 @@
+ package splithttp
+ 
+ import (
++	"errors"
++	"fmt"
++	"math"
++	"os"
+ 	"testing"
++	"time"
+ 
+ 	"golang.org/x/net/http2"
+ )
+@@ -81,8 +86,8 @@ func TestFlowSendWindowFollowsClientWindow(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowSendWindowIsReturned fills the limit, lets the client read one
+-// stream, and checks that a stream held to the default window then gets more.
++// TestFlowSendWindowIsReturned fills the limit, lets the client read eight
++// streams, and checks that a stream held to the default window then gets more.
+ func TestFlowSendWindowIsReturned(t *testing.T) {
+ 	const n = 40
+ 	h := openStreams(t, flowServerSendWindow, 4<<20, n)
+@@ -107,6 +112,176 @@ func TestFlowSendWindowIsReturned(t *testing.T) {
+ 	}
+ }
+ 
++// TestFlowSendWindowLeavesFinishedDownloadsOut fixes what the limit does not
++// cover. Sixteen downloads are sent all they may and ended, and the client
++// reads nothing; the next sixteen get the whole limit again. The limit is on
++// the streams the server has not finished: an ended one cannot be followed,
++// see clientHolds.
++func TestFlowSendWindowLeavesFinishedDownloadsOut(t *testing.T) {
++	h := openStreams(t, flowServerSendWindow, 4<<20, 0)
++	next := uint32(1)
++	round := func() (sent int64) {
++		var ids []uint32
++		for i := 0; i < 16; i++ {
++			id := next
++			next += 2
++			ids = append(ids, id)
++			h.fromClient(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x82}, EndHeaders: true, EndStream: true})
++			})
++		}
++		for _, id := range ids {
++			w := h.toServer.streams[id]
++			h.fromServer(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x88}, EndHeaders: true})
++				writeDataSplit(fr, id, int(w))
++				fr.WriteData(id, true, nil)
++			})
++			sent += w
++		}
++		return sent
++	}
++	for n := 1; n <= 2; n++ {
++		if sent := round(); sent != flowServerSendWindow {
++			t.Fatalf("round %d: sixteen downloads were sent %d, want the limit %d", n, sent, flowServerSendWindow)
++		}
++	}
++}
++
++// stuckAtLimit opens twenty downloads on a connection with the default limit,
++// lets the server use all its window and runs the guard as if every stream
++// had waited it out. With creditFirst the client returns 4 KiB before that.
++func stuckAtLimit(t *testing.T, creditFirst bool) *flowHarness {
++	t.Helper()
++	h := openStreams(t, flowServerSendWindow, 4<<20, 20)
++	t.Cleanup(func() { h.c.Close() })
++	for id := uint32(1); id < 40; id += 2 {
++		n := h.toServer.streams[id]
++		h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, id, int(n)) })
++		h.toServer.streams[id] -= n
++	}
++	if creditFirst {
++		h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, 4<<10) })
++	}
++	h.c.mu.Lock()
++	if h.c.guard != nil {
++		h.c.guard.Stop()
++	}
++	out := h.c.unstick(time.Now().Add(time.Hour), nil)
++	h.c.mu.Unlock()
++	h.toServer.receive(t, out)
++	return h
++}
++
++// TestFlowGuardLiftsSendWindow has a client that returns no credit until half
++// of its window is read. At the limit twenty streams share 4 MiB and none
++// reaches that half, so the client would never credit and the downloads would
++// stop for good. The guard lifts the limit on such a connection.
++func TestFlowGuardLiftsSendWindow(t *testing.T) {
++	h := stuckAtLimit(t, false)
++	if h.c.sendWindow != 0 {
++		t.Fatalf("the guard left the limit at %d on a client that has returned no credit", h.c.sendWindow)
++	}
++	for id, w := range h.toServer.streams {
++		if all := h.c.streams[id].downSent + w; all < 2<<20 {
++			t.Fatalf("stream %d may be sent %d in all, under half of the client's window: it will never credit", id, all)
++		}
++	}
++}
++
++// TestFlowGuardKeepsSendWindow is the same connection once the client has
++// returned 4 KiB: it credits as it reads, so it cannot be stuck for want of
++// its half, and the limit stays.
++func TestFlowGuardKeepsSendWindow(t *testing.T) {
++	h := stuckAtLimit(t, true)
++	if h.c.sendWindow != flowServerSendWindow {
++		t.Fatalf("the limit is %d after the guard, want %d", h.c.sendWindow, flowServerSendWindow)
++	}
++	total := int64(0)
++	for _, w := range h.toServer.streams {
++		total += w
++	}
++	if total > 8<<10 {
++		t.Fatalf("the guard handed out %d on a connection at its limit", total)
++	}
++}
++
++// feedFrames passes frame from the client through the governor n times.
++func feedFrames(tb testing.TB, h *flowHarness, frame []byte, n int) {
++	buf := make([]byte, 64<<10)
++	for i := 0; i < n; i++ {
++		h.conn.feed(frame)
++		for {
++			if _, err := h.c.Read(buf); err != nil {
++				if !errors.Is(err, os.ErrDeadlineExceeded) {
++					tb.Fatal(err)
++				}
++				break
++			}
++		}
++		h.conn.take()
++	}
++}
++
++// TestFlowSendWindowSettingsCost times SETTINGS frames on connections with
++// two hundred and two thousand streams past the limit. A SETTINGS frame looks
++// at every stream once, so ten times the streams may cost ten times as much;
++// when each look walked all the streams again it cost a hundred times.
++func TestFlowSendWindowSettingsCost(t *testing.T) {
++	settings := frames(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})
++	cost := func(streams int) time.Duration {
++		h := openStreams(t, flowServerSendWindow, 4<<20, streams)
++		best := time.Duration(math.MaxInt64)
++		for try := 0; try < 5; try++ {
++			start := time.Now()
++			feedFrames(t, h, settings, 50)
++			best = min(best, time.Since(start))
++		}
++		return best
++	}
++	few, many := cost(200), cost(2000)
++	t.Logf("50 SETTINGS frames: %v with 200 streams, %v with 2000", few, many)
++	if many > 40*few {
++		t.Fatalf("ten times the streams made a SETTINGS frame %d times dearer", many/few)
++	}
++}
++
++// BenchmarkFlowClientFrame is the cost of one frame from the client on a
++// server connection with many streams open, with and without the limit.
++func BenchmarkFlowClientFrame(b *testing.B) {
++	for _, kind := range []string{"settings", "windowupdate"} {
++		for _, n := range []int{100, 1000} {
++			for _, sendWindow := range []int64{0, flowServerSendWindow} {
++				b.Run(fmt.Sprintf("%s/streams=%d/sendWindow=%d", kind, n, sendWindow), func(b *testing.B) {
++					sc := &scriptConn{}
++					h := &flowHarness{t: b, conn: sc, c: newFlowConn(sc, flowDefault, flowDefault)}
++					h.fromClientRaw([]byte(h2Preface))
++					h.c.sendWindow = sendWindow
++					h.fromClient(func(fr *http2.Framer) {
++						fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++					})
++					for i := 0; i < n; i++ {
++						h.fromClient(func(fr *http2.Framer) {
++							fr.WriteHeaders(http2.HeadersFrameParam{StreamID: uint32(2*i + 1), BlockFragment: []byte{0x82}, EndHeaders: true})
++						})
++					}
++					frame := frames(func(fr *http2.Framer) {
++						if kind == "settings" {
++							fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++						} else {
++							fr.WriteWindowUpdate(uint32(2*n-1), 1)
++						}
++					})
++					b.ResetTimer()
++					feedFrames(b, h, frame, b.N)
++				})
++			}
++		}
++	}
++}
++
+ // TestH2SendWindow checks what "maxConnectionSendWindow" means.
+ func TestH2SendWindow(t *testing.T) {
+ 	for _, tc := range []struct {
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index 53d851a1..3d9b8f31 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -92,6 +92,8 @@ type testListener struct {
+ 	conns []*flowConn
+ 	up    flowLimit
+ 	down  flowLimit
++	// sendWindow is given to the connections accepted from now on.
++	sendWindow int64
+ }
+ 
+ func (l *testListener) Accept() (net.Conn, error) {
+@@ -107,6 +109,7 @@ func (l *testListener) Accept() (net.Conn, error) {
+ 	}
+ 	fc := newFlowConn(c, l.up, l.down)
+ 	l.mu.Lock()
++	fc.sendWindow = l.sendWindow
+ 	l.conns = append(l.conns, fc)
+ 	l.mu.Unlock()
+ 	return fc, nil
+diff --git a/transport/internet/splithttp/h2flow_transport.go b/transport/internet/splithttp/h2flow_transport.go
+index 8adcc3aa..afb2d84f 100644
+--- a/transport/internet/splithttp/h2flow_transport.go
++++ b/transport/internet/splithttp/h2flow_transport.go
+@@ -25,14 +25,15 @@ func (c *Config) h2FlowOn() bool {
+ }
+ 
+ // flowServerSendWindow is what a governed server lets one connection's client
+-// hold of its data unless configured otherwise: the window a Go client grants
++// hold of its data on unfinished streams unless configured otherwise: the window a Go client grants
+ // one stream. A client under a memory limit, such as a phone's network
+ // extension, holds a few connections of that and stays within tens of MiB.
+ const flowServerSendWindow = 4 << 20
+ 
+ // h2SendWindow returns what one connection's client may hold of a governed
+-// server's data, 0 for no limit: "h2Flow.maxConnectionSendWindow", where -1
+-// lifts the limit and unset means flowServerSendWindow.
++// server's data on unfinished streams, 0 for no limit:
++// "h2Flow.maxConnectionSendWindow", where -1 lifts the limit and unset means
++// flowServerSendWindow.
+ func (c *Config) h2SendWindow() int64 {
+ 	switch w := c.GetH2Flow().GetMaxConnectionSendWindow(); {
+ 	case w < 0:
+diff --git a/transport/internet/splithttp/h2flow_verify_harness_test.go b/transport/internet/splithttp/h2flow_verify_harness_test.go
+index af91f6ae..d5dc8d89 100644
+--- a/transport/internet/splithttp/h2flow_verify_harness_test.go
++++ b/transport/internet/splithttp/h2flow_verify_harness_test.go
+@@ -137,9 +137,31 @@ func (h *flowHarness) fromClientRaw(b []byte) []byte {
+ 	if h.toServer != nil {
+ 		h.toServer.receive(h.t, got)
+ 	}
++	h.checkHolds()
+ 	return got
+ }
+ 
++// checkHolds compares the counters behind clientHolds, which are kept as the
++// streams change, with a walk over the streams.
++func (h *flowHarness) checkHolds() {
++	h.t.Helper()
++	c := h.c
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	var open, forwarded, returned int64
++	for _, s := range c.streams {
++		if !s.serverDone {
++			open++
++			forwarded += s.downForwarded
++			returned += s.down.returned
++		}
++	}
++	if open != c.downOpen || forwarded != c.downOpenForwarded || returned != c.downOpenReturned {
++		h.t.Fatalf("unfinished streams: %d forwarded %d returned %d, the connection counts %d forwarded %d returned %d",
++			open, forwarded, returned, c.downOpen, c.downOpenForwarded, c.downOpenReturned)
++	}
++}
++
+ func (h *flowHarness) fromClient(f func(fr *http2.Framer)) []byte {
+ 	return h.fromClientRaw(frames(f))
+ }
+@@ -153,6 +175,7 @@ func (h *flowHarness) fromServerRaw(b []byte) ([]byte, error) {
+ 	if h.toClient != nil {
+ 		h.toClient.receive(h.t, got)
+ 	}
++	h.checkHolds()
+ 	return got, err
+ }
+ 
+-- 
+2.52.0.windows.1
+

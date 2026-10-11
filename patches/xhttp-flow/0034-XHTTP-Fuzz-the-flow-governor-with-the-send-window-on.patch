@@ -1,0 +1,218 @@
+From ca5049f21245722c034841f1a3cb4bd8b42386ae Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:27:45 +0300
+Subject: [PATCH 34/35] XHTTP: Fuzz the flow governor with the send window on,
+ pin upload quanta
+
+---
+ .../internet/splithttp/h2flow_fuzz_test.go    | 71 +++++++++++--------
+ .../internet/splithttp/h2flow_hold_test.go    | 50 +++++++++++++
+ .../splithttp/h2flow_verify_harness_test.go   | 13 +++-
+ 3 files changed, 102 insertions(+), 32 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow_fuzz_test.go b/transport/internet/splithttp/h2flow_fuzz_test.go
+index 1b7e053e..a0fb67b3 100644
+--- a/transport/internet/splithttp/h2flow_fuzz_test.go
++++ b/transport/internet/splithttp/h2flow_fuzz_test.go
+@@ -27,38 +27,45 @@ func FuzzFlowConn(f *testing.F) {
+ 	f.Add([]byte{0xff, 0xff, 0xff, 1, 0xff, 0x7f, 0xff, 0xff, 0xff}, []byte{0, 0, 4, 8, 0, 0, 0, 0, 3, 0, 0, 0, 0}, uint8(3))
+ 
+ 	f.Fuzz(func(t *testing.T, fromClient, fromServer []byte, cut uint8) {
+-		capture := &captureConn{}
+-		c := newFlowConn(capture, testUp, testDown)
+-		c.rtt = 1
+-		step := int(cut%16) + 1
+-		out := c.readFrames([]byte(h2Preface), nil)
+-		for in := fromClient; len(in) > 0; {
+-			n := min(step, len(in))
+-			out = c.readFrames(append([]byte(nil), in[:n]...), out)
+-			in = in[n:]
+-		}
+-		for in := fromServer; len(in) > 0; {
+-			n := min(step, len(in))
+-			if _, err := c.Write(in[:n]); err != nil {
+-				t.Fatal(err)
++		// The same input with the send window off and at its default.
++		for _, sendWindow := range []int64{0, flowServerSendWindow} {
++			capture := &captureConn{}
++			c := newFlowConn(capture, testUp, testDown)
++			c.sendWindow = sendWindow
++			c.rtt = 1
++			step := int(cut%16) + 1
++			out := c.readFrames([]byte(h2Preface), nil)
++			for in := fromClient; len(in) > 0; {
++				n := min(step, len(in))
++				out = c.readFrames(append([]byte(nil), in[:n]...), out)
++				in = in[n:]
+ 			}
+-			in = in[n:]
+-		}
+-		c.wmu.Lock()
+-		c.wmu.Unlock()
+-		c.mu.Lock()
+-		streams, queued := len(c.streams), queuedBytes(c)
+-		c.mu.Unlock()
+-		if streams > len(fromClient)/h2FrameHeader+1 {
+-			t.Fatalf("%d streams tracked from %d input bytes", streams, len(fromClient))
+-		}
+-		if queued > 1<<16 {
+-			t.Fatalf("%d bytes queued for the client", queued)
+-		}
+-		if limit := len(h2Preface) + len(fromClient) + 64*(len(fromClient)/h2FrameHeader+2); len(out) > limit {
+-			t.Fatalf("read side produced %d bytes from %d", len(out), len(fromClient))
++			for in := fromServer; len(in) > 0; {
++				n := min(step, len(in))
++				if _, err := c.Write(in[:n]); err != nil {
++					t.Fatal(err)
++				}
++				in = in[n:]
++			}
++			c.wmu.Lock()
++			c.wmu.Unlock()
++			c.mu.Lock()
++			streams, queued := len(c.streams), queuedBytes(c)
++			c.mu.Unlock()
++			if streams > len(fromClient)/h2FrameHeader+1 {
++				t.Fatalf("%d streams tracked from %d input bytes", streams, len(fromClient))
++			}
++			if queued > 1<<16 {
++				t.Fatalf("%d bytes queued for the client", queued)
++			}
++			if limit := len(h2Preface) + len(fromClient) + 64*(len(fromClient)/h2FrameHeader+2); len(out) > limit {
++				t.Fatalf("read side produced %d bytes from %d", len(out), len(fromClient))
++			}
++			if err := downCountersAgree(c); err != nil {
++				t.Fatalf("send window %d: %v", sendWindow, err)
++			}
++			c.Close()
+ 		}
+-		c.Close()
+ 
+ 		for _, client := range []bool{false, true} {
+ 			in := append([]byte(h2Preface), fromClient...)
+@@ -68,6 +75,7 @@ func FuzzFlowConn(f *testing.F) {
+ 			rnd := mrand.New(mrand.NewPCG(uint64(cut), uint64(len(in))))
+ 			cc := &chunkConn{data: in, rnd: rnd}
+ 			rc := newFlowConn(cc, testUp, testDown)
++			rc.sendWindow = flowServerSendWindow
+ 			if client {
+ 				rc = newFlowClientConn(cc)
+ 				rc.mode.Store(flowH2)
+@@ -84,6 +92,9 @@ func FuzzFlowConn(f *testing.F) {
+ 			if len(got) > len(in)+64*(len(in)/h2FrameHeader+2) {
+ 				t.Fatalf("Read produced %d bytes from %d", len(got), len(in))
+ 			}
++			if err := downCountersAgree(rc); err != nil {
++				t.Fatalf("client %v: %v", client, err)
++			}
+ 		}
+ 	})
+ }
+diff --git a/transport/internet/splithttp/h2flow_hold_test.go b/transport/internet/splithttp/h2flow_hold_test.go
+index edec850a..5cbcca84 100644
+--- a/transport/internet/splithttp/h2flow_hold_test.go
++++ b/transport/internet/splithttp/h2flow_hold_test.go
+@@ -1,6 +1,9 @@
+ package splithttp
+ 
+ import (
++	"bytes"
++	"errors"
++	"io"
+ 	"testing"
+ 
+ 	"golang.org/x/net/http2"
+@@ -86,3 +89,50 @@ func TestFlowCreditWaitsForAQuantum(t *testing.T) {
+ 		t.Fatalf("with a window of %d the server was handed %d, want the piece at once", q/2, got)
+ 	}
+ }
++
++// TestFlowUploadCreditGoesOnInQuanta is the upload side: the local server
++// returns an upload's credit 4 KiB at a time, for the stream and for the
++// connection, and the client is handed both in quanta. Without hold on the
++// two upload paths each piece went on as it came, 32 frames to 128 KiB.
++func TestFlowUploadCreditGoesOnInQuanta(t *testing.T) {
++	h := newFlowHarness(t)
++	t.Cleanup(func() { h.c.Close() })
++	h.c.up.init = flowShownUp
++	h.c.up.max = flowShownUp // the cap stays where it starts
++	h.track()
++	h.openStream(4 << 20)
++	h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 6<<20-h2InitWindow) })
++	h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, 512<<10) })
++	credit := func() []byte {
++		return h.fromServer(func(fr *http2.Framer) {
++			fr.WriteWindowUpdate(1, 4<<10)
++			fr.WriteWindowUpdate(0, 4<<10)
++		})
++	}
++	// The first of it shows the reader reads and funds the connection's floor.
++	for i := 0; i < 8; i++ {
++		credit()
++	}
++	count, sum := map[uint32]int{}, map[uint32]uint64{}
++	for i := 0; i < 32; i++ {
++		fr := http2.NewFramer(nil, bytes.NewReader(credit()))
++		for {
++			f, err := fr.ReadFrame()
++			if errors.Is(err, io.EOF) {
++				break
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if w, ok := f.(*http2.WindowUpdateFrame); ok {
++				count[w.StreamID]++
++				sum[w.StreamID] += uint64(w.Increment)
++			}
++		}
++	}
++	for _, id := range []uint32{0, 1} {
++		if count[id] != 4 || sum[id] != 128<<10 {
++			t.Errorf("stream %d: %d updates carrying %d bytes, want four quanta of 128 KiB in all", id, count[id], sum[id])
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_harness_test.go b/transport/internet/splithttp/h2flow_verify_harness_test.go
+index 9849c354..d8231cee 100644
+--- a/transport/internet/splithttp/h2flow_verify_harness_test.go
++++ b/transport/internet/splithttp/h2flow_verify_harness_test.go
+@@ -3,6 +3,7 @@ package splithttp
+ import (
+ 	"bytes"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net"
+ 	"os"
+@@ -145,7 +146,14 @@ func (h *flowHarness) fromClientRaw(b []byte) []byte {
+ // streams change, with a walk over the streams.
+ func (h *flowHarness) checkHolds() {
+ 	h.t.Helper()
+-	c := h.c
++	if err := downCountersAgree(h.c); err != nil {
++		h.t.Fatal(err)
++	}
++}
++
++// downCountersAgree walks the streams of c and compares them with the
++// counters the connection keeps of those the server has not finished.
++func downCountersAgree(c *flowConn) error {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	var open, forwarded, sent, returned int64
+@@ -158,9 +166,10 @@ func (h *flowHarness) checkHolds() {
+ 		}
+ 	}
+ 	if open != c.downOpen || forwarded != c.downOpenForwarded || sent != c.downOpenSent || returned != c.downOpenReturned {
+-		h.t.Fatalf("unfinished streams: %d forwarded %d sent %d returned %d, the connection counts %d forwarded %d sent %d returned %d",
++		return fmt.Errorf("unfinished streams: %d forwarded %d sent %d returned %d, the connection counts %d forwarded %d sent %d returned %d",
+ 			open, forwarded, sent, returned, c.downOpen, c.downOpenForwarded, c.downOpenSent, c.downOpenReturned)
+ 	}
++	return nil
+ }
+ 
+ func (h *flowHarness) fromClient(f func(fr *http2.Framer)) []byte {
+-- 
+2.52.0.windows.1
+

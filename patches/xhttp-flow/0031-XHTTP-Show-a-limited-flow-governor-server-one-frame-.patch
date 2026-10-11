@@ -1,0 +1,210 @@
+From da79876f4f192476380b03faaa52209a3c69b5d6 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:34:02 +0300
+Subject: [PATCH 31/32] XHTTP: Show a limited flow governor server one frame of
+ initial window, not 65535
+
+A stream has the window the server's HTTP/2 stack was shown at the start
+whatever the connection's client holds, so every stream past the send window
+adds that much. With 65535 shown, 192 streams added 12.6 MB to a limit of
+4 MiB on each of three connections.
+
+A server with a send window now shows its own stack 16 KiB for the client's
+initial window; the rest of a stream's window comes as credit when it opens,
+as before. The value stays between the governor and the stack beside it.
+---
+ transport/internet/splithttp/h2flow.go        | 32 ++++++++++++----
+ .../splithttp/h2flow_sendwindow_test.go       | 38 +++++++++----------
+ 2 files changed, 43 insertions(+), 27 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 77285c95..ceada15e 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -120,6 +120,22 @@ const (
+ // A constant larger than the lowest cap fails to compile here.
+ const _ = uint(h2InitWindow - flowShownDown)
+ 
++// flowShownLimited is what a server with a send window shows its own HTTP/2
++// stack for the client's initial window: one frame. A stream has that much
++// whatever the connection's client holds, so it is what every stream past the
++// limit adds to it, and with hundreds of streams the protocol's 65535 each
++// was most of what the client held. The rest of a stream's window comes as
++// credit when it opens, as before. The value never leaves the process.
++const flowShownLimited = h2MinMaxFrameSize
++
++// shownDown is the initial window the sender of downloads is shown.
++func (c *flowConn) shownDown() int32 {
++	if !c.client && c.sendWindow != 0 {
++		return flowShownLimited
++	}
++	return max(c.down.init, flowShownDown)
++}
++
+ type tcpStats struct {
+ 	rtt, minRTT, rttVar time.Duration
+ }
+@@ -1308,9 +1324,9 @@ func (c *flowConn) upRelease(s *flowStream) int64 {
+ // of them took a client past 40 MiB within a second. What the client holds
+ // is clientHolds. A client that itself announces a stream window above
+ // sendWindow has that room, so its window is the limit then. A stream always
+-// has the protocol's default window, which SETTINGS already gave it, so none
+-// waits for the others; streams opened once the limit is used up add that
+-// much each.
++// has the window the server was shown at the start, flowShownLimited, so
++// none waits for the others; streams opened once the limit is used up add
++// that much each.
+ func (c *flowConn) downRelease(s *flowStream) int64 {
+ 	bank := int64(c.clientInit) + s.down.returned - int64(c.clientShown) - s.downForwarded
+ 	held := int64(c.clientShown) + s.downForwarded - s.down.returned
+@@ -1319,7 +1335,7 @@ func (c *flowConn) downRelease(s *flowStream) int64 {
+ 		return rel
+ 	}
+ 	limit := max(c.sendWindow, int64(c.clientInit))
+-	return min(rel, max(limit-c.clientHolds(), h2InitWindow-held))
++	return min(rel, max(limit-c.clientHolds(), int64(c.clientShown)-held))
+ }
+ 
+ func appendWindowUpdate(out []byte, stream uint32, n int64) []byte {
+@@ -1348,8 +1364,8 @@ func rewriteInitialWindow(payload []byte, limit int32) (real, shown int32, found
+ // for each stream shown + forwarded <= real + returned. Where no value is
+ // low enough, ok is false and the connection has to go. Streams the sender
+ // has finished do not count: nothing more is sent on them.
+-func (c *flowConn) changeInitialWindow(payload []byte, l flowLimit, start int32, init, shown *int32, credit func(*flowStream) (returned, forwarded int64, done bool)) (ok bool) {
+-	real, show, found := rewriteInitialWindow(payload, max(l.init, start))
++func (c *flowConn) changeInitialWindow(payload []byte, start int32, init, shown *int32, credit func(*flowStream) (returned, forwarded int64, done bool)) (ok bool) {
++	real, show, found := rewriteInitialWindow(payload, start)
+ 	if !found {
+ 		return true
+ 	}
+@@ -1439,7 +1455,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	switch f.typ {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+-			if c.down.enabled() && !c.changeInitialWindow(payload, c.down, flowShownDown, &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
++			if c.down.enabled() && !c.changeInitialWindow(payload, c.shownDown(), &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.down.returned, s.downForwarded, s.serverDone
+ 			}) {
+ 				c.giveUp()
+@@ -1595,7 +1611,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 	switch f.typ {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+-			if c.up.enabled() && !c.changeInitialWindow(payload, c.up, flowShownUp, &c.serverInit, &c.serverShown, func(s *flowStream) (int64, int64, bool) {
++			if c.up.enabled() && !c.changeInitialWindow(payload, max(c.up.init, flowShownUp), &c.serverInit, &c.serverShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.up.returned, s.upForwarded, s.clientDone
+ 			}) {
+ 				c.giveUp()
+diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
+index f5783930..da2b5b6c 100644
+--- a/transport/internet/splithttp/h2flow_sendwindow_test.go
++++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
+@@ -34,11 +34,11 @@ func openStreams(t *testing.T, sendWindow int64, clientWindow uint32, n int) *fl
+ }
+ 
+ // granted sums what the server may send, and counts the streams that have
+-// only the protocol's default window.
++// only the window every stream has.
+ func granted(h *flowHarness) (total int64, atDefault int) {
+ 	for _, w := range h.toServer.streams {
+ 		total += w
+-		if w == h2InitWindow {
++		if w == flowShownLimited {
+ 			atDefault++
+ 		}
+ 	}
+@@ -48,7 +48,7 @@ func granted(h *flowHarness) (total int64, atDefault int) {
+ // TestFlowSendWindowBoundsManyStreams opens forty streams at once. Without a
+ // limit each starts with flowStartWindow, 10 MiB in all that the client must
+ // be ready to hold. With the limit the streams share it; those opened once it
+-// is used up keep the protocol's default window, which cannot be withheld, and
++// is used up keep the window every stream has, which cannot be withheld, and
+ // nothing more.
+ func TestFlowSendWindowBoundsManyStreams(t *testing.T) {
+ 	const n = 40
+@@ -60,16 +60,16 @@ func TestFlowSendWindowBoundsManyStreams(t *testing.T) {
+ 	h := openStreams(t, flowServerSendWindow, 4<<20, n)
+ 	total, atDefault := granted(h)
+ 	if atDefault == 0 || atDefault == n {
+-		t.Fatalf("%d of %d streams have only the default window", atDefault, n)
++		t.Fatalf("%d of %d streams have only the window every stream has", atDefault, n)
+ 	}
+ 	// The streams that got more than the default fill the limit and stop.
+-	above := total - int64(atDefault)*h2InitWindow
++	above := total - int64(atDefault)*flowShownLimited
+ 	if above > flowServerSendWindow || above < flowServerSendWindow-flowStartWindow {
+ 		t.Fatalf("streams above the default window may send %d, the limit is %d", above, flowServerSendWindow)
+ 	}
+ 	for id, w := range h.toServer.streams {
+-		if w < h2InitWindow {
+-			t.Fatalf("stream %d was left with a window of %d, below the protocol default", id, w)
++		if w < flowShownLimited {
++			t.Fatalf("stream %d was left with a window of %d, below what every stream has", id, w)
+ 		}
+ 	}
+ 	t.Logf("%d streams: %d in all with the limit, %d without", n, total, n*flowStartWindow)
+@@ -87,13 +87,13 @@ func TestFlowSendWindowFollowsClientWindow(t *testing.T) {
+ }
+ 
+ // TestFlowSendWindowIsReturned fills the limit, lets the client read eight
+-// streams, and checks that a stream held to the default window then gets more.
++// streams, and checks that a stream held to that then gets more.
+ func TestFlowSendWindowIsReturned(t *testing.T) {
+ 	const n = 40
+ 	h := openStreams(t, flowServerSendWindow, 4<<20, n)
+ 	last := uint32(2*n - 1)
+-	if got := h.toServer.streams[last]; got != h2InitWindow {
+-		t.Fatalf("the last stream opened with %d, want the default %d once the limit is used up", got, h2InitWindow)
++	if got := h.toServer.streams[last]; got != flowShownLimited {
++		t.Fatalf("the last stream opened with %d, want %d once the limit is used up", got, flowShownLimited)
+ 	}
+ 	// The client reads all of the first eight streams' data.
+ 	for id := uint32(1); id <= 15; id += 2 {
+@@ -104,11 +104,11 @@ func TestFlowSendWindowIsReturned(t *testing.T) {
+ 		h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(id, uint32(w)) })
+ 	}
+ 	// The last stream sends its window and the client reads it.
+-	h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, last, h2InitWindow) })
+-	h.toServer.streams[last] -= h2InitWindow
+-	h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(last, h2InitWindow) })
+-	if got := h.toServer.streams[last]; got <= h2InitWindow {
+-		t.Fatalf("with the limit free again the last stream may send %d, want more than %d", got, h2InitWindow)
++	h.fromServer(func(fr *http2.Framer) { writeDataSplit(fr, last, flowShownLimited) })
++	h.toServer.streams[last] -= flowShownLimited
++	h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(last, flowShownLimited) })
++	if got := h.toServer.streams[last]; got <= flowShownLimited {
++		t.Fatalf("with the limit free again the last stream may send %d, want more than %d", got, flowShownLimited)
+ 	}
+ }
+ 
+@@ -169,7 +169,7 @@ func goClientStart(t *testing.T, h *flowHarness) {
+ // TestFlowSendWindowCountsFinishedDownloads has downloads the server ends and
+ // the client does not read: their data is still the client's to hold, and
+ // only the connection's credit tells. Once the limit is used up a new stream
+-// has the protocol's default window and no more, until the client returns
++// has the window every stream has and no more, until the client returns
+ // connection credit for what it read.
+ func TestFlowSendWindowCountsFinishedDownloads(t *testing.T) {
+ 	h := openStreams(t, flowServerSendWindow, 4<<20, 0)
+@@ -178,8 +178,8 @@ func TestFlowSendWindowCountsFinishedDownloads(t *testing.T) {
+ 	if sent[0] != flowServerSendWindow {
+ 		t.Fatalf("the first sixteen downloads were sent %d, want the limit %d", sent[0], flowServerSendWindow)
+ 	}
+-	if sent[1] != 16*h2InitWindow {
+-		t.Fatalf("with %d unread the next sixteen downloads were sent %d, want the default window each, %d", sent[0], sent[1], 16*h2InitWindow)
++	if sent[1] != 16*flowShownLimited {
++		t.Fatalf("with %d unread the next sixteen downloads were sent %d, want that window each, %d", sent[0], sent[1], 16*flowShownLimited)
+ 	}
+ 	// The client reads it all, 16 KiB at a time.
+ 	for left := sent[0] + sent[1]; left > 0; left -= min(left, 16<<10) {
+@@ -356,6 +356,6 @@ func TestH2SendWindow(t *testing.T) {
+ 		}
+ 	}
+ 	if got := (&Config{}).h2SendWindow(); got != flowServerSendWindow {
+-		t.Errorf("no h2Flow: limit %d, want the default %d", got, flowServerSendWindow)
++		t.Errorf("no h2Flow: limit %d, want %d", got, flowServerSendWindow)
+ 	}
+ }
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,114 @@
+From 1f21c2f067c8b0eb505d12042db2523089b1d1f2 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 13:18:08 +0300
+Subject: [PATCH 38/38] XHTTP: Have the chained flow governor test reach its
+ state, let the fuzz target see a given up connection
+
+---
+ .../internet/splithttp/h2flow_client_test.go  | 26 +++++++++++++++++--
+ .../internet/splithttp/h2flow_fuzz_test.go    | 11 +++++++-
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index bc3f3003..e92a34b0 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -11,6 +11,8 @@ import (
+ 	mrand "math/rand/v2"
+ 	"net"
+ 	"net/http"
++	"os"
++	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -302,6 +304,11 @@ func TestFlowClientStreamStateReleased(t *testing.T) {
+ // back. Every download must still complete: with the client showing more than
+ // the lowest cap (see flowShownDown) the two governors wait for each other.
+ // It runs without the server's send window and with the default one.
++//
++// The readers pause after every read until a cap has been seen to fall at
++// both ends, so the state the test is about is reached before it is judged,
++// and only then read in the stops and starts of the seed. The seed is logged
++// and XRAY_FLOW_TEST_SEED sets it.
+ func TestFlowChainedGovernorsSlowReaders(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name       string
+@@ -367,12 +374,20 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 	// The pauses of each reader come from the seed, so a failing pacing can
+ 	// be run again.
+ 	seed := uint64(time.Now().UnixNano())
++	if set := os.Getenv("XRAY_FLOW_TEST_SEED"); set != "" {
++		var err error
++		if seed, err = strconv.ParseUint(set, 10, 64); err != nil {
++			t.Fatalf("XRAY_FLOW_TEST_SEED: %v", err)
++		}
++	}
+ 	t.Logf("seed %d", seed)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+ 	defer cancel()
+ 
+ 	// Watch the caps: the test means nothing unless they shrink at both ends.
+ 	lowServer, lowClient := int32(math.MaxInt32), int32(math.MaxInt32)
++	var fell atomic.Bool
++	fallBy := time.Now().Add(20 * time.Second)
+ 	watched := make(chan struct{})
+ 	stop := make(chan struct{})
+ 	go func() {
+@@ -386,6 +401,9 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 			case <-tick.C:
+ 				lowServer = min(lowServer, lowestDownCap(serverConns()))
+ 				lowClient = min(lowClient, lowestDownCap(clientConns()))
++				if lowServer < flowStartWindow && lowClient < flowStartWindow {
++					fell.Store(true)
++				}
+ 			}
+ 		}
+ 	}()
+@@ -416,8 +434,12 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 					errs <- fmt.Errorf("download %d after %d of %d bytes: %w", i, got, size, err)
+ 					return
+ 				}
+-				// Stop and start for the first two thirds.
+-				if got < size*2/3 && rng.IntN(8) == 0 {
++				switch {
++				case !fell.Load() && time.Now().Before(fallBy):
++					// A slow reader, until the caps have fallen.
++					time.Sleep(time.Duration(1+rng.IntN(20)) * time.Millisecond)
++				case got < size*2/3 && rng.IntN(8) == 0:
++					// Then stops and starts for the first two thirds.
+ 					time.Sleep(time.Duration(rng.IntN(60)) * time.Millisecond)
+ 				}
+ 			}
+diff --git a/transport/internet/splithttp/h2flow_fuzz_test.go b/transport/internet/splithttp/h2flow_fuzz_test.go
+index a0fb67b3..a6e8e9d7 100644
+--- a/transport/internet/splithttp/h2flow_fuzz_test.go
++++ b/transport/internet/splithttp/h2flow_fuzz_test.go
+@@ -26,6 +26,11 @@ func FuzzFlowConn(f *testing.F) {
+ 	f.Add([]byte{0, 0, 0, 4, 0, 0, 0, 0, 0}, []byte{0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1}, uint8(1))
+ 	f.Add([]byte{0xff, 0xff, 0xff, 1, 0xff, 0x7f, 0xff, 0xff, 0xff}, []byte{0, 0, 4, 8, 0, 0, 0, 0, 3, 0, 0, 0, 0}, uint8(3))
+ 
++	// A client that announces a large window, opens a stream and lowers the
++	// window under what the server was forwarded: the governor gives the
++	// connection up, and the server's write fails.
++	f.Add([]byte("\x00\x00\x06\x040\x00\x00\x00\x00\x00\x040000\x00\x00\x01\x01700010\x00\x00\x1e\x040\x00\x00\x00\x00000000\x00\x04\x00\x0000000000000000000000"), []byte("0"), uint8(3))
++
+ 	f.Fuzz(func(t *testing.T, fromClient, fromServer []byte, cut uint8) {
+ 		// The same input with the send window off and at its default.
+ 		for _, sendWindow := range []int64{0, flowServerSendWindow} {
+@@ -43,7 +48,11 @@ func FuzzFlowConn(f *testing.F) {
+ 			for in := fromServer; len(in) > 0; {
+ 				n := min(step, len(in))
+ 				if _, err := c.Write(in[:n]); err != nil {
+-					t.Fatal(err)
++					// A connection the governor gave up takes no more.
++					if !c.isBroken() {
++						t.Fatal(err)
++					}
++					break
+ 				}
+ 				in = in[n:]
+ 			}
+-- 
+2.52.0.windows.1
+

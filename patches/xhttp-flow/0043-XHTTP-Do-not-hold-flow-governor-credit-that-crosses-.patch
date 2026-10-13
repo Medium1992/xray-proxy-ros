@@ -1,0 +1,272 @@
+From ac12820838da5847fca1837ed17b8beb1b3cf00d Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 03:21:02 +0300
+Subject: [PATCH] XHTTP: Do not hold flow governor credit that crosses the
+ network to quanta
+
+A download that followed an upload on the same connection after an idle second started slower than before the quanta: its first 3 MB took up to 1.02 s at 100 Mbit/s and RTT 50 ms where they took up to 0.76 s.
+
+While an upload runs the server sends the client little but WINDOW_UPDATE frames, a packet each. Linux with CUBIC and HyStart leaves slow start on that stream of small packets at a congestion window of about twice their number in flight and keeps it as the connection's slow start threshold. Held to quanta they were half as many, and so was the threshold.
+
+Upload credit from a server and download credit from a governed client go on as they come again; a server's download credit, which goes to the HTTP/2 stack next to it, is still held. The SETTINGS cost test skips where the clock reads zero.
+---
+ transport/internet/splithttp/h2flow.go        |  41 ++++---
+ .../internet/splithttp/h2flow_hold_test.go    | 115 ++++++++----------
+ .../splithttp/h2flow_sendwindow_test.go       |   3 +
+ 3 files changed, 74 insertions(+), 85 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 8f79dd4f8..89deb4c4b 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -67,10 +67,9 @@ const (
+ 	// before its readers prove they need more: Go's default.
+ 	flowConnFloor   = 1 << 20
+ 	flowSmallCredit = 64 << 10
+-	// Credit is handed on in pieces of at least flowQuantumMin and at most
+-	// flowQuantumMax where the sender is not about to run dry, see hold. The
+-	// larger stays under flowSmallCredit, so a governor at the other end
+-	// still sees a peer that credits in small steps.
++	// A server's own stack is handed download credit in pieces of at least
++	// flowQuantumMin and at most flowQuantumMax where it is not about to run
++	// dry, see hold.
+ 	flowQuantumMin  = 16 << 10
+ 	flowQuantumMax  = 32 << 10
+ 	flowShrinkAfter = 3
+@@ -1137,16 +1136,12 @@ func (c *flowConn) upConnRelease() int64 {
+ 	return min(bank, flowConnFloor+reading-unread-window, h2MaxWindow)
+ }
+ 
+-// appendUpConnRelease hands the client what connection credit is due. It
+-// waits for a quantum, see hold, unless ramping says the stream whose credit
+-// brought it here is still speeding up.
+-func (c *flowConn) appendUpConnRelease(out []byte, ramping bool) []byte {
+-	rel := c.upConnRelease()
+-	if rel <= 0 || !ramping && hold(rel, h2InitWindow+c.upConnForwarded-c.upConnSent, flowQuantumMax) {
+-		return out
++func (c *flowConn) appendUpConnRelease(out []byte) []byte {
++	if rel := c.upConnRelease(); rel > 0 {
++		c.upConnForwarded += rel
++		out = appendWindowUpdate(out, 0, rel)
+ 	}
+-	c.upConnForwarded += rel
+-	return appendWindowUpdate(out, 0, rel)
++	return out
+ }
+ 
+ // quantum is the least credit worth handing on for a window of cap: an
+@@ -1162,9 +1157,15 @@ func quantum(cap int32) int64 {
+ // what it sends then brings the next credit; once it has less, all credit
+ // goes out at once. No cap changes, so the reader holds no more than before.
+ //
+-// An upload that is still speeding up is not held, stream or connection: its
+-// cap opens with every credit, and credit that waited for a quantum cost its
+-// first megabytes a round trip.
++// Only a server's download credit is held: it goes to the HTTP/2 stack next
++// to the governor. Credit that crosses the network is not, upload credit
++// from a server and download credit from a client. Each WINDOW_UPDATE is a
++// packet of its own, and those packets are all the peer's kernel sees of
++// this side's sending while the transfer runs the other way. Linux leaves
++// slow start there at about twice their number in flight and keeps that as
++// the connection's slow start threshold; held to quanta they were half as
++// many, and a download that followed an upload on the same connection after
++// an idle second started that much slower.
+ func hold(rel, window, quantum int64) bool {
+ 	return rel < quantum && window >= quantum
+ }
+@@ -1603,7 +1604,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		}
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+-		if rel <= 0 || hold(rel, int64(c.clientShown)+s.downForwarded-s.downSent, quantum(s.down.cap)) {
++		if rel <= 0 || !c.client && hold(rel, int64(c.clientShown)+s.downForwarded-s.downSent, quantum(s.down.cap)) {
+ 			return out
+ 		}
+ 		c.forwardDown(s, rel)
+@@ -1711,7 +1712,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 			if !c.upConnGrantKnown && c.upConnSent == 0 {
+ 				c.upConnGrant += inc
+ 			}
+-			return c.appendUpConnRelease(out, false)
++			return c.appendUpConnRelease(out)
+ 		}
+ 		s := c.stream(f.stream)
+ 		if s == nil || inc == 0 || !c.up.enabled() {
+@@ -1736,12 +1737,12 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 			s.up.cap = min(s.up.cap, flowUnconfirmedUp)
+ 		}
+ 		c.upLearned.note(now, c.up.init, s.up.cap)
+-		if rel := c.upRelease(s); rel > 0 && (!s.up.ramped || !hold(rel, int64(c.serverShown)+s.upForwarded-s.upSent, quantum(s.up.cap))) {
++		if rel := c.upRelease(s); rel > 0 {
+ 			s.upForwarded += rel
+ 			out = appendWindowUpdate(out, f.stream, rel)
+ 		}
+ 		// What the reader took also frees room on the connection.
+-		return c.appendUpConnRelease(out, !s.up.ramped)
++		return c.appendUpConnRelease(out)
+ 	}
+ 	out = append(out, header...)
+ 	return append(out, payload...)
+diff --git a/transport/internet/splithttp/h2flow_hold_test.go b/transport/internet/splithttp/h2flow_hold_test.go
+index 3765c9634..fa45a1792 100644
+--- a/transport/internet/splithttp/h2flow_hold_test.go
++++ b/transport/internet/splithttp/h2flow_hold_test.go
+@@ -90,11 +90,34 @@ func TestFlowCreditWaitsForAQuantum(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowUploadCreditGoesOnInQuanta is the upload side: the local server
+-// returns an upload's credit 4 KiB at a time, for the stream and for the
+-// connection, and the client is handed both in quanta. Without hold on the
+-// two upload paths each piece went on as it came, 32 frames to 128 KiB.
+-func TestFlowUploadCreditGoesOnInQuanta(t *testing.T) {
++// windowUpdates counts the WINDOW_UPDATE frames in b by stream and adds up
++// what they carry.
++func windowUpdates(t *testing.T, b []byte, count map[uint32]int, sum map[uint32]uint64) {
++	t.Helper()
++	fr := http2.NewFramer(nil, bytes.NewReader(b))
++	for {
++		f, err := fr.ReadFrame()
++		if errors.Is(err, io.EOF) {
++			return
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		if w, ok := f.(*http2.WindowUpdateFrame); ok {
++			count[w.StreamID]++
++			sum[w.StreamID] += uint64(w.Increment)
++		}
++	}
++}
++
++// TestFlowUploadCreditNotHeld is the upload side of a server: the local
++// server returns an upload's credit 4 KiB at a time, for the stream and for
++// the connection, and each piece goes on to the client as it comes, also once
++// the upload has stopped speeding up. That credit crosses the network, and
++// its packets are what the client's kernel sees of the server's sending
++// during an upload: held to quanta they were an eighth as many here, and the
++// slow start threshold Linux keeps from them fell with their number.
++func TestFlowUploadCreditNotHeld(t *testing.T) {
+ 	h := newFlowHarness(t)
+ 	t.Cleanup(func() { h.c.Close() })
+ 	h.c.up.init = flowShownUp
+@@ -113,79 +136,41 @@ func TestFlowUploadCreditGoesOnInQuanta(t *testing.T) {
+ 	for i := 0; i < 8; i++ {
+ 		credit()
+ 	}
+-	// The upload has stopped speeding up: from here its credit is held.
+ 	h.c.mu.Lock()
+ 	h.c.streams[1].up.ramped = true
+ 	h.c.mu.Unlock()
+ 	count, sum := map[uint32]int{}, map[uint32]uint64{}
+ 	for i := 0; i < 32; i++ {
+-		fr := http2.NewFramer(nil, bytes.NewReader(credit()))
+-		for {
+-			f, err := fr.ReadFrame()
+-			if errors.Is(err, io.EOF) {
+-				break
+-			}
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if w, ok := f.(*http2.WindowUpdateFrame); ok {
+-				count[w.StreamID]++
+-				sum[w.StreamID] += uint64(w.Increment)
+-			}
+-		}
++		windowUpdates(t, credit(), count, sum)
+ 	}
+ 	for _, id := range []uint32{0, 1} {
+-		if count[id] != 4 || sum[id] != 128<<10 {
+-			t.Errorf("stream %d: %d updates carrying %d bytes, want four quanta of 128 KiB in all", id, count[id], sum[id])
++		if count[id] != 32 || sum[id] != 128<<10 {
++			t.Errorf("stream %d: %d updates carrying %d bytes, want each of 32 pieces of 4 KiB at once", id, count[id], sum[id])
+ 		}
+ 	}
+ }
+ 
+-// TestFlowUploadCreditNotHeldWhileRamping is the same upload while it is
+-// still speeding up. Its cap opens with every credit, so each piece goes on
+-// as it comes, for the stream and for the connection: held to a quantum, the
+-// first megabytes of an upload took a round trip longer.
+-func TestFlowUploadCreditNotHeldWhileRamping(t *testing.T) {
+-	h := newFlowHarness(t)
+-	t.Cleanup(func() { h.c.Close() })
+-	h.c.up.init = flowShownUp
+-	h.c.up.max = flowShownUp
+-	h.track()
+-	h.openStream(4 << 20)
+-	h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 6<<20-h2InitWindow) })
+-	h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, 512<<10) })
+-	if h.c.streams[1].up.ramped {
+-		t.Fatal("a new upload counts as one that has stopped speeding up")
+-	}
+-	for i := 0; i < 8; i++ {
+-		h.fromServer(func(fr *http2.Framer) {
+-			fr.WriteWindowUpdate(0, 4<<10)
+-			fr.WriteWindowUpdate(1, 4<<10)
+-		})
++// TestFlowClientDownloadCreditNotHeld is the same for a governed client: the
++// local client returns a download's credit 4 KiB at a time, and each piece
++// goes on to the server as it comes. On a client it is the download's credit
++// that crosses the network.
++func TestFlowClientDownloadCreditNotHeld(t *testing.T) {
++	const id, piece, pieces = 1, 4 << 10, 16
++	ch := newChain(t, 0)
++	ch.start()
++	ch.open(id)
++	sent := ch.sendAll(id)
++	if sent < 2*pieces*piece {
++		t.Fatalf("the server sent %d, want room for %d pieces of credit", sent, pieces)
+ 	}
+-	count := map[uint32]int{}
+-	for i := 0; i < 16; i++ {
+-		got := h.fromServer(func(fr *http2.Framer) {
+-			fr.WriteWindowUpdate(0, 4<<10)
+-			fr.WriteWindowUpdate(1, 4<<10)
+-		})
+-		fr := http2.NewFramer(nil, bytes.NewReader(got))
+-		for {
+-			f, err := fr.ReadFrame()
+-			if errors.Is(err, io.EOF) {
+-				break
+-			}
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if w, ok := f.(*http2.WindowUpdateFrame); ok {
+-				count[w.StreamID]++
+-			}
++	count, sum := map[uint32]int{}, map[uint32]uint64{}
++	for i := 0; i < pieces; i++ {
++		if _, err := ch.cg.Write(frames(func(fr *http2.Framer) { fr.WriteWindowUpdate(id, piece) })); err != nil {
++			t.Fatal(err)
+ 		}
++		windowUpdates(t, ch.cconn.take(), count, sum)
+ 	}
+-	for _, id := range []uint32{0, 1} {
+-		if count[id] != 16 {
+-			t.Errorf("stream %d: %d updates for 16 pieces of credit while the upload speeds up, want each at once", id, count[id])
+-		}
++	if count[id] != pieces || sum[id] != pieces*piece {
++		t.Fatalf("%d updates carrying %d bytes reached the wire, want each of %d pieces of 4 KiB at once", count[id], sum[id], pieces)
+ 	}
+ }
+diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
+index 256c248ef..7d553abb4 100644
+--- a/transport/internet/splithttp/h2flow_sendwindow_test.go
++++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
+@@ -600,6 +600,9 @@ func TestFlowSendWindowSettingsCost(t *testing.T) {
+ 	}
+ 	few, many := cost(200), cost(2000)
+ 	t.Logf("50 SETTINGS frames: %v with 200 streams, %v with 2000", few, many)
++	if few == 0 {
++		t.Skip("the clock does not resolve 50 SETTINGS frames")
++	}
+ 	if many > 40*few {
+ 		t.Fatalf("ten times the streams made a SETTINGS frame %d times dearer", many/few)
+ 	}
+-- 
+2.52.0.windows.1
+

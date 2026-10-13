@@ -1,0 +1,171 @@
+From 3a919a3775b6d945fb03d7d716a4d5cad766e61b Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:29:30 +0300
+Subject: [PATCH] XHTTP: Hold flow governor connections to the settled rule in
+ tests
+
+With the kernel vouching for the path, an upload on a server and a download on a governed client that are one low round into their start have to keep their caps, and to follow the path model after a second such round. A reader that grows a tenth a round has flat rounds and has not ended its ramp: it is not settled.
+---
+ .../internet/splithttp/h2flow_ramp_test.go    |  22 ++++
+ .../internet/splithttp/h2flow_settled_test.go | 116 ++++++++++++++++++
+ 2 files changed, 138 insertions(+)
+ create mode 100644 transport/internet/splithttp/h2flow_settled_test.go
+
+diff --git a/transport/internet/splithttp/h2flow_ramp_test.go b/transport/internet/splithttp/h2flow_ramp_test.go
+index 113967a2f..5e7545170 100644
+--- a/transport/internet/splithttp/h2flow_ramp_test.go
++++ b/transport/internet/splithttp/h2flow_ramp_test.go
+@@ -73,6 +73,28 @@ func TestFlowWindowSettles(t *testing.T) {
+ 	}
+ }
+ 
++// TestFlowWindowGrowingSlowlyIsNotSettled is a reader a tenth faster every
++// round trip. Its rounds are flat, under a quarter more each, but none has
++// ended the ramp: it still speeds up, and stays with adjust, which follows
++// it at twice its rate, as before.
++func TestFlowWindowGrowingSlowlyIsNotSettled(t *testing.T) {
++	const rtt = 50 * time.Millisecond
++	start := time.Unix(0, 0)
++	w := flowWindow{cap: flowStartWindow}
++	credit := int64(400 << 10)
++	for i := 0; i < 6; i++ {
++		w.returned += credit
++		w.adjust(start.Add(time.Duration(i)*rtt), rtt, h2InitWindow, 1<<30, true, false)
++		credit += credit / 10
++	}
++	if w.flat < flowSettledRounds {
++		t.Fatalf("%d flat rounds counted for a reader that grows a tenth a round, want at least %d", w.flat, flowSettledRounds)
++	}
++	if w.ramped || w.settled() {
++		t.Fatalf("a reader that still speeds up counts as ramped %v, settled %v", w.ramped, w.settled())
++	}
++}
++
+ func TestFlowLearnedHalfLife(t *testing.T) {
+ 	var l flowLearned
+ 	start := time.Unix(0, 0)
+diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
+new file mode 100644
+index 000000000..2fab0747f
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_settled_test.go
+@@ -0,0 +1,116 @@
++package splithttp
++
++import (
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// vouchedPath makes c take the kernel's word for a round trip of 50 ms, as a
++// connection on Linux does once TCP_INFO agrees with its PINGs: the state in
++// which a window may follow the path model. The kernel is not asked again
++// for the length of a test.
++func vouchedPath(c *flowConn) {
++	const rtt = 50 * time.Millisecond
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.tcp, c.kAt, c.kOK = fakeRawConn{}, time.Now().Add(time.Hour), true
++	c.kstat = tcpStats{rtt: rtt, minRTT: rtt}
++	c.rttBase = rtt
++}
++
++// lowRoundBehind puts w where a stream is after one round trip that read low
++// at its start: ramped, since that round was not above the one before, with
++// flat such rounds behind it, a small round to go by, and a round trip that
++// ends with the next credit.
++func lowRoundBehind(w *flowWindow, flat int) {
++	w.ramped, w.flat = true, flat
++	w.prev, w.measured = 8<<10, true
++	w.mark, w.markBase = time.Now().Add(-time.Second), w.returned
++}
++
++// TestFlowUploadFollowsModelOnceSettled is a server whose kernel vouches for
++// the path, and an upload one low round into its start. Its window stays
++// where it started: the path model, which would have that one small round to
++// go by, is not asked yet. After a second such round it is, and the window
++// goes where the model puts it.
++func TestFlowUploadFollowsModelOnceSettled(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		flat    int
++		modeled bool
++	}{
++		{"one flat round", flowSettledRounds - 1, false},
++		{"settled", flowSettledRounds, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			const id = 1
++			h := newFlowHarness(t)
++			t.Cleanup(func() { h.c.Close() })
++			h.track()
++			h.openStream(4 << 20)
++			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, 200<<10) })
++			vouchedPath(h.c)
++			h.c.mu.Lock()
++			s := h.c.streams[id]
++			start := s.up.cap
++			lowRoundBehind(&s.up, tc.flat)
++			h.c.mu.Unlock()
++			if start != flowStartWindow {
++				t.Fatalf("the upload starts with a cap of %d, want %d", start, flowStartWindow)
++			}
++			h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(id, 4<<10) })
++			h.c.mu.Lock()
++			got, floor := s.up.cap, h.c.up.init
++			h.c.mu.Unlock()
++			if tc.modeled && got != floor {
++				t.Fatalf("a settled upload has a cap of %d, want the %d the path model gives a reader this slow", got, floor)
++			}
++			if !tc.modeled && got != start {
++				t.Fatalf("one low round took the cap from %d to %d: the window follows the path model before its reader has settled", start, got)
++			}
++		})
++	}
++}
++
++// TestFlowClientDownloadFollowsModelOnceSettled is the same for a governed
++// client's download, the window that follows the model on that side.
++func TestFlowClientDownloadFollowsModelOnceSettled(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		flat    int
++		modeled bool
++	}{
++		{"one flat round", flowSettledRounds - 1, false},
++		{"settled", flowSettledRounds, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			const id = 1
++			ch := newChain(t, 0)
++			ch.start()
++			ch.open(id)
++			if sent := ch.sendAll(id); sent == 0 {
++				t.Fatal("the server sent nothing")
++			}
++			vouchedPath(ch.cg)
++			ch.cg.mu.Lock()
++			s := ch.cg.streams[id]
++			start := s.down.cap
++			lowRoundBehind(&s.down, tc.flat)
++			ch.cg.mu.Unlock()
++			if _, err := ch.cg.Write(frames(func(fr *http2.Framer) { fr.WriteWindowUpdate(id, 4<<10) })); err != nil {
++				t.Fatal(err)
++			}
++			ch.cg.mu.Lock()
++			got, floor := s.down.cap, ch.cg.down.init
++			ch.cg.mu.Unlock()
++			if tc.modeled && got != floor {
++				t.Fatalf("a settled download has a cap of %d, want the %d the path model gives a reader this slow", got, floor)
++			}
++			if !tc.modeled && got < start {
++				t.Fatalf("one low round took the cap from %d to %d: the window follows the path model before its reader has settled", start, got)
++			}
++		})
++	}
++}
+-- 
+2.52.0.windows.1
+

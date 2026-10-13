@@ -1,0 +1,125 @@
+From 298295593b7f555ae657d8985b49c7d44d1ae5c1 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:18:59 +0300
+Subject: [PATCH] XHTTP: Count the flow governor's settling rounds from the end
+ of the ramp
+
+A reader that grew slowly was settled by the first low round after that growth, and the path model had that round to go by. Flat rounds are counted from the round that ends the ramp.
+---
+ transport/internet/splithttp/h2flow.go        | 16 +++++++---
+ .../internet/splithttp/h2flow_ramp_test.go    | 32 +++++++++++++++++++
+ .../internet/splithttp/h2flow_settled_test.go |  6 ++--
+ 3 files changed, 46 insertions(+), 8 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 155c670a..889c69c2 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -385,6 +385,7 @@ type flowWindow struct {
+ 	rates    [flowModelRounds]int64
+ 	rateAt   int
+ 	flat     int
++	steady   int
+ 	piPrev   float64
+ }
+ 
+@@ -425,8 +426,11 @@ func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32,
+ 	}
+ 	if w.prev > 0 && 4*copied < 5*w.prev {
+ 		w.flat++
++		if w.ramped {
++			w.steady++
++		}
+ 	} else {
+-		w.flat = 0
++		w.flat, w.steady = 0, 0
+ 	}
+ 	w.prev, w.measured = copied, true
+ 	w.mark, w.markBase = now, w.returned
+@@ -456,16 +460,18 @@ const (
+ 	flowModelMinRound    = 20 * time.Millisecond
+ )
+ 
+-// settled reports whether the reader has found its rate: ramped, and less
+-// than a quarter faster than the round before for flowSettledRounds rounds in
+-// a row. Only then does a window follow the path model. One round without
++// settled reports whether the reader has found its rate: less than a
++// quarter faster than the round before for flowSettledRounds rounds in a
++// row, counted from the round that ended its ramp. Flat rounds before that
++// do not count: a reader that grew slowly would otherwise be settled by the
++// first low round after them. Only then does a window follow the path model. One round without
+ // growth is not enough for that: the end of a round may fall between the
+ // reader getting data and returning its credit, so that it reads low and the
+ // next makes up for it. A window that took such a round at the start of a
+ // stream for its rate had that one small round to model the path from, fell
+ // to it, and grew back a quarter at a time.
+ func (w *flowWindow) settled() bool {
+-	return w.ramped && w.flat >= flowSettledRounds
++	return w.steady >= flowSettledRounds
+ }
+ 
+ // model sets the cap from the path model; rtprop is the empty path's round
+diff --git a/transport/internet/splithttp/h2flow_ramp_test.go b/transport/internet/splithttp/h2flow_ramp_test.go
+index 5e754517..ab271ea0 100644
+--- a/transport/internet/splithttp/h2flow_ramp_test.go
++++ b/transport/internet/splithttp/h2flow_ramp_test.go
+@@ -95,6 +95,38 @@ func TestFlowWindowGrowingSlowlyIsNotSettled(t *testing.T) {
+ 	}
+ }
+ 
++// TestFlowWindowSlowGrowthThenLowRoundIsNotSettled is that reader followed
++// by one round that reads low, as a start in congestion avoidance may give.
++// The low round ends the ramp. The flat rounds before it are not rounds at a
++// found rate, and the model would have the low round to go by.
++func TestFlowWindowSlowGrowthThenLowRoundIsNotSettled(t *testing.T) {
++	const rtt = 50 * time.Millisecond
++	start := time.Unix(0, 0)
++	w := flowWindow{cap: flowStartWindow}
++	credit := int64(400 << 10)
++	at := time.Duration(0)
++	round := func(credit int64) {
++		w.returned += credit
++		w.adjust(start.Add(at), rtt, h2InitWindow, 1<<30, true, false)
++		at += rtt
++	}
++	for i := 0; i < 6; i++ {
++		round(credit)
++		credit += credit / 10
++	}
++	round(8 << 10)
++	if !w.ramped {
++		t.Fatal("a round under the one before did not end the ramp")
++	}
++	if w.settled() {
++		t.Fatalf("one low round after slow growth settled the window, with %d to model the path from", w.prev)
++	}
++	round(8 << 10)
++	if !w.settled() {
++		t.Fatalf("%d round trips at the same rate after the ramp did not settle the reader", flowSettledRounds)
++	}
++}
++
+ func TestFlowLearnedHalfLife(t *testing.T) {
+ 	var l flowLearned
+ 	start := time.Unix(0, 0)
+diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
+index 2fab0747..700423b6 100644
+--- a/transport/internet/splithttp/h2flow_settled_test.go
++++ b/transport/internet/splithttp/h2flow_settled_test.go
+@@ -22,10 +22,10 @@ func vouchedPath(c *flowConn) {
+ 
+ // lowRoundBehind puts w where a stream is after one round trip that read low
+ // at its start: ramped, since that round was not above the one before, with
+-// flat such rounds behind it, a small round to go by, and a round trip that
++// steady flat rounds since, a small round to go by, and a round trip that
+ // ends with the next credit.
+-func lowRoundBehind(w *flowWindow, flat int) {
+-	w.ramped, w.flat = true, flat
++func lowRoundBehind(w *flowWindow, steady int) {
++	w.ramped, w.flat, w.steady = true, steady, steady
+ 	w.prev, w.measured = 8<<10, true
+ 	w.mark, w.markBase = time.Now().Add(-time.Second), w.returned
+ }
+-- 
+2.52.0.windows.1
+

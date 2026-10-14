@@ -9,7 +9,7 @@ diff --git a/app/proxyman/inbound/inbound.go b/app/proxyman/inbound/inbound.go
 index 411de859..e046513a 100644
 --- a/app/proxyman/inbound/inbound.go
 +++ b/app/proxyman/inbound/inbound.go
-@@ -174,9 +174,7 @@ func NewHandler(ctx context.Context, config *core.InboundHandlerConfig) (inbound
+@@ -174,9 +174,9 @@ func NewHandler(ctx context.Context, config *core.InboundHandlerConfig) (inbound
  			Mark: streamSettings.SocketSettings.Mark,
  		})
  	}

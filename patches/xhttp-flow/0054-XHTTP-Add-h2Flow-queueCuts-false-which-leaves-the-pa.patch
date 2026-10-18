@@ -1,0 +1,261 @@
+From 697f598eb301250dffab1d1405a81afcbd6bcc14 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:08:04 +0300
+Subject: [PATCH] XHTTP: Add "h2Flow": {"queueCuts": false}, which leaves the
+ path's queue to TCP
+
+A governed server cuts its downloads against the queue it sees on the path, which holds that queue short, at the cost of giving way to traffic that keeps it full. An inbound that carries bridges, or that would rather keep its share than its latency, can now turn that off: pi and the cut at a long queue do not run, and the downloads' windows follow their readers alone. Beside four other flows for 20 seconds a download then averages 36 Mbit/s, as without a governor, where the default gets 20; the request beside eight downloads takes 150-265 ms where the default takes 65.
+---
+ infra/conf/transport_h2flow_test.go           |  5 ++-
+ infra/conf/transport_method.go                |  5 ++-
+ transport/internet/splithttp/config.pb.go     | 19 ++++++++--
+ transport/internet/splithttp/config.proto     |  3 ++
+ transport/internet/splithttp/h2flow.go        | 18 +++++++--
+ .../internet/splithttp/h2flow_foreign_test.go | 37 +++++++++++++++++++
+ transport/internet/splithttp/hub.go           |  2 +-
+ 7 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/infra/conf/transport_h2flow_test.go b/infra/conf/transport_h2flow_test.go
+index b9cc1265..f2da3d5f 100644
+--- a/infra/conf/transport_h2flow_test.go
++++ b/infra/conf/transport_h2flow_test.go
+@@ -27,6 +27,7 @@ func TestXHTTPH2Flow(t *testing.T) {
+ 		mode         int32
+ 		stream, conn int32
+ 		send         int32
++		noCuts       bool
+ 		absent       bool
+ 	}{
+ 		{json: `{}`, absent: true},
+@@ -36,6 +37,8 @@ func TestXHTTPH2Flow(t *testing.T) {
+ 		{json: `{"extra": {"h2Flow": {"enabled": true, "maxStreamReceiveWindow": 6291456, "maxConnectionReceiveWindow": 16777216}}}`, mode: 1, stream: 6291456, conn: 16777216},
+ 		{json: `{"h2Flow": {"enabled": true, "maxConnectionSendWindow": 8388608}}`, mode: 1, send: 8388608},
+ 		{json: `{"h2Flow": {"enabled": true, "maxConnectionSendWindow": -1}}`, mode: 1, send: -1},
++		{json: `{"h2Flow": {"enabled": true, "queueCuts": false}}`, mode: 1, noCuts: true},
++		{json: `{"h2Flow": {"enabled": true, "queueCuts": true}}`, mode: 1},
+ 	} {
+ 		c, err := build(tc.json)
+ 		if err != nil {
+@@ -46,7 +49,7 @@ func TestXHTTPH2Flow(t *testing.T) {
+ 			t.Fatalf("%s: h2Flow present = %v", tc.json, f != nil)
+ 		}
+ 		if f.GetMode() != tc.mode || f.GetMaxStreamReceiveWindow() != tc.stream || f.GetMaxConnectionReceiveWindow() != tc.conn ||
+-			f.GetMaxConnectionSendWindow() != tc.send {
++			f.GetMaxConnectionSendWindow() != tc.send || f.GetNoQueueCuts() != tc.noCuts {
+ 			t.Errorf("%s: got %v", tc.json, f)
+ 		}
+ 	}
+diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
+index 4f437cf3..ff633892 100644
+--- a/infra/conf/transport_method.go
++++ b/infra/conf/transport_method.go
+@@ -303,12 +303,14 @@ type SplitHTTPConfig struct {
+ // "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
+ // receive windows are what this side grants for data it receives.
+ // "maxConnectionSendWindow" is what a governed server lets one connection's
+-// client hold of its data; -1 lifts that limit.
++// client hold of its data; -1 lifts that limit. "queueCuts": false leaves the
++// queue on the path to TCP, see splithttp.H2FlowConfig.NoQueueCuts.
+ type H2FlowConfig struct {
+ 	Enabled                    *bool `json:"enabled"`
+ 	MaxStreamReceiveWindow     int32 `json:"maxStreamReceiveWindow"`
+ 	MaxConnectionReceiveWindow int32 `json:"maxConnectionReceiveWindow"`
+ 	MaxConnectionSendWindow    int32 `json:"maxConnectionSendWindow"`
++	QueueCuts                  *bool `json:"queueCuts"`
+ }
+ 
+ // HTTP/2 windows below the protocol's initial window would stall a stream;
+@@ -326,6 +328,7 @@ func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
+ 		MaxStreamReceiveWindow:     c.MaxStreamReceiveWindow,
+ 		MaxConnectionReceiveWindow: c.MaxConnectionReceiveWindow,
+ 		MaxConnectionSendWindow:    c.MaxConnectionSendWindow,
++		NoQueueCuts:                c.QueueCuts != nil && !*c.QueueCuts,
+ 	}
+ 	if c.Enabled != nil {
+ 		config.Mode = 2
+diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
+index 80db30af..cee7e0a0 100644
+--- a/transport/internet/splithttp/config.pb.go
++++ b/transport/internet/splithttp/config.pb.go
+@@ -87,8 +87,11 @@ type H2FlowConfig struct {
+ 	// data plus unused window, over all its streams. 0 keeps the default,
+ 	// -1 lifts the limit.
+ 	MaxConnectionSendWindow int32 `protobuf:"varint,4,opt,name=maxConnectionSendWindow,proto3" json:"maxConnectionSendWindow,omitempty"`
+-	unknownFields           protoimpl.UnknownFields
+-	sizeCache               protoimpl.SizeCache
++	// true leaves the queue on the path to TCP: a governed server does not cut
++	// its downloads against it. Their windows still follow their readers.
++	NoQueueCuts   bool `protobuf:"varint,5,opt,name=noQueueCuts,proto3" json:"noQueueCuts,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
+ }
+ 
+ func (x *H2FlowConfig) Reset() {
+@@ -149,6 +152,13 @@ func (x *H2FlowConfig) GetMaxConnectionSendWindow() int32 {
+ 	return 0
+ }
+ 
++func (x *H2FlowConfig) GetNoQueueCuts() bool {
++	if x != nil {
++		return x.NoQueueCuts
++	}
++	return false
++}
++
+ type XmuxConfig struct {
+ 	state            protoimpl.MessageState `protogen:"open.v1"`
+ 	MaxConcurrency   *RangeConfig           `protobuf:"bytes,1,opt,name=maxConcurrency,proto3" json:"maxConcurrency,omitempty"`
+@@ -532,12 +542,13 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+ 	")transport/internet/splithttp/config.proto\x12!xray.transport.internet.splithttp\x1a\x1ftransport/internet/config.proto\"1\n" +
+ 	"\vRangeConfig\x12\x12\n" +
+ 	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
+-	"\x02to\x18\x02 \x01(\x05R\x02to\"\xd4\x01\n" +
++	"\x02to\x18\x02 \x01(\x05R\x02to\"\xf6\x01\n" +
+ 	"\fH2FlowConfig\x12\x12\n" +
+ 	"\x04mode\x18\x01 \x01(\x05R\x04mode\x126\n" +
+ 	"\x16maxStreamReceiveWindow\x18\x02 \x01(\x05R\x16maxStreamReceiveWindow\x12>\n" +
+ 	"\x1amaxConnectionReceiveWindow\x18\x03 \x01(\x05R\x1amaxConnectionReceiveWindow\x128\n" +
+-	"\x17maxConnectionSendWindow\x18\x04 \x01(\x05R\x17maxConnectionSendWindow\"\xf8\x03\n" +
++	"\x17maxConnectionSendWindow\x18\x04 \x01(\x05R\x17maxConnectionSendWindow\x12 \n" +
++	"\vnoQueueCuts\x18\x05 \x01(\bR\vnoQueueCuts\"\xf8\x03\n" +
+ 	"\n" +
+ 	"XmuxConfig\x12V\n" +
+ 	"\x0emaxConcurrency\x18\x01 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0emaxConcurrency\x12V\n" +
+diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
+index a26a544e..6ebc6b7f 100644
+--- a/transport/internet/splithttp/config.proto
++++ b/transport/internet/splithttp/config.proto
+@@ -25,6 +25,9 @@ message H2FlowConfig {
+   // data plus unused window, over all its streams. 0 keeps the default,
+   // -1 lifts the limit.
+   int32 maxConnectionSendWindow = 4;
++  // true leaves the queue on the path to TCP: a governed server does not cut
++  // its downloads against it. Their windows still follow their readers.
++  bool noQueueCuts = 5;
+ }
+ 
+ message XmuxConfig {
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index cbe36477..bee363d4 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -179,6 +179,9 @@ type flowListener struct {
+ 	// sendWindow is what one connection's client may hold, 0 for no
+ 	// limit, see flowConn.downRelease.
+ 	sendWindow int64
++	// noQueueCuts leaves the queue on the path to TCP, see
++	// flowConn.noQueueCuts.
++	noQueueCuts bool
+ }
+ 
+ func (l *flowListener) Accept() (net.Conn, error) {
+@@ -187,7 +190,7 @@ func (l *flowListener) Accept() (net.Conn, error) {
+ 		return nil, err
+ 	}
+ 	fc := newFlowConn(c, l.up, l.down)
+-	fc.sendWindow = l.sendWindow
++	fc.sendWindow, fc.noQueueCuts = l.sendWindow, l.noQueueCuts
+ 	if l.connWindow > 0 {
+ 		fc.upConnGrant, fc.upConnGrantKnown = int64(max(l.connWindow, h2InitWindow)-h2InitWindow), true
+ 	}
+@@ -680,6 +683,13 @@ type flowConn struct {
+ 	kAt   time.Time
+ 	kOK   bool
+ 
++	// noQueueCuts leaves the queue on the path to TCP: a server that sets
++	// it neither runs pi nor cuts against a long queue, and its downloads'
++	// windows follow their readers alone, held while a queue stands. Such
++	// a server never takes a download below its share of a link that other
++	// traffic keeps full, and holds its own queue no shorter than TCP does.
++	noQueueCuts bool
++
+ 	// path is what this server's connections from the same client share
+ 	// of the queue, see foreignQueue, looked up once it is first needed:
+ 	// asking a connection behind a PROXY header for its peer waits for that
+@@ -1793,14 +1803,14 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		default:
+ 			q = c.queueing(now)
+ 		}
+-		foreign := !c.client && c.foreignQueue(now)
++		foreign := !c.client && !c.noQueueCuts && c.foreignQueue(now)
+ 		if foreign {
+ 			q = 0
+ 		}
+ 		switch {
+ 		case c.client && c.modelled(now) && s.down.settled():
+ 			s.down.model(now, c.currentRTT(), c.down.init, c.down.max)
+-		case !c.client && !foreign && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
++		case !c.client && !c.noQueueCuts && !foreign && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
+ 			// Only clients that credit in small steps: one that waits for
+ 			// half of its own window could be held below that half. Only
+ 			// where the kernel sees the path: behind a TCP proxy it sees
+@@ -1817,7 +1827,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 			if !c.floorConfirmed(now) {
+ 				s.down.cap = min(s.down.cap, flowUnconfirmedDown)
+ 			}
+-		case q == 2 && now.Sub(s.down.qAt) >= c.currentRTT():
++		case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
+ 			s.down.qAt = now
+ 			s.down.cap = max(c.down.init, s.down.cap/4*3)
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_foreign_test.go b/transport/internet/splithttp/h2flow_foreign_test.go
+index 45d38e5e..bab31200 100644
+--- a/transport/internet/splithttp/h2flow_foreign_test.go
++++ b/transport/internet/splithttp/h2flow_foreign_test.go
+@@ -308,3 +308,40 @@ func TestFlowPathTakesLongestQueue(t *testing.T) {
+ 		t.Fatal("a queue no connection has reported for long still holds the verdict")
+ 	}
+ }
++
++// TestFlowNoQueueCuts is a download against a standing queue on a server
++// that leaves the queue to TCP: neither pi nor the cut at a long queue takes
++// its cap down, where the same server without the setting cuts it.
++func TestFlowNoQueueCuts(t *testing.T) {
++	for _, noCuts := range []bool{false, true} {
++		h, s := queuedDownload(t)
++		h.c.mu.Lock()
++		h.c.noQueueCuts = noCuts
++		h.c.mu.Unlock()
++		got := credit(h, s)
++		if cut := got < 1<<20; cut == noCuts {
++			t.Fatalf("noQueueCuts %v: the cap went from 1 MiB to %d", noCuts, got)
++		}
++	}
++}
++
++// TestFlowNoQueueCutsStopsPI is a queue of 60 ms over an empty 50 ms, short
++// of the cut at a long queue but well over pi's setpoint, on a download pi
++// governs: a client that returns credit in small steps, a reader that has
++// settled, a round trip measured. pi cuts it, unless the server leaves the
++// queue to TCP.
++func TestFlowNoQueueCutsStopsPI(t *testing.T) {
++	for _, noCuts := range []bool{false, true} {
++		h, s := queuedDownload(t)
++		h.c.mu.Lock()
++		h.c.noQueueCuts, h.c.incremental = noCuts, true
++		h.c.kstat.rtt = 110 * time.Millisecond
++		s.down.flat = flowFullRounds
++		s.down.mark = time.Now().Add(-200 * time.Millisecond)
++		h.c.mu.Unlock()
++		got := credit(h, s)
++		if cut := got < 1<<20; cut == noCuts {
++			t.Fatalf("noQueueCuts %v: pi took the cap from 1 MiB to %d", noCuts, got)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index 7e124afc..4bf7973a 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -568,7 +568,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 			HTTP2:             l.config.h2ReceiveConfig(true),
+ 		}
+ 		if l.config.h2FlowOn() {
+-			fl := &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault, sendWindow: l.config.h2SendWindow()}
++			fl := &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault, sendWindow: l.config.h2SendWindow(), noQueueCuts: l.config.GetH2Flow().GetNoQueueCuts()}
+ 			if h2 := l.server.HTTP2; h2 != nil && h2.MaxReceiveBufferPerConnection > 0 {
+ 				fl.connWindow = int32(min(h2.MaxReceiveBufferPerConnection, h2MaxWindow))
+ 			} else {
+-- 
+2.52.0.windows.1
+

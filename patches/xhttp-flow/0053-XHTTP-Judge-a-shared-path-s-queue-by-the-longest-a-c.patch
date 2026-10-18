@@ -1,0 +1,184 @@
+From bd3760704fd1fdee24118f358b138dcd10adb39e Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 10:03:00 +0300
+Subject: [PATCH] XHTTP: Judge a shared path's queue by the longest a
+ connection sees
+
+Clients behind one address, as behind a carrier NAT, share a flow path without sharing a bottleneck. The queue was the one the last reporting connection saw, so a client with an empty path reset another's episode and ended its verdict, and that client's downloads were cut again against the queue other traffic kept. Each connection now reports its queue with what it has in flight, and the path takes the longest one reported within four round trips.
+---
+ transport/internet/splithttp/h2flow.go        | 40 +++++++++++++------
+ .../internet/splithttp/h2flow_foreign_test.go | 40 +++++++++++++++++--
+ 2 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 73eafd12..cbe36477 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -744,6 +744,7 @@ func (c *flowConn) queueing(now time.Time) int {
+ // after its last connection closes, as a client opens new ones, and takes a
+ // new floor as often, as the kernel does.
+ const (
++	flowPathFresh     = 4
+ 	flowSuspectRounds = 2
+ 	flowForeignRounds = 32
+ 	flowPathKeep      = 5 * time.Minute
+@@ -758,8 +759,7 @@ type flowPath struct {
+ 
+ 	mu sync.Mutex
+ 	// floor is the least empty-path round trip of the path's connections
+-	// since floorAt. inFlight is what each connection's open downloads have
+-	// in flight and what it has in the network. cutQ is the queue when it
++	// since floorAt. conns is what each connection reported last. cutQ is the queue when it
+ 	// first stood over the bar, zero while it does not, and cutIn the most
+ 	// of each since; suspectAt is when both halved with the queue where it
+ 	// was, zero while not. foreignAt is when
+@@ -767,13 +767,22 @@ type flowPath struct {
+ 	// server's own.
+ 	floor     time.Duration
+ 	floorAt   time.Time
+-	inFlight  map[*flowConn][2]int64
++	conns     map[*flowConn]flowPathConn
+ 	cutQ      time.Duration
+ 	cutIn     [2]int64
+ 	suspectAt time.Time
+ 	foreignAt time.Time
+ }
+ 
++// flowPathConn is what a connection last told its path: what its open
++// downloads have in flight, what it has in the network, the queue it saw
++// and when.
++type flowPathConn struct {
++	inFlight, inNet int64
++	queue           time.Duration
++	at              time.Time
++}
++
+ var (
+ 	flowPathsMu    sync.Mutex
+ 	flowPaths      = map[string]*flowPath{}
+@@ -800,7 +809,7 @@ func flowPathOf(c net.Conn) *flowPath {
+ 	}
+ 	p := flowPaths[key]
+ 	if p == nil {
+-		p = &flowPath{key: key, inFlight: map[*flowConn][2]int64{}}
++		p = &flowPath{key: key, conns: map[*flowConn]flowPathConn{}}
+ 		flowPaths[key] = p
+ 	}
+ 	p.refs++
+@@ -810,7 +819,7 @@ func flowPathOf(c net.Conn) *flowPath {
+ // release drops c's reference to p and what it had in flight.
+ func (p *flowPath) release(c *flowConn) {
+ 	p.mu.Lock()
+-	delete(p.inFlight, c)
++	delete(p.conns, c)
+ 	p.mu.Unlock()
+ 	flowPathsMu.Lock()
+ 	defer flowPathsMu.Unlock()
+@@ -849,14 +858,21 @@ func (c *flowConn) foreignQueue(now time.Time) bool {
+ 	st.minRTT = p.floor
+ 	// The bar leaves the jitter out, unlike pi's setpoint: a queue that
+ 	// other traffic keeps full swings the round trip by as much as it holds.
+-	queue, bar := st.rtt-st.minRTT, 2*max(st.minRTT/4, flowPIMinSet)
+-	if p.inFlight == nil {
+-		p.inFlight = map[*flowConn][2]int64{}
+-	}
+-	p.inFlight[c] = [2]int64{max(0, c.downOpenSent-c.downOpenReturned), c.kstat.unacked}
++	bar := 2 * max(st.minRTT/4, flowPIMinSet)
++	if p.conns == nil {
++		p.conns = map[*flowConn]flowPathConn{}
++	}
++	p.conns[c] = flowPathConn{max(0, c.downOpenSent-c.downOpenReturned), c.kstat.unacked, st.rtt - st.minRTT, now}
++	// The queue is the longest a connection has seen lately. Clients behind
++	// one address, as behind a carrier NAT, share the path without sharing
++	// a bottleneck: one with an empty path must not end another's verdict.
+ 	var in [2]int64
+-	for _, n := range p.inFlight {
+-		in[0], in[1] = in[0]+n[0], in[1]+n[1]
++	var queue time.Duration
++	for _, n := range p.conns {
++		in[0], in[1] = in[0]+n.inFlight, in[1]+n.inNet
++		if now.Sub(n.at) < flowPathFresh*st.rtt {
++			queue = max(queue, n.queue)
++		}
+ 	}
+ 	switch {
+ 	case !p.foreignAt.IsZero():
+diff --git a/transport/internet/splithttp/h2flow_foreign_test.go b/transport/internet/splithttp/h2flow_foreign_test.go
+index d4e9a662..45d38e5e 100644
+--- a/transport/internet/splithttp/h2flow_foreign_test.go
++++ b/transport/internet/splithttp/h2flow_foreign_test.go
+@@ -16,7 +16,7 @@ func queuedPath(c *flowConn, minRTT, rtt time.Duration) {
+ 	c.kstat = tcpStats{rtt: rtt, minRTT: minRTT}
+ 	c.rttBase = minRTT
+ 	if c.path == nil {
+-		c.path, c.pathSet = &flowPath{inFlight: map[*flowConn][2]int64{}}, true
++		c.path, c.pathSet = &flowPath{conns: map[*flowConn]flowPathConn{}}, true
+ 	}
+ }
+ 
+@@ -145,7 +145,7 @@ func TestFlowForeignQueueEnds(t *testing.T) {
+ // queue is foreign. A connection alone would have taken its own halving for
+ // the verdict, with the other's data the queue.
+ func TestFlowInFlightSpansConnections(t *testing.T) {
+-	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
++	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
+ 	a := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+ 	b := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+ 	queuedPath(a, 50*time.Millisecond, 500*time.Millisecond)
+@@ -164,7 +164,7 @@ func TestFlowInFlightSpansConnections(t *testing.T) {
+ 		t.Fatal("the path's data halved with the queue where it was, and it is not foreign")
+ 	}
+ 	path.release(a)
+-	if _, ok := path.inFlight[a]; ok {
++	if _, ok := path.conns[a]; ok {
+ 		t.Fatal("a released connection still counts for the path")
+ 	}
+ }
+@@ -174,7 +174,7 @@ func TestFlowInFlightSpansConnections(t *testing.T) {
+ // path keeps the least empty-path round trip of all its connections, 50 ms,
+ // and the queue counts as foreign all the same.
+ func TestFlowPathFloor(t *testing.T) {
+-	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
++	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
+ 	early := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+ 	queuedPath(early, 50*time.Millisecond, 60*time.Millisecond)
+ 	now := time.Now()
+@@ -276,3 +276,35 @@ func TestFlowBarLeavesJitterOut(t *testing.T) {
+ 		t.Fatal("a queue of 600 ms that swings by 300 ms is not foreign")
+ 	}
+ }
++
++// TestFlowPathTakesLongestQueue is two clients behind one address: A's
++// path holds a queue other traffic keeps at 450 ms, B's is empty. B's
++// reports must not end A's episode: the path takes the longest queue a
++// connection has seen lately, and A's queue is foreign all the same. Once
++// A has not reported for flowPathFresh round trips, its queue no longer
++// counts.
++func TestFlowPathTakesLongestQueue(t *testing.T) {
++	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
++	a := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
++	b := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
++	queuedPath(a, 50*time.Millisecond, 500*time.Millisecond)
++	queuedPath(b, 50*time.Millisecond, 55*time.Millisecond)
++	now := time.Now()
++	inFlight(a, 4<<20)
++	a.foreignQueue(now)
++	b.foreignQueue(now.Add(time.Millisecond))
++	inFlight(a, 1<<20)
++	a.foreignQueue(now.Add(time.Second))
++	b.foreignQueue(now.Add(time.Second + time.Millisecond))
++	verdict := now.Add(time.Second + flowSuspectRounds*500*time.Millisecond)
++	if !a.foreignQueue(verdict) {
++		t.Fatal("a client with an empty path behind the same address ended another's verdict")
++	}
++	// Well inside flowForeignRounds of B's round trip, so that only A's
++	// queue going stale can end the verdict.
++	late := verdict.Add(flowPathFresh*55*time.Millisecond + time.Millisecond)
++	b.foreignQueue(late)
++	if b.foreignQueue(late.Add(flowSuspectRounds * 55 * time.Millisecond)) {
++		t.Fatal("a queue no connection has reported for long still holds the verdict")
++	}
++}
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,405 @@
+From 9eec9a013bcdc423c5a130b3a1748118b07a46bb Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:09:58 +0300
+Subject: [PATCH] XHTTP: Judge the flow governor's gain by its own cuts
+
+Only the bytes pi and the cut at a long queue take count as a cut, once what is in flight has come down with them; a loss, the caps following the round trip and a dip of other traffic's queue no longer read as one. A download that returns no credit in a round stays in the caps for a second, and a queue that halves gives the cuts their gain back.
+---
+ transport/internet/splithttp/h2flow.go        | 35 +++++---
+ transport/internet/splithttp/h2flow_effect.go | 71 +++++++++++-----
+ .../internet/splithttp/h2flow_effect_test.go  | 84 ++++++++++++++++++-
+ .../splithttp/h2flow_queuecuts_test.go        | 24 ++++++
+ 4 files changed, 178 insertions(+), 36 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index dac36010..c923b114 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -393,8 +393,10 @@ type flowWindow struct {
+ 	steady   int
+ 	piPrev   float64
+ 	piRTT    time.Duration
+-	// noted is returned as of the connection's last flowEffect note.
+-	noted int64
++	// noted is returned as of the connection's last flowEffect note, and
++	// tookAt when it last grew.
++	noted  int64
++	tookAt time.Time
+ }
+ 
+ // adjust sets the cap to twice what the reader consumed over the last round
+@@ -529,11 +531,12 @@ const (
+ // catches up with a path that got faster. A reader that takes less than a
+ // quarter of what the window gives it per round limits itself: the cap does
+ // not grow then, and shrinks by a quarter after flowShrinkAfter such rounds.
+-// Cuts are scaled by gain, see flowEffect.
+-func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain float64) {
++// Cuts are scaled by gain, see flowEffect, and pi returns the bytes it cut
++// against the queue.
++func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain float64) (cut float64) {
+ 	round := now.Sub(w.mark)
+ 	if round < max(st.minRTT, flowModelMinRound) {
+-		return
++		return 0
+ 	}
+ 	copied := w.returned - w.markBase
+ 	w.mark, w.markBase = now, w.returned
+@@ -549,6 +552,7 @@ func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain floa
+ 	delta = min(max(delta, -flowPIMaxStep*cap), flowPIMaxStep*cap)
+ 	if delta < 0 {
+ 		delta *= gain
++		cut = -delta
+ 	}
+ 	if w.piRTT > 0 {
+ 		// Where cuts do not move the queue, the cap follows the round trip,
+@@ -577,6 +581,7 @@ func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain floa
+ 		w.slow = 0
+ 	}
+ 	w.cap = int32(min(max(int64(cap+delta), int64(init)), int64(limit)))
++	return cut
+ }
+ 
+ // flowLearned remembers the largest cap a stream on this connection needed
+@@ -731,20 +736,24 @@ func (c *flowConn) queueing(now time.Time) int {
+ 
+ // cutGain is how much of a cut against the queue takes effect, see
+ // flowEffect: the connection notes its round trip, the bytes its kernel has
+-// in flight and the caps of the downloads that took data since the last
+-// note, once per round trip of the empty path. A stream that carries no
+-// data, as an upload's beside the download, would have its cap stand for
+-// a cut that never moved.
++// in flight and the caps of the downloads that took data lately, once per
++// round trip of the empty path. A stream that carries no data, as an
++// upload's beside the download, would have its cap stand for a cut that
++// never moved. Lately, not since the last note: a download that slows
++// returns credit less often than once a round, and a round it missed would
++// take its cap out of the sum, a cut that never happened.
+ func (c *flowConn) cutGain(now time.Time) float64 {
+ 	if !c.kOK || !c.effect.due(now, max(c.kstat.minRTT, flowModelMinRound)) {
+ 		return c.effect.value()
+ 	}
+ 	var caps int64
+ 	for _, s := range c.streams {
+-		if !s.serverDone && s.down.returned != s.down.noted {
++		if s.down.returned != s.down.noted {
++			s.down.noted, s.down.tookAt = s.down.returned, now
++		}
++		if !s.serverDone && now.Sub(s.down.tookAt) < max(flowEffectRecent*c.kstat.minRTT, time.Second) {
+ 			caps += int64(s.down.cap)
+ 		}
+-		s.down.noted = s.down.returned
+ 	}
+ 	set := max(c.kstat.minRTT/4, 4*c.kstat.rttVar, flowPIMinSet)
+ 	return c.effect.note(now, c.kstat.rtt, c.kstat.minRTT, set, c.kstat.inFlight, caps)
+@@ -1640,7 +1649,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 			// half of its own window could be held below that half. Only
+ 			// where the kernel sees the path: behind a TCP proxy it sees
+ 			// no queue at all.
+-			s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now))
++			c.effect.cutBy(s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now)))
+ 		default:
+ 			s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
+ 			// A round trip pi saw before the stream left it is no step to
+@@ -1657,7 +1666,9 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 			}
+ 		case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
+ 			s.down.qAt = now
++			before := s.down.cap
+ 			s.down.cap = max(c.down.init, s.down.cap-int32(c.cutGain(now)*float64(s.down.cap/4)))
++			c.effect.cutBy(float64(before - s.down.cap))
+ 		}
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+diff --git a/transport/internet/splithttp/h2flow_effect.go b/transport/internet/splithttp/h2flow_effect.go
+index a24b7827..7cc452aa 100644
+--- a/transport/internet/splithttp/h2flow_effect.go
++++ b/transport/internet/splithttp/h2flow_effect.go
+@@ -8,14 +8,13 @@ import "time"
+ // winding up against an error nothing it does removes, takes the downloads
+ // to init per round trip. So each connection measures what its cuts do:
+ // over an episode of standing queue, how far the queue fell from its peak
+-// for how far a cut brought down what the kernel has in flight, the caps
+-// and the rate the caps allow over the round trip, the least of the three.
+-// What is in flight, as a cut lands only once the data in flight comes down
+-// to it: where the queue is the server's own, by Little's law it falls with
+-// what is in flight, and where it is foreign only the download's share of
+-// the rate does. The caps, as a loss beside other traffic drops what is in
+-// flight while other senders back off, and the queue with it. The rate, as a
+-// cap that follows the round trip down is no cut either.
++// for the share of the caps the controller cut, once the cut has landed in
++// what the kernel has in flight. Where the queue is the server's own, by
++// Little's law it falls with what is in flight; where it is foreign only the
++// download's share of the rate does. Only the controller's own cuts count: a
++// loss that drops what is in flight, the caps following the round trip down
++// and a dip of other traffic's queue move together now and then, and read
++// together as a cut that worked.
+ //
+ // Cuts are scaled by that gain; growth is not, and where cuts have less
+ // gain the caps follow the round trip by as much more, so the download keeps
+@@ -23,8 +22,9 @@ import "time"
+ // connections share a queue of the server's own, each one's cut moves the
+ // queue by its share, and all of them cutting by their shares drain it.
+ const (
+-	// flowEffectProbe is how far a cut must bring the three down from their
+-	// peaks before the queue's answer counts: until then cuts work in full.
++	// flowEffectProbe is the share of the caps a cut must take, and of what
++	// is in flight it must bring down, before the queue's answer counts:
++	// until then cuts work in full.
+ 	flowEffectProbe = 0.2
+ 	// An episode is a queue over flowEffectAbove times the setpoint: the PI
+ 	// controller holds the queue at the setpoint, and an episode that took
+@@ -32,6 +32,9 @@ const (
+ 	// an old peak. flowEffectClear rounds in a row back under it end one.
+ 	flowEffectAbove = 1.25
+ 	flowEffectClear = 2
++	// flowEffectRecent is the round trips of the empty path, and at least a
++	// second, within which a download that took data counts as taking it.
++	flowEffectRecent = 8
+ )
+ 
+ type flowEffect struct {
+@@ -41,17 +44,22 @@ type flowEffect struct {
+ 	clear     int
+ 	flightTop float64
+ 	capsTop   float64
+-	rateTop   float64
+ 	qTop      float64
++	cut       float64
+ 	gain      float64
+ }
+ 
++// cutBy notes bytes the controller cut from the caps against the queue.
++func (e *flowEffect) cutBy(bytes float64) {
++	e.cut += bytes
++}
++
+ // note takes the round trip the kernel reads and that of the empty path, the
+ // setpoint, the bytes in flight and the caps of the downloads that took data,
+ // once per round. It returns the gain cuts are scaled by: 1 outside an
+-// episode and until a cut has brought the three down by flowEffectProbe;
+-// then the share by which the queue fell for the share of that cut, as of
+-// the last such cut.
++// episode, until the controller has cut flowEffectProbe of the caps and what
++// is in flight has come down as far, and once the queue halves; otherwise
++// the share by which the queue fell for the share of the last such cut.
+ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFlight, caps int64) float64 {
+ 	e.at = now
+ 	// The kernel's smoothed round trip, as it is: smoothing it again would
+@@ -59,7 +67,6 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
+ 	// took effect read as one that did not.
+ 	e.queue = float64(rtt - minRTT)
+ 	x, c := float64(inFlight), float64(caps)
+-	r := c / float64(max(rtt, time.Millisecond))
+ 	if e.queue <= flowEffectAbove*float64(set) {
+ 		if e.clear++; e.clear >= flowEffectClear {
+ 			e.active = false
+@@ -69,19 +76,41 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
+ 	e.clear = 0
+ 	if !e.active {
+ 		e.active, e.gain = true, 1
+-		e.flightTop, e.capsTop, e.rateTop, e.qTop = x, c, r, e.queue
++		e.start(x, c)
++		return 1
++	}
++	e.flightTop, e.qTop = max(e.flightTop, x), max(e.qTop, e.queue)
++	// A queue that halved since the last judgement drained by the client's
++	// own cuts, this connection's or its neighbours': cuts have their gain
++	// back. Other traffic's queue at a full buffer wanders by a tenth, and
++	// halves only as that traffic leaves.
++	if e.gain < 1 && e.queue <= e.qTop/2 {
++		e.gain = 1
++		e.start(x, c)
+ 		return 1
+ 	}
+-	e.flightTop, e.capsTop, e.rateTop, e.qTop = max(e.flightTop, x), max(e.capsTop, c), max(e.rateTop, r), max(e.qTop, e.queue)
+-	// Without a cut deep enough to judge by, the gain stays what the last one
+-	// showed: a cap held where cuts did nothing brings what is in flight back
+-	// to its peak, and must not take that for leave to cut again.
+-	if cut := min(1-x/e.flightTop, 1-c/e.capsTop, 1-r/e.rateTop); cut >= flowEffectProbe {
++	// Only what the controller cut counts, and only once it has landed in
++	// what is in flight. The caps following the round trip down, a loss that
++	// drops what is in flight, and a dip of other traffic's queue each move
++	// with the others now and then, and taken together read as a cut that
++	// worked. Without a cut deep enough to judge by, the gain stays what the
++	// last one showed; without gain the controller does not cut, and the gain
++	// stays none until the queue halves or is gone.
++	if e.capsTop <= 0 {
++		return e.gain
++	}
++	if cut := min(e.cut/e.capsTop, 1-x/e.flightTop); cut >= flowEffectProbe {
+ 		e.gain = min(max((1-e.queue/e.qTop)/cut, 0), 1)
++		e.start(x, c)
+ 	}
+ 	return e.gain
+ }
+ 
++// start begins a measurement from now: the next cut is judged from here.
++func (e *flowEffect) start(x, c float64) {
++	e.flightTop, e.capsTop, e.qTop, e.cut = x, c, e.queue, 0
++}
++
+ // due reports whether a round has passed since the last note.
+ func (e *flowEffect) due(now time.Time, round time.Duration) bool {
+ 	return e.at.IsZero() || now.Sub(e.at) >= round
+diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
+index aeb1d30e..a0894637 100644
+--- a/transport/internet/splithttp/h2flow_effect_test.go
++++ b/transport/internet/splithttp/h2flow_effect_test.go
+@@ -7,14 +7,25 @@ import (
+ 
+ // rounds feeds e one round each 100 ms from start: the queue and the bytes
+ // in flight of each step, with caps as large as what is in flight unless a
+-// third value gives them, against a 20 ms setpoint. It returns the last gain.
++// third value gives them, against a 20 ms setpoint. What the caps fell by
++// since the step before counts as the controller's cut unless a fourth value
++// gives the cut. It returns the last gain.
+ func rounds(e *flowEffect, start time.Time, steps [][]int64) float64 {
+ 	g := e.value()
++	var prev int64
+ 	for i, s := range steps {
+ 		caps := s[1]
+ 		if len(s) > 2 {
+ 			caps = s[2]
+ 		}
++		cut := max(0, prev-caps)
++		if len(s) > 3 {
++			cut = s[3]
++		}
++		if i > 0 {
++			e.cutBy(float64(cut))
++		}
++		prev = caps
+ 		g = e.note(start.Add(time.Duration(i)*100*time.Millisecond), time.Duration(100+s[0])*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond, s[1], caps)
+ 	}
+ 	return g
+@@ -86,7 +97,7 @@ func TestFlowEffectEpisodeEnds(t *testing.T) {
+ // and the gain stays as it was.
+ func TestFlowEffectLossIsNoCut(t *testing.T) {
+ 	var e flowEffect
+-	g := rounds(&e, time.Now(), [][]int64{{100, 1000}, {110, 700}, {120, 1000, 1000}, {60, 500, 1000}, {50, 450, 1000}})
++	g := rounds(&e, time.Now(), [][]int64{{100, 1000}, {110, 700}, {120, 1000, 1000}, {85, 500, 1000}, {80, 450, 1000}})
+ 	if g != 0 {
+ 		t.Fatalf("gain %v after a loss under a held cap", g)
+ 	}
+@@ -98,7 +109,7 @@ func TestFlowEffectLossIsNoCut(t *testing.T) {
+ // stays as it was.
+ func TestFlowEffectFollowIsNoCut(t *testing.T) {
+ 	var e flowEffect
+-	g := rounds(&e, time.Now(), [][]int64{{900, 1000}, {950, 700}, {1000, 1100}, {800, 900}, {600, 700}})
++	g := rounds(&e, time.Now(), [][]int64{{900, 1000}, {950, 700}, {1000, 1100, 1100, 0}, {800, 900, 900, 0}, {600, 700, 700, 0}})
+ 	if g != 0 {
+ 		t.Fatalf("gain %v for a cap that followed the round trip down", g)
+ 	}
+@@ -181,6 +192,7 @@ func TestFlowEffectCountsDownloadsOnly(t *testing.T) {
+ 	// The download is cut by a third and takes data; the queue stands.
+ 	down.down.cap, down.down.returned = 700<<10, 2
+ 	c.kstat.inFlight = 700 << 10
++	c.effect.cutBy(300 << 10)
+ 	if g := c.cutGain(now.Add(time.Second)); g != 0 {
+ 		t.Fatalf("gain %v for a download cut against a queue that did not move", g)
+ 	}
+@@ -198,3 +210,69 @@ func TestFlowPIFollowsOneStep(t *testing.T) {
+ 		t.Fatalf("cap %d from %d in one step", w.cap, 1<<20)
+ 	}
+ }
++
++// TestFlowEffectCountsSlowDownload is a download that returns no credit in a
++// round, as one beside a long queue does: its cap stays in the sum, so that
++// the round reads as no cut.
++func TestFlowEffectCountsSlowDownload(t *testing.T) {
++	down := &flowStream{}
++	down.down.cap = 1 << 20
++	c := &flowConn{streams: map[uint32]*flowStream{1: down}, kOK: true}
++	c.kstat = tcpStats{rtt: 300 * time.Millisecond, minRTT: 100 * time.Millisecond, inFlight: 1 << 20}
++	now := time.Now()
++	down.down.returned = 1
++	c.cutGain(now)
++	// A round with no credit from the download, and what is in flight down
++	// as TCP loses a little; the queue stands.
++	c.kstat.inFlight = 700 << 10
++	if g := c.cutGain(now.Add(200 * time.Millisecond)); g != 1 {
++		t.Fatalf("gain %v after a round the download returned nothing in", g)
++	}
++}
++
++// TestFlowEffectNoiseIsNoCut is a held cap beside other traffic in the
++// minute after cuts lost their gain: a loss halves what is in flight, the
++// caps follow the round trip down a quarter, and the other traffic's queue
++// dips a tenth, all at once. None of it is a cut of the controller's, and the
++// gain stays none.
++func TestFlowEffectNoiseIsNoCut(t *testing.T) {
++	var e flowEffect
++	g := rounds(&e, time.Now(), [][]int64{{1000, 2000}, {1010, 1400}, {1300, 2800, 2800, 0}, {1170, 1400, 2100, 0}, {1150, 1300, 2000, 0}})
++	if g != 0 {
++		t.Fatalf("gain %v from a loss, a follow and a dip together", g)
++	}
++}
++
++// TestFlowEffectHalvedQueueGivesGainBack is a queue cuts did nothing against
++// that then halves, drained by the client's other connections: the cuts have
++// their full gain back.
++func TestFlowEffectHalvedQueueGivesGainBack(t *testing.T) {
++	var e flowEffect
++	if g := rounds(&e, time.Now(), [][]int64{{100, 1000}, {105, 700}, {80, 700, 700, 0}, {50, 700, 700, 0}}); g != 1 {
++		t.Fatalf("gain %v once the queue halved", g)
++	}
++}
++
++// TestFlowEffectCutMustLand is a cut of three tenths of the caps that what
++// is in flight has not come down by yet: the queue cannot have answered it,
++// and the gain stays full.
++func TestFlowEffectCutMustLand(t *testing.T) {
++	var e flowEffect
++	if g := rounds(&e, time.Now(), [][]int64{{100, 1000}, {105, 1000, 700, 300}}); g != 1 {
++		t.Fatalf("gain %v for a cut that has not landed", g)
++	}
++}
++
++// TestFlowPIReturnsCut is pi over a queue far above the setpoint: it returns
++// the bytes it took off the cap, scaled by the gain.
++func TestFlowPIReturnsCut(t *testing.T) {
++	st := tcpStats{rtt: 300 * time.Millisecond, minRTT: 100 * time.Millisecond}
++	for _, gain := range []float64{1, 0.5} {
++		w := flowWindow{cap: 1 << 20, mark: time.Now()}
++		w.returned = 1 << 20
++		cut := w.pi(w.mark.Add(st.rtt), st, h2InitWindow, 1<<30, gain)
++		if got := float64(1<<20 - w.cap); cut <= 0 || got < cut-1 || got > cut+1 {
++			t.Fatalf("gain %v: pi returned %v, the cap fell by %v", gain, cut, got)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_queuecuts_test.go b/transport/internet/splithttp/h2flow_queuecuts_test.go
+index 5a272f0b..d871996b 100644
+--- a/transport/internet/splithttp/h2flow_queuecuts_test.go
++++ b/transport/internet/splithttp/h2flow_queuecuts_test.go
+@@ -90,3 +90,27 @@ func TestFlowPIForgetsRoundTripOutside(t *testing.T) {
+ 		t.Fatalf("pi's round trip %v kept outside pi", s.down.piRTT)
+ 	}
+ }
++
++// TestFlowCutsAreCounted is a download against a standing queue, cut by pi
++// and by the cut at a long queue in turn: each cut is noted for flowEffect
++// to judge by.
++func TestFlowCutsAreCounted(t *testing.T) {
++	for _, viaPI := range []bool{false, true} {
++		h, s := queuedDownload(t)
++		h.c.mu.Lock()
++		if viaPI {
++			h.c.incremental = true
++			h.c.kstat.rtt = 110 * time.Millisecond
++			s.down.flat = flowFullRounds
++			s.down.mark = time.Now().Add(-200 * time.Millisecond)
++		}
++		h.c.mu.Unlock()
++		got := credit(h, s)
++		h.c.mu.Lock()
++		cut := h.c.effect.cut
++		h.c.mu.Unlock()
++		if got >= 1<<20 || cut <= 0 {
++			t.Fatalf("pi %v: the cap went to %d and %v bytes of cut were noted", viaPI, got, cut)
++		}
++	}
++}
+-- 
+2.52.0.windows.1
+

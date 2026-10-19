@@ -1,0 +1,92 @@
+From 1034b1dfd5ce6c1c47df4026b44660b3ed4000ec Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:25:18 +0300
+Subject: [PATCH] XHTTP: Bound the flow governor's step with the round trip,
+ and drop pi's round trip outside pi
+
+A stream that left pi kept the round trip pi last saw, and on its return took the whole change since then for one round's step. The round trip is now dropped while adjust governs the stream, and a step with the round trip is held to pi's own largest.
+---
+ transport/internet/splithttp/h2flow.go          |  4 ++++
+ .../internet/splithttp/h2flow_effect_test.go    | 14 +++++++++++++-
+ .../internet/splithttp/h2flow_queuecuts_test.go | 17 +++++++++++++++++
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 80258c65..dac36010 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -557,6 +557,7 @@ func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain floa
+ 		// limit lets it take, a cap that grew would leave a later cut
+ 		// nothing to land on, and flowEffect nothing to judge it by.
+ 		follow := (1 - gain) * cap * float64(st.rtt-w.piRTT) / float64(w.piRTT)
++		follow = min(max(follow, -flowPIMaxStep*cap), flowPIMaxStep*cap)
+ 		if follow < 0 || 4*float64(copied)*float64(st.rtt) >= 3*cap*float64(round) {
+ 			delta += follow
+ 		}
+@@ -1642,6 +1643,9 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 			s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now))
+ 		default:
+ 			s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
++			// A round trip pi saw before the stream left it is no step to
++			// follow when it comes back.
++			s.down.piRTT = 0
+ 		}
+ 		switch {
+ 		case c.client:
+diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
+index 634cd487..aeb1d30e 100644
+--- a/transport/internet/splithttp/h2flow_effect_test.go
++++ b/transport/internet/splithttp/h2flow_effect_test.go
+@@ -122,7 +122,6 @@ func TestFlowPIGainHolds(t *testing.T) {
+ 		if !tc.cut && float64(w.cap) < float64(1<<20)*1.15 {
+ 			t.Fatalf("gain 0: cap %d did not follow the round trip up a fifth", w.cap)
+ 		}
+-
+ 	}
+ }
+ 
+@@ -186,3 +185,16 @@ func TestFlowEffectCountsDownloadsOnly(t *testing.T) {
+ 		t.Fatalf("gain %v for a download cut against a queue that did not move", g)
+ 	}
+ }
++
++// TestFlowPIFollowsOneStep is a round trip that rose tenfold in one round:
++// a cut that does not move the queue has the cap follow it by no more than
++// pi's own largest step.
++func TestFlowPIFollowsOneStep(t *testing.T) {
++	st := tcpStats{rtt: time.Second, minRTT: 100 * time.Millisecond}
++	w := flowWindow{cap: 1 << 20, mark: time.Now(), piRTT: 100 * time.Millisecond}
++	w.returned = 1 << 20
++	w.pi(w.mark.Add(st.minRTT), st, h2InitWindow, 1<<30, 0)
++	if float64(w.cap) > float64(1<<20)*(1+flowPIMaxStep) {
++		t.Fatalf("cap %d from %d in one step", w.cap, 1<<20)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_queuecuts_test.go b/transport/internet/splithttp/h2flow_queuecuts_test.go
+index 948876dc..5a272f0b 100644
+--- a/transport/internet/splithttp/h2flow_queuecuts_test.go
++++ b/transport/internet/splithttp/h2flow_queuecuts_test.go
+@@ -73,3 +73,20 @@ func TestFlowNoQueueCutsStopsPI(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowPIForgetsRoundTripOutside is a download pi does not govern for a
++// round, here one whose client credits in large steps: the round trip pi saw
++// last is dropped, so that pi, when the stream comes back to it, does not
++// take the change since then for one round's.
++func TestFlowPIForgetsRoundTripOutside(t *testing.T) {
++	h, s := queuedDownload(t)
++	h.c.mu.Lock()
++	s.down.piRTT = 100 * time.Millisecond
++	h.c.mu.Unlock()
++	credit(h, s)
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	if s.down.piRTT != 0 {
++		t.Fatalf("pi's round trip %v kept outside pi", s.down.piRTT)
++	}
++}
+-- 
+2.52.0.windows.1
+

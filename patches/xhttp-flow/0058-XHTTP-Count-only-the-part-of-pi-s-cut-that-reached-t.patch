@@ -1,0 +1,48 @@
+From 7cbbe4e2517544026358cd233fcd8c89a47806c9 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:59:14 +0300
+Subject: [PATCH] XHTTP: Count only the part of pi's cut that reached the cap
+
+A cap at init, or one whose round trip pi followed up in the same step, falls by less than the step; the bytes that never left the cap are no cut, and no longer count toward the flow governor's gain.
+---
+ transport/internet/splithttp/h2flow.go             |  4 +++-
+ transport/internet/splithttp/h2flow_effect_test.go | 11 +++++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index c923b114..f2e03881 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -581,7 +581,9 @@ func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain floa
+ 		w.slow = 0
+ 	}
+ 	w.cap = int32(min(max(int64(cap+delta), int64(init)), int64(limit)))
+-	return cut
++	// What reached the cap: a cap at init, or a round trip followed up, takes
++	// less off than the step, and bytes that never left the cap are no cut.
++	return min(cut, max(cap-float64(w.cap), 0))
+ }
+ 
+ // flowLearned remembers the largest cap a stream on this connection needed
+diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
+index a0894637..6d775749 100644
+--- a/transport/internet/splithttp/h2flow_effect_test.go
++++ b/transport/internet/splithttp/h2flow_effect_test.go
+@@ -276,3 +276,14 @@ func TestFlowPIReturnsCut(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowPIReturnsCutThatLanded is pi cutting a cap just over init: it
++// returns what the cap fell by, not the step it could not take.
++func TestFlowPIReturnsCutThatLanded(t *testing.T) {
++	st := tcpStats{rtt: 300 * time.Millisecond, minRTT: 100 * time.Millisecond}
++	w := flowWindow{cap: h2InitWindow + 1000, mark: time.Now()}
++	w.returned = 1 << 20
++	if cut := w.pi(w.mark.Add(st.rtt), st, h2InitWindow, 1<<30, 1); cut > 1000 {
++		t.Fatalf("pi returned %v for a cap that could fall by 1000", cut)
++	}
++}
+-- 
+2.52.0.windows.1
+

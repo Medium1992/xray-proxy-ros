@@ -1,0 +1,64 @@
+From dc2d613ef52ad90163bb7602b9270a5fe52454f0 Mon Sep 17 00:00:00 2001
+From: fUS1ONd <koskriv2006@gmail.com>
+Date: Thu, 22 Oct 2026 15:26:23 +0000
+Subject: [PATCH] XHTTP: Keep the flow governor's Read within the buffer it is
+ given
+
+---
+ transport/internet/splithttp/h2flow.go        |  5 ++--
+ .../internet/splithttp/h2flow_read_test.go    | 23 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index f2e03881..ed295b79 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -905,11 +905,12 @@ func (c *flowConn) Read(b []byte) (int, error) {
+ 		}
+ 		in := bytespool.Alloc(int32(n))
+ 		copy(in, b[:n])
++		// What does not fit in b goes to rpending, never past len(b).
+ 		var out []byte
+ 		if c.client {
+-			out = c.fromServer(in[:n], b[:0])
++			out = c.fromServer(in[:n], b[:0:len(b)])
+ 		} else {
+-			out = c.readFrames(in[:n], b[:0])
++			out = c.readFrames(in[:n], b[:0:len(b)])
+ 		}
+ 		bytespool.Free(in)
+ 		if c.isBroken() {
+diff --git a/transport/internet/splithttp/h2flow_read_test.go b/transport/internet/splithttp/h2flow_read_test.go
+index 4f7a590d..5e078db6 100644
+--- a/transport/internet/splithttp/h2flow_read_test.go
++++ b/transport/internet/splithttp/h2flow_read_test.go
+@@ -129,3 +129,26 @@ func TestFlowReadChunked(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowReadStaysInBuffer reads a client's opening frames into a buffer
++// that is a slice of a larger one: the credit the governor adds for the new
++// stream makes its output longer than the read, and none of it may land past
++// the buffer, in memory the caller still owns.
++func TestFlowReadStaysInBuffer(t *testing.T) {
++	sc := &scriptConn{}
++	c := newFlowConn(sc, flowDefault, flowDefault)
++	in := append([]byte(h2Preface), frames(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})...)
++	sc.feed(in)
++	buf := bytes.Repeat([]byte{0xee}, 1024)
++	if _, err := c.Read(buf[:len(in)]); err != nil {
++		t.Fatal(err)
++	}
++	for i, v := range buf[len(in):] {
++		if v != 0xee {
++			t.Fatalf("Read wrote past the %d-byte buffer it was given, at %d", len(in), len(in)+i)
++		}
++	}
++}
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,168 @@
+From 7229ce94657f3e83f0c8474ddf0815e9af57d986 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 15:16:09 +0300
+Subject: [PATCH] XHTTP: End a governed connection whose client sends past the
+ window it was shown
+
+---
+ transport/internet/splithttp/h2flow.go        | 15 ++++-
+ .../internet/splithttp/h2flow_read_test.go    | 10 +++-
+ .../internet/splithttp/h2flow_settled_test.go |  2 +
+ .../internet/splithttp/h2flow_shown_test.go   | 55 +++++++++++++++++++
+ .../splithttp/h2flow_verify_bench_test.go     |  4 ++
+ 5 files changed, 84 insertions(+), 2 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_shown_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 08ac019f..f7e77688 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -973,7 +973,8 @@ func (c *flowConn) releaseLocked() {
+ 
+ // giveUp marks the connection for closing at the next read or write and
+ // drops its state at once: the peer lowered its window below the credit
+-// already handed on, or opened more streams than the governor tracks.
++// already handed on, sent past the window it was shown, or opened more
++// streams than the governor tracks.
+ func (c *flowConn) giveUp() {
+ 	c.broken = true
+ 	c.releaseLocked()
+@@ -1589,8 +1590,20 @@ func (r *flowReader) frame(f h2Frame) {
+ 		}
+ 	case h2Data:
+ 		c.upConnSent += int64(f.length)
++		// The stack is given larger windows than the client is shown, so it
++		// would not stop a client that sends past what it was shown: the
++		// governor does, as the stack would with the windows shown.
++		up := !c.client && c.up.enabled()
++		if up && c.upConnSent > h2InitWindow+c.upConnForwarded {
++			c.giveUp()
++			return
++		}
+ 		if s := c.stream(f.stream); s != nil {
+ 			s.upSent += int64(f.length)
++			if up && s.upSent > int64(c.serverShown)+s.upForwarded {
++				c.giveUp()
++				return
++			}
+ 			if f.flags&h2FlagEndStream != 0 {
+ 				s.clientDone = true
+ 				c.finish(f.stream, s)
+diff --git a/transport/internet/splithttp/h2flow_read_test.go b/transport/internet/splithttp/h2flow_read_test.go
+index 5e078db6..fdeb8e65 100644
+--- a/transport/internet/splithttp/h2flow_read_test.go
++++ b/transport/internet/splithttp/h2flow_read_test.go
+@@ -41,12 +41,20 @@ func frameStream(clientSide bool) ([]byte, map[uint32][]byte) {
+ 	fr := http2.NewFramer(&s, nil)
+ 	fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+ 	data := map[uint32][]byte{}
++	// A client may send no more than the windows it starts with: a governed
++	// server ends the connection past them.
++	budget := h2InitWindow
+ 	for i := 0; i < 400; i++ {
+ 		id := uint32(1 + 2*(i%7))
+ 		if clientSide && i < 7 {
+ 			fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte{0x82}, EndHeaders: true})
+ 		}
+-		p := make([]byte, mrand.IntN(16384))
++		n := mrand.IntN(16384)
++		if clientSide {
++			n = min(mrand.IntN(300), budget)
++			budget -= n
++		}
++		p := make([]byte, n)
+ 		for j := range p {
+ 			p[j] = byte(i*31 + j)
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
+index 700423b6..80ff1da5 100644
+--- a/transport/internet/splithttp/h2flow_settled_test.go
++++ b/transport/internet/splithttp/h2flow_settled_test.go
+@@ -50,6 +50,8 @@ func TestFlowUploadFollowsModelOnceSettled(t *testing.T) {
+ 			t.Cleanup(func() { h.c.Close() })
+ 			h.track()
+ 			h.openStream(4 << 20)
++			// Connection credit, so the client may send the upload.
++			h.fromServer(func(fr *http2.Framer) { fr.WriteWindowUpdate(0, 8<<20) })
+ 			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, id, 200<<10) })
+ 			vouchedPath(h.c)
+ 			h.c.mu.Lock()
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+new file mode 100644
+index 00000000..7a551d61
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -0,0 +1,55 @@
++package splithttp
++
++import (
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// TestFlowClientPastShownWindow sends upload data up to the windows the
++// client was shown, which the server takes, and then a byte more, which ends
++// the connection as a stack shown those windows would. The server's stack is
++// given larger windows than the client is shown, so without the governor's
++// check a client could leave it several times as much unread.
++func TestFlowClientPastShownWindow(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		connCredit uint32
++		streamCred uint32
++	}{
++		{"no credit", 0, 0},
++		{"connection credit", 8 << 20, 0},
++		{"stream and connection credit", 8 << 20, 4 << 20},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			h := newFlowHarness(t)
++			t.Cleanup(func() { h.c.Close() })
++			h.track()
++			h.openStream(4 << 20)
++			h.toClient.open(1)
++			h.fromServer(func(fr *http2.Framer) {
++				if tc.connCredit > 0 {
++					fr.WriteWindowUpdate(0, tc.connCredit)
++				}
++				if tc.streamCred > 0 {
++					fr.WriteWindowUpdate(1, tc.streamCred)
++				}
++			})
++			conn := int64(h2InitWindow)
++			for _, f := range h.toClient.frames {
++				if wu, ok := f.(*http2.WindowUpdateFrame); ok && wu.StreamID == 0 {
++					conn += int64(wu.Increment)
++				}
++			}
++			shown := min(conn, h.toClient.streams[1])
++			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, int(shown)) })
++			if h.readErr != nil || h.c.isBroken() {
++				t.Fatalf("data within the %d shown ended the connection: %v", shown, h.readErr)
++			}
++			h.fromClient(func(fr *http2.Framer) { fr.WriteData(1, false, []byte{0}) })
++			if h.readErr == nil || !h.c.isBroken() {
++				t.Fatalf("a byte past the %d shown was taken", shown)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_bench_test.go b/transport/internet/splithttp/h2flow_verify_bench_test.go
+index 00f74973..add714bb 100644
+--- a/transport/internet/splithttp/h2flow_verify_bench_test.go
++++ b/transport/internet/splithttp/h2flow_verify_bench_test.go
+@@ -68,6 +68,10 @@ func benchFlowConn(tb testing.TB, inner *replayConn) *flowConn {
+ 	c.mu.Lock()
+ 	c.lastPing = c.lastPing.AddDate(100, 0, 0) // keep PINGs out of the measurement
+ 	c.incremental = true
++	// The replay sends the same upload again and again: show its client
++	// windows it never runs out of.
++	c.upConnForwarded += 1 << 50
++	c.streams[1].upForwarded += 1 << 50
+ 	c.mu.Unlock()
+ 	c.Conn = inner
+ 	return c
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,232 @@
+From f0cf2e979a5261d7b5849ef654d86c56b8d1dc56 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:28:13 +0300
+Subject: [PATCH] XHTTP: Drop references to old branches from the flow
+ governor's tests and comments
+
+---
+ transport/internet/splithttp/h2flow.go               |  2 +-
+ transport/internet/splithttp/h2flow_model_test.go    |  4 ++--
+ .../internet/splithttp/h2flow_verify_control_test.go |  4 +---
+ .../internet/splithttp/h2flow_verify_cr_test.go      |  6 +++---
+ .../internet/splithttp/h2flow_verify_harness_test.go |  2 +-
+ .../internet/splithttp/h2flow_verify_inject_test.go  |  2 +-
+ .../splithttp/h2flow_verify_listener_test.go         | 12 ++++++------
+ .../internet/splithttp/h2flow_verify_memory_test.go  |  6 +++---
+ .../internet/splithttp/h2flow_verify_off_test.go     |  2 +-
+ .../splithttp/h2flow_verify_settings_test.go         |  2 +-
+ 10 files changed, 20 insertions(+), 22 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index d8499aae..db85cf0f 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -914,7 +914,7 @@ const (
+ // client's upload, or of a download towards a client this side dialed from.
+ // A PING's ACK waits behind whatever is queued between the peers, so the last
+ // round trip, or the wait for an ACK still due, above the lowest one this
+-// connection has seen is that backlog. Like the kernel's min_rtt, the floor
++// connection has seen is that backlog. The floor
+ // is kept for the connection's life: a long transfer keeps the queue full, and
+ // a floor that forgot the empty path would rise with it. A PING samples it only
+ // once a second, so it reacts at half the queue the kernel signal tolerates.
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index eef46b25..d4149b1b 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -428,7 +428,7 @@ func (m *flowModel) changeClientWindow() {
+ 		}
+ 		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: uint32(next)})
+ 	}, false)
+-	// Adapted to bdbac60e: it has no broken flag; a governor that gives up
++	// A governor that gives up
+ 	// releases its state, which sets closed.
+ 	m.c.mu.Lock()
+ 	broken := m.c.closed
+@@ -621,7 +621,7 @@ func TestFlowModelWindowChanges(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowModelWindowChangesLenient (added for bdbac60e) runs the window-change
++// TestFlowModelWindowChangesLenient runs the window-change
+ // model without requiring the governor to give up an inexpressible change:
+ // only the stock invariants judge, i.e. the server never sends beyond the
+ // client's real window and no stream stalls after both readers drain.
+diff --git a/transport/internet/splithttp/h2flow_verify_control_test.go b/transport/internet/splithttp/h2flow_verify_control_test.go
+index 7e8c0ae8..d7900164 100644
+--- a/transport/internet/splithttp/h2flow_verify_control_test.go
++++ b/transport/internet/splithttp/h2flow_verify_control_test.go
+@@ -157,8 +157,6 @@ func TestFlowRecognisesEveryOutstandingPing(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowForgetsOldestPings is not transplanted: it tests flowPingSlots, a
+-// mechanism of the pr17-fixes branch that bdbac60e does not have.
+ 
+ // pingReaction connects to a server, answers the first PING it sends (or uses
+ // a fixed payload when it sends none) with the frames build returns, and
+@@ -203,7 +201,7 @@ func pingReaction(t *testing.T, addr string, build func(ping [8]byte) []byte) st
+ 	}
+ }
+ 
+-// TestFlowPingViolationsGetStockErrors (added for bdbac60e) answers the
++// TestFlowPingViolationsGetStockErrors answers the
+ // governor's PING with an ACK that stock HTTP/2 rejects, on a stock and a
+ // governed server: on stream 1, and between HEADERS and its CONTINUATION.
+ func TestFlowPingViolationsGetStockErrors(t *testing.T) {
+diff --git a/transport/internet/splithttp/h2flow_verify_cr_test.go b/transport/internet/splithttp/h2flow_verify_cr_test.go
+index 56bbf284..0177ec74 100644
+--- a/transport/internet/splithttp/h2flow_verify_cr_test.go
++++ b/transport/internet/splithttp/h2flow_verify_cr_test.go
+@@ -7,10 +7,10 @@ import (
+ 	"time"
+ )
+ 
+-// TestFlowCodeRabbitUplinkLeak (added for bdbac60e) checks CodeRabbit comment
+-// 4199461853: whether TestFlowSlowUplinkHandlerBounded leaves HTTP/2 client
++// TestFlowSlowUplinkLeavesNoGoroutines checks whether
++// TestFlowSlowUplinkHandlerBounded leaves HTTP/2 client
+ // goroutines behind while it runs and after its cleanup.
+-func TestFlowCodeRabbitUplinkLeak(t *testing.T) {
++func TestFlowSlowUplinkLeavesNoGoroutines(t *testing.T) {
+ 	count := func() int {
+ 		buf := make([]byte, 1<<22)
+ 		stacks := string(buf[:runtime.Stack(buf, true)])
+diff --git a/transport/internet/splithttp/h2flow_verify_harness_test.go b/transport/internet/splithttp/h2flow_verify_harness_test.go
+index d8231cee..7a14b27b 100644
+--- a/transport/internet/splithttp/h2flow_verify_harness_test.go
++++ b/transport/internet/splithttp/h2flow_verify_harness_test.go
+@@ -205,7 +205,7 @@ func (h *flowHarness) sync() {
+ }
+ 
+ // dueForPing lets the next frame boundary towards the client carry a PING.
+-// Adapted to bdbac60e: the governor now sends a PING with its first SETTINGS
++// The governor sends a PING with its first SETTINGS
+ // and keeps a single outstanding PING, so the earlier one is treated as timed
+ // out, which is what the governor itself does after flowPingTimeout.
+ func (h *flowHarness) dueForPing() {
+diff --git a/transport/internet/splithttp/h2flow_verify_inject_test.go b/transport/internet/splithttp/h2flow_verify_inject_test.go
+index f4915639..277b7c11 100644
+--- a/transport/internet/splithttp/h2flow_verify_inject_test.go
++++ b/transport/internet/splithttp/h2flow_verify_inject_test.go
+@@ -55,7 +55,7 @@ func TestFlowInjectedWriteFailureIsTerminal(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowInjectedWriteFailureTearsStream (added for bdbac60e) shows what the
++// TestFlowInjectedWriteFailureTearsStream shows what the
+ // client reads after a short write of the governor's own frames. The torn
+ // half is already on the wire, so the client sees the connection end inside a
+ // frame, as with a stock stack whose socket fails mid-write; nothing the
+diff --git a/transport/internet/splithttp/h2flow_verify_listener_test.go b/transport/internet/splithttp/h2flow_verify_listener_test.go
+index 0cdf2e36..91034f05 100644
+--- a/transport/internet/splithttp/h2flow_verify_listener_test.go
++++ b/transport/internet/splithttp/h2flow_verify_listener_test.go
+@@ -166,9 +166,9 @@ func TestFlowListenerGovernsTLSHTTP2(t *testing.T) {
+ // TestFlowConnKeepsOptionalInterfaces checks the wrapper against the inner
+ // connection: net/http sees TLS exactly when the inner connection is TLS,
+ // and unwrapping and half-close still reach the inner connection.
+-// Adapted to bdbac60e: newFlowConn is the only constructor; the TLS
++// The TLS
+ // interfaces are the ones net/http itself asserts (*tls.Conn, or
+-// ConnectionState/HandshakeContext on the fixes branch).
++// ConnectionState/HandshakeContext).
+ func TestFlowConnKeepsOptionalInterfaces(t *testing.T) {
+ 	plain, peer := net.Pipe()
+ 	defer plain.Close()
+@@ -207,7 +207,7 @@ func TestFlowConnKeepsOptionalInterfaces(t *testing.T) {
+ // takes HTTP/2 exactly when ALPN picked h2, as net/http does: with any other
+ // protocol net/http serves HTTP/1.x only, even after an HTTP/2 preface, and
+ // the governor must not parse that as frames.
+-// Adapted to bdbac60e: there is no handshake hook, so the client sends the
++// There is no handshake hook, so the client sends the
+ // HTTP/2 preface after the handshake and the mode is read after the
+ // governor has seen it, as net/http would read it.
+ func TestFlowTLSModeFollowsALPN(t *testing.T) {
+@@ -251,7 +251,7 @@ func TestFlowTLSModeFollowsALPN(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowListenerSendsSettingsBeforePreface (added for bdbac60e) states
++// TestFlowListenerSendsSettingsBeforePreface states
+ // the order serverSettings relies on as its own check: after TLS with ALPN
+ // h2, a stock XHTTP listener sends its SETTINGS before the client preface;
+ // the governed one must too, since a prober can tell the two apart.
+@@ -338,7 +338,7 @@ func TestFlowListenerSendsOnlySettingsBeforePreface(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowListenerGovernsTLSHTTP2AfterPreface (added for bdbac60e) is
++// TestFlowListenerGovernsTLSHTTP2AfterPreface is
+ // TestFlowListenerGovernsTLSHTTP2 with the client preface sent first, to
+ // separate whether the governor rewrites the SETTINGS from when they leave.
+ func TestFlowListenerGovernsTLSHTTP2AfterPreface(t *testing.T) {
+@@ -375,7 +375,7 @@ func TestFlowListenerGovernsTLSHTTP2AfterPreface(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowListenerClosesLikeStock (added for bdbac60e) sends an HTTP/1.1
++// TestFlowListenerClosesLikeStock sends an HTTP/1.1
+ // request whose headers exceed MaxHeaderBytes. net/http answers 431 and
+ // calls CloseWrite on the connection before it waits rstAvoidanceDelay, so
+ // with stock TLS the client sees close_notify right after the answer. The
+diff --git a/transport/internet/splithttp/h2flow_verify_memory_test.go b/transport/internet/splithttp/h2flow_verify_memory_test.go
+index 806297b4..95ea2d4b 100644
+--- a/transport/internet/splithttp/h2flow_verify_memory_test.go
++++ b/transport/internet/splithttp/h2flow_verify_memory_test.go
+@@ -110,7 +110,7 @@ func (c *rawH2Client) pump(quiet time.Duration) {
+ 	}
+ }
+ 
+-// TestFlowServerUnreadPerConnection (added for bdbac60e) opens 32 upload
++// TestFlowServerUnreadPerConnection opens 32 upload
+ // streams whose handlers never read and counts what the server accepts on
+ // the connection. Stock Go holds that to its 1 MiB connection window; the
+ // PR states that a governed server reaches its 6 MiB only "while the outbound
+@@ -185,7 +185,7 @@ func (l *blockingListener) Accept() (net.Conn, error) {
+ 	return fc, nil
+ }
+ 
+-// TestFlowInjectedQueueBounded (added for bdbac60e) stops reading on the
++// TestFlowInjectedQueueBounded stops reading on the
+ // client so the server's writes block, then opens and resets streams. Every
+ // new stream makes the governor queue upload credit for the client, outside
+ // net/http's own control-frame limit, and nothing drains it while the write
+@@ -271,7 +271,7 @@ func TestFlowInjectedQueueBounded(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowProtoField32 (added for bdbac60e) checks the generated descriptor
++// TestFlowProtoField32 checks the generated descriptor
+ // for the new field and a wire round trip.
+ func TestFlowProtoField32(t *testing.T) {
+ 	fd := (&Config{}).ProtoReflect().Descriptor().Fields().ByNumber(32)
+diff --git a/transport/internet/splithttp/h2flow_verify_off_test.go b/transport/internet/splithttp/h2flow_verify_off_test.go
+index 113738d2..0d6392eb 100644
+--- a/transport/internet/splithttp/h2flow_verify_off_test.go
++++ b/transport/internet/splithttp/h2flow_verify_off_test.go
+@@ -11,7 +11,7 @@ import (
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ )
+ 
+-// TestFlowOffLeavesStockWiring (added for bdbac60e) checks the default: with
++// TestFlowOffLeavesStockWiring checks the default: with
+ // XRAY_XHTTP_FLOW unset and no "h2Flow", ListenXH does not wrap its listener,
+ // net/http gets Go's HTTP/2 windows, and the client transport is Go's.
+ func TestFlowOffLeavesStockWiring(t *testing.T) {
+diff --git a/transport/internet/splithttp/h2flow_verify_settings_test.go b/transport/internet/splithttp/h2flow_verify_settings_test.go
+index 6b610d95..df7b79d4 100644
+--- a/transport/internet/splithttp/h2flow_verify_settings_test.go
++++ b/transport/internet/splithttp/h2flow_verify_settings_test.go
+@@ -300,7 +300,7 @@ func TestFlowMalformedSettingsGetStockErrors(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowOversizedSettingsGetStockErrors (added for bdbac60e) sends the
++// TestFlowOversizedSettingsGetStockErrors sends the
+ // oversized SETTINGS of TestFlowOversizedSettingsFailClosed to a stock and a
+ // governed server: net/http rejects more than 100 settings itself, so the
+ // governor's pass-through does not change what a peer observes.
+-- 
+2.52.0.windows.1
+

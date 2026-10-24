@@ -1,0 +1,126 @@
+From 0e9b40762af8001d0d75c551fb8d0d83911accb8 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:23:41 +0300
+Subject: [PATCH] XHTTP: Count the queue PINGs see from the path's own round
+ trip once it has risen
+
+---
+ transport/internet/splithttp/h2flow.go        | 39 +++++++++++++++---
+ .../splithttp/h2flow_rebaseping_test.go       | 41 +++++++++++++++++++
+ 2 files changed, 75 insertions(+), 5 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_rebaseping_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index e725c814..31ad33ff 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -674,10 +674,13 @@ type flowConn struct {
+ 	rttLast     time.Duration
+ 	rttBase     time.Duration
+ 	rttSamples  int
+-	pingData    uint64
+-	pings       []flowPing
+-	pingSentAt  time.Time
+-	lastPing    time.Time
++	// pingBase is the path's round trip once it has risen over rttBase, see
++	// rebasePing, and pingStep how far it rose.
++	pingBase, pingStep time.Duration
++	pingData           uint64
++	pings              []flowPing
++	pingSentAt         time.Time
++	lastPing           time.Time
+ 
+ 	incremental bool
+ 	guard       *time.Timer
+@@ -893,7 +896,7 @@ func (w *flowMinWindow) full(now time.Time) bool {
+ // proxy: a min_rtt that far below the PING's means exactly that, and the PING
+ // is kept.
+ func (c *flowConn) pingFloor(now time.Time) time.Duration {
+-	floor := c.rttBase
++	floor := max(c.rttBase, c.pingBase)
+ 	if c.floorConfirmed(now) && c.kstat.minRTT < floor {
+ 		floor = c.kstat.minRTT
+ 	}
+@@ -1380,6 +1383,32 @@ func (c *flowConn) sampleRTT(now time.Time, sample time.Duration) {
+ 	if c.rtt == 0 || sample < c.rtt {
+ 		c.rtt = sample
+ 	}
++	c.rebasePing()
++}
++
++// rebasePing moves the floor PINGs are measured against where the path's own
++// round trip has risen: rttBase keeps the least PING for the life of the
++// connection, so a route or network that adds to the round trip reads as a
++// standing queue, and queueShrink holds the windows at init. Where even the
++// least PING over the last one to two flowRTTWindow stands that far above,
++// the queue is not one cuts can drain, as an own queue drains within seconds
++// of a quarter cut a second, and that least PING is the path's. The base only
++// falls after that, with the PINGs, and is dropped once they have come back
++// by half of what the path added.
++func (c *flowConn) rebasePing() {
++	if c.rttPrev == 0 {
++		return
++	}
++	least := min(c.rtt, c.rttPrev)
++	if c.pingBase != 0 {
++		c.pingBase = min(c.pingBase, least)
++		if c.pingBase-c.rttBase <= c.pingStep/2 {
++			c.pingBase, c.pingStep = 0, 0
++		}
++	}
++	if floor := max(c.rttBase, c.pingBase); least-floor > max(floor, flowQueueShrink) {
++		c.pingBase, c.pingStep = least, least-c.rttBase
++	}
+ }
+ 
+ // appendPing adds a PING for the remote peer once a second while streams are
+diff --git a/transport/internet/splithttp/h2flow_rebaseping_test.go b/transport/internet/splithttp/h2flow_rebaseping_test.go
+new file mode 100644
+index 00000000..3be6e6f8
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_rebaseping_test.go
+@@ -0,0 +1,41 @@
++package splithttp
++
++import (
++	"testing"
++	"time"
++)
++
++// TestFlowRebasePing has PINGs at 20 ms, then the path move to 80 ms, as a
++// client without the kernel's view sees a WiFi to cellular move: once the
++// least PING over a window stands there, the queue is counted from it, and
++// once the path is back it is counted from 20 ms again. A queue that drains
++// now and then, as an own queue under the cuts does, is no move.
++func TestFlowRebasePing(t *testing.T) {
++	c := &flowConn{}
++	now := time.Unix(1, 0)
++	feed := func(d time.Duration, rtts ...time.Duration) {
++		for end, i := now.Add(d), 0; now.Before(end); now, i = now.Add(time.Second), i+1 {
++			c.sampleRTT(now, rtts[i%len(rtts)])
++		}
++	}
++	feed(5*time.Second, 20*time.Millisecond)
++	feed(5*time.Second, 80*time.Millisecond)
++	if got := c.pingFloor(now); got != 20*time.Millisecond {
++		t.Fatalf("five seconds after the move the floor is %v, want 20ms still", got)
++	}
++	feed(2*flowRTTWindow, 80*time.Millisecond)
++	if got := c.pingFloor(now); got != 80*time.Millisecond {
++		t.Fatalf("after the path moved to 80ms the floor is %v", got)
++	}
++	feed(2*flowRTTWindow+time.Second, 20*time.Millisecond)
++	if got := c.pingFloor(now); got != 20*time.Millisecond {
++		t.Fatalf("the path came back and the floor is %v", got)
++	}
++
++	c = &flowConn{}
++	feed(5*time.Second, 20*time.Millisecond)
++	feed(3*flowRTTWindow, 90*time.Millisecond, 120*time.Millisecond, 25*time.Millisecond)
++	if got := c.pingFloor(now); got != 20*time.Millisecond {
++		t.Fatalf("a queue that drains every few seconds moved the floor to %v", got)
++	}
++}
+-- 
+2.52.0.windows.1
+

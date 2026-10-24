@@ -1,0 +1,105 @@
+From 9bef18d69dfe1f0e9c2aba9cdb4bf9d3496cc3f9 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:15:50 +0300
+Subject: [PATCH] XHTTP: Keep the flow governor's rate products from wrapping
+ on credit no reader could take
+
+---
+ transport/internet/splithttp/h2flow.go        | 16 ++++++++---
+ .../internet/splithttp/h2flow_shown_test.go   | 28 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 2954e61b..037d2204 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -448,7 +448,9 @@ func (w *flowWindow) adjust(now time.Time, rtt time.Duration, init, limit int32,
+ 		w.ramped = true
+ 	}
+ 	if !w.ramped && w.prev > 0 {
+-		grow += 2 * s * (copied - w.prev) / w.prev
++		// In floats: credit a hostile client returns has no bound, and the
++		// product of two such rounds would wrap.
++		grow += int64(min(2*float64(s)*float64(copied-w.prev)/float64(w.prev), float64(limit)))
+ 	}
+ 	if hold {
+ 		grow = min(grow, int64(w.cap))
+@@ -510,23 +512,29 @@ func (w *flowWindow) model(now time.Time, rtprop time.Duration, init, limit int3
+ 	if w.rateAt == 0 && w.prev > 0 {
+ 		// The ramp's last round seeds the filter, so one slow first round
+ 		// cannot drop a window the reader just showed it fills.
+-		w.rates[0] = w.prev * int64(time.Second) / int64(round)
++		w.rates[0] = flowRate(w.prev, round)
+ 		w.rateAt = 1
+ 	}
+ 	if now.Sub(w.mark) < round {
+ 		return
+ 	}
+-	w.rates[w.rateAt%flowModelRounds] = (w.returned - w.markBase) * int64(time.Second) / int64(now.Sub(w.mark))
++	w.rates[w.rateAt%flowModelRounds] = flowRate(w.returned-w.markBase, now.Sub(w.mark))
+ 	w.rateAt++
+ 	w.mark, w.markBase = now, w.returned
+ 	var bw int64
+ 	for _, r := range w.rates {
+ 		bw = max(bw, r)
+ 	}
+-	target := bw * int64(rtprop) / int64(time.Second) * flowModelGainPercent / 100
++	target := int64(min(float64(bw)*rtprop.Seconds()*flowModelGainPercent/100, float64(limit)))
+ 	w.cap = int32(min(max(target, int64(init)), int64(limit)))
+ }
+ 
++// flowRate is bytes per second, in floats and held well inside int64: credit
++// a hostile client returns has no bound, and times a second it would wrap.
++func flowRate(bytes int64, d time.Duration) int64 {
++	return int64(min(float64(bytes)/d.Seconds(), 1<<53))
++}
++
+ // Once the reader's rate has grown by less than a quarter for flowFullRounds
+ // round trips in a row, the path is full, as BBR judges it, and a download
+ // window on a server is held by a PI controller on the queue the kernel sees.
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+index 7a551d61..222c4c36 100644
+--- a/transport/internet/splithttp/h2flow_shown_test.go
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -2,6 +2,7 @@ package splithttp
+ 
+ import (
+ 	"testing"
++	"time"
+ 
+ 	"golang.org/x/net/http2"
+ )
+@@ -53,3 +54,30 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestFlowWindowHugeCredit hands a window more credit in a round than a
++// reader could take, as a hostile client may: the cap grows to its limit
++// and stays there, where products of such rounds wrapped to a cap at init.
++func TestFlowWindowHugeCredit(t *testing.T) {
++	const limit = 1 << 30
++	start := time.Unix(1, 0)
++	var w flowWindow
++	w.cap = flowStartWindow
++	now := start
++	w.adjust(now, 50*time.Millisecond, h2InitWindow, limit, true, false)
++	w.returned += 1 << 20
++	now = now.Add(60 * time.Millisecond)
++	w.adjust(now, 50*time.Millisecond, h2InitWindow, limit, true, false)
++	w.returned += 1 << 34
++	now = now.Add(60 * time.Millisecond)
++	w.adjust(now, 50*time.Millisecond, h2InitWindow, limit, true, false)
++	if w.cap != limit {
++		t.Fatalf("adjust: cap %d after a round of 2^34, want the limit %d", w.cap, limit)
++	}
++	w.returned += 1 << 40
++	now = now.Add(60 * time.Millisecond)
++	w.model(now, 50*time.Millisecond, h2InitWindow, limit)
++	if w.cap != limit {
++		t.Fatalf("model: cap %d after a round of 2^40, want the limit %d", w.cap, limit)
++	}
++}
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,39 @@
+From b0197bd00261d20b9a5f5a25b2d07345c0e637fb Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:17:56 +0300
+Subject: [PATCH] XHTTP: Walk the flow governor's streams on a SETTINGS only
+ when it moved a window
+
+---
+ transport/internet/splithttp/h2flow.go | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 037d2204..e725c814 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -1720,6 +1720,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	switch f.typ {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
++			init, shown := c.clientInit, c.clientShown
+ 			if c.down.enabled() && !c.changeInitialWindow(payload, c.shownDown(initialWindow(payload)), &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.down.returned, s.downForwarded, s.serverDone
+ 			}) {
+@@ -1730,8 +1731,11 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 			c.pingReady = c.pingReady || c.client
+ 			out = append(out, header...)
+ 			out = append(out, payload...)
+-			// A raised window funds credit the receiver no longer owes.
+-			if c.down.enabled() {
++			// A raised window funds credit the receiver no longer owes. A
++			// SETTINGS that left the windows as they were funds nothing, and
++			// a walk over every stream for each one would let a client that
++			// floods them cost the server that walk each time.
++			if c.down.enabled() && (c.clientInit != init || c.clientShown != shown) {
+ 				for id, s := range c.streams {
+ 					if s.serverDone {
+ 						continue
+-- 
+2.52.0.windows.1
+

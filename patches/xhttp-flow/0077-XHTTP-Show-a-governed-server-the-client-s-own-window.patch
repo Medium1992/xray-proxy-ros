@@ -1,0 +1,534 @@
+From 35f2d0400a47de18f29ab195a6a3a9970bc6b6db Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:27:12 +0300
+Subject: [PATCH] XHTTP: Show a governed server the client's own window and
+ leave its downloads to it
+
+---
+ transport/internet/splithttp/h2flow.go        | 150 +++++++++++++-----
+ .../internet/splithttp/h2flow_chain_test.go   |  25 +--
+ .../internet/splithttp/h2flow_client_test.go  |  34 ++--
+ .../internet/splithttp/h2flow_credit_test.go  |   3 +
+ .../internet/splithttp/h2flow_guard_test.go   |  39 +++++
+ .../internet/splithttp/h2flow_model_test.go   |  63 +++++---
+ .../internet/splithttp/h2flow_settled_test.go |   3 +
+ 7 files changed, 241 insertions(+), 76 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 31ad33ffc..e3e731ffc 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -687,6 +687,16 @@ type flowConn struct {
+ 	guardProbe  bool
+ 	// guardArmed says the guard is set to fire for a stream that waits.
+ 	guardArmed bool
++	// peerGoverned says, on a client, that the server governs its downloads,
++	// as its PING ahead of any reply shows: the client then credits them as
++	// its reader does, and governing them twice takes no rate. serverReplied
++	// notes the server's first HEADERS.
++	peerGoverned, serverReplied bool
++	// restock says the server has been seen to govern and has yet to be
++	// shown the stack's window, see appendRestock; settingsOwn notes, in
++	// order, which SETTINGS sent to the server were the governor's.
++	restock     bool
++	settingsOwn []bool
+ 
+ 	rp       frameParser
+ 	rpending []byte
+@@ -1710,6 +1720,9 @@ func (r *flowReader) frame(f h2Frame) {
+ 			s = &flowStream{}
+ 			s.up.cap = max(c.upLearned.value(now, c.up.init), flowStartWindow)
+ 			s.down.cap = max(c.downLearned.value(now, c.down.init), flowStartWindow)
++			if c.client && c.peerGoverned {
++				s.down.cap = c.down.max
++			}
+ 			c.streams[f.stream] = s
+ 			c.downOpen++
+ 			c.opened = append(c.opened, f.stream)
+@@ -1750,6 +1763,9 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	case h2Settings:
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+ 			init, shown := c.clientInit, c.clientShown
++			if c.client {
++				c.settingsOwn = append(c.settingsOwn, false)
++			}
+ 			if c.down.enabled() && !c.changeInitialWindow(payload, c.shownDown(initialWindow(payload)), &c.clientInit, &c.clientShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.down.returned, s.downForwarded, s.serverDone
+ 			}) {
+@@ -1802,42 +1818,13 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if inc < flowSmallCredit {
+ 			c.incremental = true
+ 		}
+-		var q int
+-		switch {
+-		case c.client && c.modelled(now):
+-		case c.client:
+-			q = c.pingQueueing(now)
+-		default:
+-			q = c.queueing(now)
+-		}
+-		switch {
+-		case c.client && c.modelled(now) && s.down.settled():
+-			s.down.model(now, c.currentRTT(), c.down.init, c.down.max)
+-		case !c.client && !c.noQueueCuts && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
+-			// Only clients that credit in small steps: one that waits for
+-			// half of its own window could be held below that half. Only
+-			// where the kernel sees the path: behind a TCP proxy it sees
+-			// no queue at all.
+-			c.effect.cutBy(s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now)))
+-		default:
+-			s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
+-			// A round trip pi saw before the stream left it is no step to
+-			// follow when it comes back.
+-			s.down.piRTT = 0
+-		}
+-		switch {
+-		case c.client:
+-			if q == 2 {
+-				c.queueShrink(&s.down, now, c.down.init)
+-			}
+-			if !c.floorConfirmed(now) {
+-				s.down.cap = min(s.down.cap, flowUnconfirmedDown)
+-			}
+-		case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
+-			s.down.qAt = now
+-			before := s.down.cap
+-			s.down.cap = max(c.down.init, s.down.cap-int32(c.cutGain(now)*float64(s.down.cap/4)))
+-			c.effect.cutBy(float64(before - s.down.cap))
++		if c.client && c.peerGoverned {
++			// The server governs this download, as it does an official
++			// client's once it has been shown the real window, see
++			// restock: the reader's credit goes on as it comes.
++			s.down.cap = c.down.max
++		} else {
++			c.governDown(now, s)
+ 		}
+ 		c.downLearned.note(now, c.down.init, s.down.cap)
+ 		rel := c.downRelease(s)
+@@ -1851,8 +1838,40 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ 	return append(out, payload...)
+ }
+ 
++// appendRestock makes a client whose server governs its downloads look to
++// that server as an official client does: it sends the stack's own initial
++// window in a SETTINGS of the governor's, whose ACK the stack does not see,
++// and hands on all the credit it held back. The server then governs these
++// downloads, the client's memory with them, as it does an official
++// client's; two governors that each held back credit took rate and memory
++// a server-side governor alone keeps.
++func (c *flowConn) appendRestock(out []byte) []byte {
++	c.restock = false
++	out = append(out, 0, 0, 6, h2Settings, 0, 0, 0, 0, 0)
++	out = binary.BigEndian.AppendUint16(out, h2SettingInitialWindowSize)
++	out = binary.BigEndian.AppendUint32(out, uint32(c.clientInit))
++	c.settingsOwn = append(c.settingsOwn, true)
++	c.clientShown = c.clientInit
++	for id, s := range c.streams {
++		if s.serverDone {
++			continue
++		}
++		s.down.cap = c.down.max
++		if rel := c.downRelease(s); rel > 0 {
++			c.forwardDown(s, rel)
++			out = appendWindowUpdate(out, id, rel)
++		}
++	}
++	return out
++}
++
+ func (r *flowReader) boundary(out []byte) []byte {
+ 	c := (*flowConn)(r)
++	// Ahead of any credit: the server is to know the window before it is
++	// handed what the window holds.
++	if c.client && c.restock && c.clientInit != 0 {
++		out = c.appendRestock(out)
++	}
+ 	for _, id := range c.opened {
+ 		s := c.stream(id)
+ 		if s == nil {
+@@ -1874,7 +1893,7 @@ func (r *flowReader) boundary(out []byte) []byte {
+ 		}
+ 	}
+ 	c.opened = c.opened[:0]
+-	if c.client {
++	if c.client && !c.peerGoverned {
+ 		out = c.appendPing(out)
+ 	}
+ 	return out
+@@ -1900,6 +1919,7 @@ func (w *flowWriter) frame(f h2Frame) {
+ 		}
+ 		fallthrough
+ 	case h2Headers:
++		c.serverReplied = true
+ 		if s != nil && f.flags&h2FlagEndStream != 0 {
+ 			c.endDown(s)
+ 			c.finish(f.stream, s)
+@@ -1913,6 +1933,15 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 	c := (*flowConn)(w)
+ 	switch f.typ {
+ 	case h2Settings:
++		// The ACK of a SETTINGS the governor sent, see restock, is not the
++		// stack's to see: ACKs come in the order the SETTINGS went.
++		if c.client && f.flags&h2FlagAck != 0 && len(c.settingsOwn) > 0 {
++			own := c.settingsOwn[0]
++			c.settingsOwn = c.settingsOwn[1:]
++			if own {
++				return out
++			}
++		}
+ 		if f.flags&h2FlagAck == 0 && validSettings(payload) {
+ 			if c.up.enabled() && !c.changeInitialWindow(payload, max(c.up.init, flowShownUp), &c.serverInit, &c.serverShown, func(s *flowStream) (int64, int64, bool) {
+ 				return s.up.returned, s.upForwarded, s.clientDone
+@@ -1942,6 +1971,11 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if c.client && c.pingAck(f, payload) {
+ 			return out
+ 		}
++		// A governed server sends a PING of its own with its first SETTINGS,
++		// before it answers anything; a stock one does not.
++		if c.client && f.flags&h2FlagAck == 0 && !c.serverReplied && !c.peerGoverned {
++			c.peerGoverned, c.restock = true, true
++		}
+ 	case h2WindowUpdate:
+ 		inc := int64(binary.BigEndian.Uint32(payload) & 0x7fffffff)
+ 		if f.stream == 0 && inc > 0 && c.up.enabled() {
+@@ -1985,6 +2019,48 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 	return append(out, payload...)
+ }
+ 
++// governDown sets a download's cap from its reader and the queue on the path,
++// as the stream's credit comes back.
++func (c *flowConn) governDown(now time.Time, s *flowStream) {
++	var q int
++	switch {
++	case c.client && c.modelled(now):
++	case c.client:
++		q = c.pingQueueing(now)
++	default:
++		q = c.queueing(now)
++	}
++	switch {
++	case c.client && c.modelled(now) && s.down.settled():
++		s.down.model(now, c.currentRTT(), c.down.init, c.down.max)
++	case !c.client && !c.noQueueCuts && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
++		// Only clients that credit in small steps: one that waits for
++		// half of its own window could be held below that half. Only
++		// where the kernel sees the path: behind a TCP proxy it sees
++		// no queue at all.
++		c.effect.cutBy(s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now)))
++	default:
++		s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
++		// A round trip pi saw before the stream left it is no step to
++		// follow when it comes back.
++		s.down.piRTT = 0
++	}
++	switch {
++	case c.client:
++		if q == 2 {
++			c.queueShrink(&s.down, now, c.down.init)
++		}
++		if !c.floorConfirmed(now) {
++			s.down.cap = min(s.down.cap, flowUnconfirmedDown)
++		}
++	case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
++		s.down.qAt = now
++		before := s.down.cap
++		s.down.cap = max(c.down.init, s.down.cap-int32(c.cutGain(now)*float64(s.down.cap/4)))
++		c.effect.cutBy(float64(before - s.down.cap))
++	}
++}
++
+ func (w *flowWriter) boundary(out []byte) []byte {
+ 	c := (*flowConn)(w)
+ 	if c.client || !c.settingsSent {
+diff --git a/transport/internet/splithttp/h2flow_chain_test.go b/transport/internet/splithttp/h2flow_chain_test.go
+index 8b8e8e754..9eab8ded0 100644
+--- a/transport/internet/splithttp/h2flow_chain_test.go
++++ b/transport/internet/splithttp/h2flow_chain_test.go
+@@ -187,14 +187,13 @@ func TestFlowChainedStallAtSendWindow(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowChainedClientNotHeldToSendWindow fixes what the send window does not
+-// do. Forty downloads open from a governed client, the server sends all it
+-// may and the client reads nothing. The client governor opens each stream
+-// with credit of its cap above what it showed, and the server governor hands
+-// all of that on: a client that shows no more than the protocol default is
+-// shown all of it, see shownDown. What such a client holds is up to its own
+-// governor, forty times its starting cap here, with the limit as without.
+-func TestFlowChainedClientNotHeldToSendWindow(t *testing.T) {
++// TestFlowChainedClientHeldLikeOfficial opens forty downloads from a governed
++// client, the server sends all it may and the client reads nothing. The client
++// sees the server govern and shows it the stack's own window, see
++// appendRestock: the server then holds it as it holds an official client, to
++// its send window and a frame a stream over it, and without the limit to the
++// start window a stream has. Both governors count the same.
++func TestFlowChainedClientHeldLikeOfficial(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name       string
+ 		sendWindow int64
+@@ -228,8 +227,14 @@ func TestFlowChainedClientNotHeldToSendWindow(t *testing.T) {
+ 				total += ch.sendAll(id)
+ 			}
+ 			t.Logf("governed client, 40 unread downloads: client holds %d unread (limit %d); server governor counts %d", total, tc.sendWindow, ch.h.c.clientHolds())
+-			if total != 40*flowStartWindow {
+-				t.Fatalf("a governed client was sent %d on forty streams, want its own governor's %d each, %d", total, flowStartWindow, 40*flowStartWindow)
++			if held := ch.h.c.clientHolds(); held != total {
++				t.Fatalf("the server governor counts %d held, the client was sent %d", held, total)
++			}
++			switch {
++			case tc.sendWindow == 0 && total != 40*flowStartWindow:
++				t.Fatalf("with no send window a governed client was sent %d on forty streams, want the start window each, %d", total, 40*flowStartWindow)
++			case tc.sendWindow != 0 && total > tc.sendWindow+40*flowShownLimited:
++				t.Fatalf("a governed client was sent %d on forty streams, over the send window %d and a frame a stream", total, tc.sendWindow)
+ 			}
+ 		})
+ 	}
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index e92a34b04..1573a8088 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -100,12 +100,19 @@ func TestFlowClientSlowReaderBounded(t *testing.T) {
+ 			close(stop)
+ 			resp.Body.Close()
+ 			t.Logf("%s, governed client %v: server wrote %d, client read %d, gap %d, unread at client %d", sc.name, governed, written.Load(), consumed.Load(), gap, unread)
+-			if governed && unread > int64(h2InitWindow)+64<<10 {
++			// In front of a governed server the client leaves its downloads
++			// to it, see appendRestock, and is held as an official client is:
++			// to the server's send window.
++			serverGoverned := sc.down.enabled()
++			if governed && !serverGoverned && unread > int64(h2InitWindow)+64<<10 {
+ 				t.Fatalf("%s: unread at the governed client %d", sc.name, unread)
+ 			}
+-			if governed && gap > 512<<10 {
++			if governed && !serverGoverned && gap > 512<<10 {
+ 				t.Fatalf("%s: gap %d between written and read", sc.name, gap)
+ 			}
++			if governed && serverGoverned && gap > flowServerSendWindow+512<<10 {
++				t.Fatalf("%s: gap %d between written and read, over the server's send window", sc.name, gap)
++			}
+ 		}
+ 	}
+ }
+@@ -300,9 +307,10 @@ func TestFlowClientStreamStateReleased(t *testing.T) {
+ 
+ // TestFlowChainedGovernorsSlowReaders puts a governor at both ends of twelve
+ // downloads, as on a bridge in front of a governed server, and reads them in
+-// stops and starts, so the caps shrink at both ends while each holds credit
+-// back. Every download must still complete: with the client showing more than
+-// the lowest cap (see flowShownDown) the two governors wait for each other.
++// stops and starts, so the server's caps shrink. The client sees the server
++// govern and leaves the downloads to it, see appendRestock: every download
++// must still complete, and the client must hold nothing back. Two governors
++// that each held credit once waited for each other, see flowShownDown.
+ // It runs without the server's send window and with the default one.
+ //
+ // The readers pause after every read until a cap has been seen to fall at
+@@ -401,7 +409,7 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 			case <-tick.C:
+ 				lowServer = min(lowServer, lowestDownCap(serverConns()))
+ 				lowClient = min(lowClient, lowestDownCap(clientConns()))
+-				if lowServer < flowStartWindow && lowClient < flowStartWindow {
++				if lowServer < flowStartWindow {
+ 					fell.Store(true)
+ 				}
+ 			}
+@@ -462,9 +470,17 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 		logDownState(t, "client", clientConns())
+ 		t.FailNow()
+ 	}
+-	if lowServer >= flowStartWindow || lowClient >= flowStartWindow {
+-		t.Fatalf("lowest cap seen: server %d, client %d; both must fall under the starting %d for the two governors to hold credit at once",
+-			lowServer, lowClient, flowStartWindow)
++	if lowServer >= flowStartWindow {
++		t.Fatalf("lowest cap seen: server %d, client %d; the server's must fall under the starting %d", lowServer, lowClient, flowStartWindow)
++	}
++	for _, c := range clientConns() {
++		c.mu.Lock()
++		// A connection the transport dialed and never used saw no reply.
++		deferred := !c.serverReplied || c.peerGoverned && !c.restock
++		c.mu.Unlock()
++		if !deferred {
++			t.Fatal("the client did not leave its downloads to the governed server")
++		}
+ 	}
+ 	t.Logf("lowest cap seen: server %d, client %d", lowServer, lowClient)
+ }
+diff --git a/transport/internet/splithttp/h2flow_credit_test.go b/transport/internet/splithttp/h2flow_credit_test.go
+index 807e1ca5a..74172dfcd 100644
+--- a/transport/internet/splithttp/h2flow_credit_test.go
++++ b/transport/internet/splithttp/h2flow_credit_test.go
+@@ -250,6 +250,9 @@ func TestFlowClientDownloadCreditNotHeld(t *testing.T) {
+ 				t.Fatalf("the server sent %d, want room for %d pieces of credit", sent, pieces)
+ 			}
+ 			ch.cg.mu.Lock()
++			// A client that governs: toward a server that does, it leaves the
++			// window to the server, see peerGoverned.
++			ch.cg.peerGoverned = false
+ 			ch.cg.streams[id].down.ramped = state.ramped
+ 			ch.cg.mu.Unlock()
+ 			for i := 0; i < pieces; i++ {
+diff --git a/transport/internet/splithttp/h2flow_guard_test.go b/transport/internet/splithttp/h2flow_guard_test.go
+index 5907ee087..3c9c8ff97 100644
+--- a/transport/internet/splithttp/h2flow_guard_test.go
++++ b/transport/internet/splithttp/h2flow_guard_test.go
+@@ -3,6 +3,8 @@ package splithttp
+ import (
+ 	"testing"
+ 	"time"
++
++	"golang.org/x/net/http2"
+ )
+ 
+ // TestFlowGuardNotPutOffByNewStreams has a stream run out of window with a
+@@ -39,3 +41,40 @@ func TestFlowGuardNotPutOffByNewStreams(t *testing.T) {
+ 	}
+ 	t.Fatalf("stream 1 has waited %v with no probe, the guard's delay being %v", 400*time.Millisecond, flowGuardMin)
+ }
++
++// TestFlowClientSeesGovernedServer feeds a governed client the server's first
++// frames: a PING ahead of any reply marks the server as one that governs its
++// downloads, a PING after a reply, as a stock server's keepalive, does not.
++func TestFlowClientSeesGovernedServer(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		frames   func(fr *http2.Framer)
++		governed bool
++	}{
++		{"PING with the first SETTINGS", func(fr *http2.Framer) {
++			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++			fr.WritePing(false, [8]byte{1})
++		}, true},
++		{"PING after a reply", func(fr *http2.Framer) {
++			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++			fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x88}, EndHeaders: true})
++			fr.WritePing(false, [8]byte{1})
++		}, false},
++		{"no PING", func(fr *http2.Framer) {
++			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++		}, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c := newFlowClientConn(&scriptConn{})
++			t.Cleanup(func() { c.Close() })
++			c.mode.Store(flowH2)
++			c.fromServer(frames(tc.frames), nil)
++			c.mu.Lock()
++			got := c.peerGoverned
++			c.mu.Unlock()
++			if got != tc.governed {
++				t.Fatalf("server taken as governed: %v, want %v", got, tc.governed)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index d4149b1b3..03353904d 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -54,26 +54,27 @@ type modelStream struct {
+ }
+ 
+ type flowModel struct {
+-	t        *testing.T
+-	rnd      *mrand.Rand
+-	c        *flowConn
+-	capture  *captureConn
+-	streams  map[uint32]*modelStream
+-	next     uint32
+-	cliInit  int64
+-	srvInit  int64
+-	srvPeak  int64 // the largest srvInit so far
+-	cliSees  int64 // initial window the client believes the server granted
+-	srvSees  int64 // initial window the server believes the client granted
+-	up, down flowLimit
+-	phase    int
+-	steps    int
+-	cliConn  int64 // connection window the client believes it has
+-	srvConn  int64 // connection window the server really has left
+-	resize   bool  // the client changes its initial window now and then
+-	changes  int   // mid-connection client window changes applied
+-	failed   bool  // the governor gave up the connection
+-	lenient  bool  // do not require a give-up; let the invariants judge
++	t           *testing.T
++	rnd         *mrand.Rand
++	c           *flowConn
++	capture     *captureConn
++	streams     map[uint32]*modelStream
++	next        uint32
++	cliInit     int64
++	srvInit     int64
++	srvPeak     int64 // the largest srvInit so far
++	cliSees     int64 // initial window the client believes the server granted
++	srvSees     int64 // initial window the server believes the client granted
++	up, down    flowLimit
++	phase       int
++	steps       int
++	cliConn     int64 // connection window the client believes it has
++	srvConn     int64 // connection window the server really has left
++	resize      bool  // the client changes its initial window now and then
++	changes     int   // mid-connection client window changes applied
++	failed      bool  // the governor gave up the connection
++	lenient     bool  // do not require a give-up; let the invariants judge
++	ownSettings int   // SETTINGS the client governor sent itself, whose ACK the client does not see
+ 
+ 	// proto adds the protocol scenarios of protoStep and checks that every
+ 	// frame the governor does not own reaches the other side as it was sent,
+@@ -751,15 +752,33 @@ func (m *flowModel) check(q *[]rawFrame, b []byte, to string) {
+ 			}
+ 			continue
+ 		}
++		// A client governor that sees the server govern sends that server
++		// the stack's initial window in a SETTINGS of its own, see
++		// appendRestock.
++		if to == "server" && got.typ == h2Settings && got.flags == 0 && len(got.payload) == 6 &&
++			binary.BigEndian.Uint16(got.payload) == h2SettingInitialWindowSize && (len(*q) == 0 || (*q)[0].typ != h2Settings) {
++			m.ownSettings++
++			continue
++		}
+ 		if len(*q) == 0 {
+ 			m.t.Fatalf("to the %s: frame %+v that nobody sent", to, got)
+ 		}
++		// The ACK of a SETTINGS the governor sent itself does not reach the
++		// client stack.
++		for to == "client" && m.ownSettings > 0 && len(*q) > 1 && isSettingsAck((*q)[0]) && !sameFrame((*q)[0], got) {
++			*q = (*q)[1:]
++			m.ownSettings--
++		}
+ 		want := (*q)[0]
+ 		*q = (*q)[1:]
+ 		if !sameFrame(want, got) {
+ 			m.t.Fatalf("to the %s: sent %+v, got %+v", to, want, got)
+ 		}
+ 	}
++	for to == "client" && m.ownSettings > 0 && len(*q) > 0 && isSettingsAck((*q)[0]) {
++		*q = (*q)[1:]
++		m.ownSettings--
++	}
+ 	if len(*q) > 0 {
+ 		m.t.Fatalf("to the %s: %d frames lost, first %+v", to, len(*q), (*q)[0])
+ 	}
+@@ -1009,3 +1028,7 @@ func runProtoModel(t *testing.T, seed uint64, up, down flowLimit, client bool, s
+ 		}
+ 	}
+ }
++
++func isSettingsAck(f rawFrame) bool {
++	return f.typ == h2Settings && f.flags&h2FlagAck != 0
++}
+diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
+index 80ff1da5d..0ea1831ef 100644
+--- a/transport/internet/splithttp/h2flow_settled_test.go
++++ b/transport/internet/splithttp/h2flow_settled_test.go
+@@ -97,6 +97,9 @@ func TestFlowClientDownloadFollowsModelOnceSettled(t *testing.T) {
+ 			}
+ 			vouchedPath(ch.cg)
+ 			ch.cg.mu.Lock()
++			// The model is for a server that does not govern: the chain's
++			// does, and the client would leave the window to it.
++			ch.cg.peerGoverned = false
+ 			s := ch.cg.streams[id]
+ 			start := s.down.cap
+ 			lowRoundBehind(&s.down, tc.flat)
+-- 
+2.52.0.windows.1
+

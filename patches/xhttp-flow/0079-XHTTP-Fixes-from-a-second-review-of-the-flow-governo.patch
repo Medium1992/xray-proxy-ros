@@ -1,0 +1,579 @@
+From 79693d1134854ce114aaf7b6ccfcdb1d28cf71c8 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 14:54:14 +0300
+Subject: [PATCH] XHTTP: Fixes from a second review of the flow governor
+
+---
+ transport/internet/splithttp/h2flow.go        |  71 +++++++++--
+ .../splithttp/h2flow_cutaccount_test.go       |  80 ++++++++++++
+ transport/internet/splithttp/h2flow_effect.go |   7 +-
+ .../internet/splithttp/h2flow_effect_test.go  |  33 +++--
+ .../internet/splithttp/h2flow_guard_test.go   | 117 +++++++++++++++++-
+ .../internet/splithttp/h2flow_model_test.go   |   9 ++
+ .../internet/splithttp/h2flow_shown_test.go   |  52 ++++++--
+ 7 files changed, 339 insertions(+), 30 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_cutaccount_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 26c4c0af7..9c051e3f2 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -48,6 +48,9 @@ const (
+ 	h2WindowUpdate = 0x8
+ 	h2Continuation = 0x9
+ 
++	// h2ErrFlowControl is FLOW_CONTROL_ERROR.
++	h2ErrFlowControl = 0x3
++
+ 	h2FlagEndStream  = 0x1
+ 	h2FlagAck        = 0x1
+ 	h2FlagEndHeaders = 0x4
+@@ -598,7 +601,7 @@ func (w *flowWindow) pi(now time.Time, st tcpStats, init, limit int32, gain floa
+ 	// queue a reader that takes all it is given still copies only the
+ 	// round's share of the cap, and must not be taken for one that limits
+ 	// itself.
+-	if 4*copied < int64(w.cap)*int64(round)/int64(max(st.rtt, round)) {
++	if 4*float64(copied) < float64(w.cap)*float64(round)/float64(max(st.rtt, round)) {
+ 		delta = min(delta, 0)
+ 		if w.slow++; w.slow >= flowShrinkAfter {
+ 			delta = min(delta, -cap/4)
+@@ -692,6 +695,10 @@ type flowConn struct {
+ 	// its reader does, and governing them twice takes no rate. serverReplied
+ 	// notes the server's first HEADERS.
+ 	peerGoverned, serverReplied bool
++	// pingTagged says a server has sent its tagged first PING, see flowPingTag.
++	pingTagged bool
++	// resets are streams whose client sent past their window, to be reset.
++	resets []uint32
+ 	// group is what a client shares with its other connections to the server,
+ 	// see flowGroup; probeSince is when its downloads were last seen to sit
+ 	// at init under a raised round trip, and wide that a probe widens them.
+@@ -1496,8 +1503,18 @@ type flowPing struct {
+ // health checks do, and remembers it to recognize the ACK. The last
+ // flowPingSlots are remembered, so a guard probe sent while a periodic PING
+ // is due back does not make that one's ACK look foreign.
++// flowPingTag marks the first PING a governed server sends, with its first
++// SETTINGS: a governed client takes it, and no other early PING, for a
++// server that governs its downloads, see peerGoverned. The PING's payload is
++// inside TLS, seen by the two ends alone.
++const flowPingTag = 0x6b7a3f91
++
+ func (c *flowConn) appendPingFrame(out []byte) []byte {
+ 	c.pingData = rand.Uint64()
++	if !c.client && !c.pingTagged {
++		c.pingTagged = true
++		c.pingData = flowPingTag<<32 | c.pingData&0xffffffff
++	}
+ 	c.pings = append(c.pings, flowPing{c.pingData, time.Now()})
+ 	if len(c.pings) > flowPingSlots {
+ 		c.pings = c.pings[len(c.pings)-flowPingSlots:]
+@@ -1793,8 +1810,12 @@ func (r *flowReader) frame(f h2Frame) {
+ 		}
+ 		if s := c.stream(f.stream); s != nil {
+ 			s.upSent += int64(f.length)
++			// Past a stream's window is the stream's error alone, as with a
++			// stack shown that window: the stream is reset both ways, see
++			// appendResets, and the connection goes on.
+ 			if up && s.upSent > int64(c.serverShown)+s.upForwarded {
+-				c.giveUp()
++				c.resets = append(c.resets, f.stream)
++				c.drop(f.stream)
+ 				return
+ 			}
+ 			if f.flags&h2FlagEndStream != 0 {
+@@ -1915,8 +1936,32 @@ func (c *flowConn) appendRestock(out []byte) []byte {
+ 	return out
+ }
+ 
++// appendResets resets the streams whose client sent past the window it was
++// shown, with FLOW_CONTROL_ERROR, as a stack shown that window would: to the
++// stack, as if from the client, so the handler ends, and to the client.
++func (c *flowConn) appendResets(out []byte) []byte {
++	if len(c.resets) == 0 {
++		return out
++	}
++	for _, id := range c.resets {
++		out = appendRSTStream(out, id, h2ErrFlowControl)
++		c.wqueue = appendRSTStream(c.wqueue, id, h2ErrFlowControl)
++	}
++	c.resets = c.resets[:0]
++	c.wakeQueue()
++	return out
++}
++
++// appendRSTStream adds an RST_STREAM for id with code to out.
++func appendRSTStream(out []byte, id, code uint32) []byte {
++	out = append(out, 0, 0, 4, h2RSTStream, 0)
++	out = binary.BigEndian.AppendUint32(out, id&0x7fffffff)
++	return binary.BigEndian.AppendUint32(out, code)
++}
++
+ func (r *flowReader) boundary(out []byte) []byte {
+ 	c := (*flowConn)(r)
++	out = c.appendResets(out)
+ 	// Ahead of any credit: the server is to know the window before it is
+ 	// handed what the window holds.
+ 	if c.client && c.restock && c.clientInit != 0 {
+@@ -1988,7 +2033,9 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 	case h2Settings:
+ 		// The ACK of a SETTINGS the governor sent, see restock, is not the
+ 		// stack's to see: ACKs come in the order the SETTINGS went.
+-		if c.client && f.flags&h2FlagAck != 0 && len(c.settingsOwn) > 0 {
++		// Only a well-formed one: an ACK with a payload is a FRAME_SIZE_ERROR
++		// the stack has to see to raise, and it takes no SETTINGS off the queue.
++		if c.client && f.flags&h2FlagAck != 0 && f.length == 0 && f.stream == 0 && len(c.settingsOwn) > 0 {
+ 			own := c.settingsOwn[0]
+ 			c.settingsOwn = c.settingsOwn[1:]
+ 			if own {
+@@ -2025,8 +2072,9 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 			return out
+ 		}
+ 		// A governed server sends a PING of its own with its first SETTINGS,
+-		// before it answers anything; a stock one does not.
+-		if c.client && f.flags&h2FlagAck == 0 && !c.serverReplied && !c.peerGoverned {
++		// before it answers anything, tagged: a stock server's health check can
++		// come early too, and is not one.
++		if c.client && f.flags&h2FlagAck == 0 && !c.serverReplied && !c.peerGoverned && len(payload) == 8 && binary.BigEndian.Uint32(payload) == flowPingTag {
+ 			c.peerGoverned, c.restock = true, true
+ 		}
+ 	case h2WindowUpdate:
+@@ -2094,7 +2142,11 @@ func (c *flowConn) governDown(now time.Time, s *flowStream) {
+ 		// half of its own window could be held below that half. Only
+ 		// where the kernel sees the path: behind a TCP proxy it sees
+ 		// no queue at all.
+-		c.effect.cutBy(s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now)))
++		// A download the server has finished takes no part in the gain, see
++		// cutGain, and neither does what is cut from it.
++		if cut := s.down.pi(now, c.kstat, c.down.init, c.down.max, c.cutGain(now)); !s.serverDone {
++			c.effect.cutBy(cut)
++		}
+ 	default:
+ 		s.down.adjust(now, c.currentRTT(), c.down.init, c.down.max, c.client || c.incremental, q > 0)
+ 		// A round trip pi saw before the stream left it is no step to
+@@ -2112,8 +2164,11 @@ func (c *flowConn) governDown(now time.Time, s *flowStream) {
+ 	case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
+ 		s.down.qAt = now
+ 		before := s.down.cap
+-		s.down.cap = max(c.down.init, s.down.cap-int32(c.cutGain(now)*float64(s.down.cap/4)))
+-		c.effect.cutBy(float64(before - s.down.cap))
++		// The quarter cut as it always was, before/4*3, scaled by the gain.
++		s.down.cap = max(c.down.init, before-int32(c.cutGain(now)*float64(before-before/4*3)))
++		if !s.serverDone {
++			c.effect.cutBy(float64(before - s.down.cap))
++		}
+ 	}
+ }
+ 
+diff --git a/transport/internet/splithttp/h2flow_cutaccount_test.go b/transport/internet/splithttp/h2flow_cutaccount_test.go
+new file mode 100644
+index 000000000..e4df3e8cb
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_cutaccount_test.go
+@@ -0,0 +1,80 @@
++package splithttp
++
++import (
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++)
++
++// TestFlowEffectPostCutSpikeIsNoCut has what is in flight double after a cut
++// and come back to where it stood before it, with the queue above where it
++// was: nothing fell below the round before the cut, so the cut is not judged
++// and the gain stays 1. Peaks raised after the cut took the fall back from
++// the spike for the cut's effect.
++func TestFlowEffectPostCutSpikeIsNoCut(t *testing.T) {
++	var e flowEffect
++	t0 := time.Unix(1, 0)
++	e.note(t0, 300*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond, 1024, 1024)
++	e.cutBy(256)
++	e.note(t0.Add(time.Second), 500*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond, 2048, 1024)
++	if gain := e.note(t0.Add(2*time.Second), 450*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond, 1024, 768); gain != 1 {
++		t.Fatalf("gain=%g: what is in flight never fell below the round before the cut", gain)
++	}
++}
++
++// TestFlowFinishedDownloadCutNotCounted has the server finish a download and
++// the client then return credit on it, as it legally may, beside a long
++// queue: what the cut at a long queue takes off that cap is no cut of a
++// download that takes part in the gain, and is not noted.
++func TestFlowFinishedDownloadCutNotCounted(t *testing.T) {
++	h, s := queuedDownload(t)
++	h.fromServer(func(fr *http2.Framer) { fr.WriteData(1, true, nil) })
++	h.c.mu.Lock()
++	done := s.serverDone
++	h.c.mu.Unlock()
++	if !done {
++		t.Fatal("the server did not finish the download")
++	}
++	credit(h, s)
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	if h.c.effect.cut != 0 {
++		t.Fatalf("%v bytes of cut noted on a download the server had finished", h.c.effect.cut)
++	}
++}
++
++// TestFlowPISlowReaderNoOverflow has a reader that took one byte over an hour,
++// and a 1 GiB cap over ten seconds, at the last slow round before the cap
++// shrinks: the cap shrinks. The cap times the round in nanoseconds wrapped,
++// and the cap grew instead.
++func TestFlowPISlowReaderNoOverflow(t *testing.T) {
++	for _, tc := range []struct {
++		cap   int32
++		round time.Duration
++	}{{4 << 20, time.Hour}, {1 << 30, 10 * time.Second}} {
++		now := time.Unix(1e6, 0)
++		w := flowWindow{cap: tc.cap, returned: 1, slow: flowShrinkAfter - 1}
++		w.mark = now.Add(-tc.round)
++		st := tcpStats{rtt: 100 * time.Millisecond, minRTT: 100 * time.Millisecond}
++		w.pi(now, st, h2InitWindow, 1<<30, 1)
++		if w.cap >= tc.cap {
++			t.Fatalf("cap %d after a byte in %v: did not shrink from %d", w.cap, tc.round, tc.cap)
++		}
++	}
++}
++
++// TestFlowLongQueueCutRounding cuts caps one to three bytes over a multiple
++// of four at full gain: the cap goes to three quarters as it always did,
++// before/4*3.
++func TestFlowLongQueueCutRounding(t *testing.T) {
++	for _, before := range []int32{1048577, 1048578, 1048579} {
++		h, s := queuedDownload(t)
++		h.c.mu.Lock()
++		s.down.cap = before
++		h.c.mu.Unlock()
++		if got, want := credit(h, s), before/4*3; got != want {
++			t.Fatalf("cap %d cut at full gain to %d, want %d", before, got, want)
++		}
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_effect.go b/transport/internet/splithttp/h2flow_effect.go
+index 7cc452aa1..8bf5e64fa 100644
+--- a/transport/internet/splithttp/h2flow_effect.go
++++ b/transport/internet/splithttp/h2flow_effect.go
+@@ -79,7 +79,12 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
+ 		e.start(x, c)
+ 		return 1
+ 	}
+-	e.flightTop, e.qTop = max(e.flightTop, x), max(e.qTop, e.queue)
++	// A cut is judged from the round before it, see cutBy: peaks after it,
++	// a burst of flight it did not cause or a queue that rose on, would
++	// have a fall back from them read as the cut's.
++	if e.cut == 0 {
++		e.flightTop, e.qTop = max(e.flightTop, x), max(e.qTop, e.queue)
++	}
+ 	// A queue that halved since the last judgement drained by the client's
+ 	// own cuts, this connection's or its neighbours': cuts have their gain
+ 	// back. Other traffic's queue at a full buffer wanders by a tenth, and
+diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
+index 6d775749a..d9da32c01 100644
+--- a/transport/internet/splithttp/h2flow_effect_test.go
++++ b/transport/internet/splithttp/h2flow_effect_test.go
+@@ -192,7 +192,9 @@ func TestFlowEffectCountsDownloadsOnly(t *testing.T) {
+ 	// The download is cut by a third and takes data; the queue stands.
+ 	down.down.cap, down.down.returned = 700<<10, 2
+ 	c.kstat.inFlight = 700 << 10
++	t.Logf("before the cut: %+v", c.effect)
+ 	c.effect.cutBy(300 << 10)
++	t.Logf("after the cut: %+v", c.effect)
+ 	if g := c.cutGain(now.Add(time.Second)); g != 0 {
+ 		t.Fatalf("gain %v for a download cut against a queue that did not move", g)
+ 	}
+@@ -211,22 +213,31 @@ func TestFlowPIFollowsOneStep(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowEffectCountsSlowDownload is a download that returns no credit in a
+-// round, as one beside a long queue does: its cap stays in the sum, so that
+-// the round reads as no cut.
++// TestFlowEffectCountsSlowDownload has two downloads beside a queue that does
++// not move, one of which returns no credit in the round before a cut, as one
++// beside a long queue does. Its cap stays in the sum: the cut of 300 KiB is
++// under a fifth of the 2 MiB of caps, not judged yet, and the gain stays 1.
++// Taken out of the sum, the same cut is three tenths of 1 MiB, judged against
++// a queue that stood, and the gain falls to none.
+ func TestFlowEffectCountsSlowDownload(t *testing.T) {
+-	down := &flowStream{}
+-	down.down.cap = 1 << 20
+-	c := &flowConn{streams: map[uint32]*flowStream{1: down}, kOK: true}
++	fast, slow := &flowStream{}, &flowStream{}
++	fast.down.cap, slow.down.cap = 1<<20, 1<<20
++	c := &flowConn{streams: map[uint32]*flowStream{1: fast, 3: slow}, kOK: true}
+ 	c.kstat = tcpStats{rtt: 300 * time.Millisecond, minRTT: 100 * time.Millisecond, inFlight: 1 << 20}
+ 	now := time.Now()
+-	down.down.returned = 1
++	fast.down.returned, slow.down.returned = 1, 1
+ 	c.cutGain(now)
+-	// A round with no credit from the download, and what is in flight down
+-	// as TCP loses a little; the queue stands.
++	// The slow download returns nothing in the next round.
++	now = now.Add(200 * time.Millisecond)
++	fast.down.returned = 2
++	c.cutGain(now)
++	c.effect.cutBy(300 << 10)
++	// The cut lands: what is in flight falls three tenths; the queue stands.
++	now = now.Add(200 * time.Millisecond)
++	fast.down.returned = 3
+ 	c.kstat.inFlight = 700 << 10
+-	if g := c.cutGain(now.Add(200 * time.Millisecond)); g != 1 {
+-		t.Fatalf("gain %v after a round the download returned nothing in", g)
++	if g := c.cutGain(now); g != 1 {
++		t.Fatalf("gain %v: the slow download's cap left the sum, and a cut under a fifth of the caps was judged", g)
+ 	}
+ }
+ 
+diff --git a/transport/internet/splithttp/h2flow_guard_test.go b/transport/internet/splithttp/h2flow_guard_test.go
+index 3c9c8ff97..42c40f5aa 100644
+--- a/transport/internet/splithttp/h2flow_guard_test.go
++++ b/transport/internet/splithttp/h2flow_guard_test.go
+@@ -1,6 +1,12 @@
+ package splithttp
+ 
+ import (
++	"context"
++	gotls "crypto/tls"
++	"io"
++	"net"
++	"net/http"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -51,14 +57,20 @@ func TestFlowClientSeesGovernedServer(t *testing.T) {
+ 		frames   func(fr *http2.Framer)
+ 		governed bool
+ 	}{
+-		{"PING with the first SETTINGS", func(fr *http2.Framer) {
++		{"tagged PING with the first SETTINGS", func(fr *http2.Framer) {
+ 			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+-			fr.WritePing(false, [8]byte{1})
++			fr.WritePing(false, [8]byte{0x6b, 0x7a, 0x3f, 0x91, 1, 2, 3, 4})
+ 		}, true},
++		// A stock server's health check, as http2.Server with ReadIdleTimeout
++		// sends while a handler holds its first reply.
++		{"untagged early PING", func(fr *http2.Framer) {
++			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++			fr.WritePing(false, [8]byte{1})
++		}, false},
+ 		{"PING after a reply", func(fr *http2.Framer) {
+ 			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+ 			fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x88}, EndHeaders: true})
+-			fr.WritePing(false, [8]byte{1})
++			fr.WritePing(false, [8]byte{0x6b, 0x7a, 0x3f, 0x91, 1, 2, 3, 4})
+ 		}, false},
+ 		{"no PING", func(fr *http2.Framer) {
+ 			fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+@@ -78,3 +90,102 @@ func TestFlowClientSeesGovernedServer(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestFlowClientNotFooledByStockHealthCheck puts a governed client in front of
++// an unmodified x/net HTTP/2 server with a 10 ms ReadIdleTimeout whose handler
++// holds its first reply: the server's health-check PINGs come before any
++// reply, and the client must keep governing.
++func TestFlowClientNotFooledByStockHealthCheck(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	srv := &http2.Server{ReadIdleTimeout: 10 * time.Millisecond, PingTimeout: time.Second}
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go srv.ServeConn(c, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				time.Sleep(300 * time.Millisecond)
++				w.Write([]byte("ok"))
++			})})
++		}
++	}()
++	var fc *flowConn
++	var mu sync.Mutex
++	client := &http.Client{Transport: &http2.Transport{
++		AllowHTTP: true,
++		DialTLSContext: func(ctx context.Context, network, addr string, _ *gotls.Config) (net.Conn, error) {
++			c, err := (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
++			if err != nil {
++				return nil, err
++			}
++			g := newFlowClientConn(c)
++			mu.Lock()
++			fc = g
++			mu.Unlock()
++			return g, nil
++		},
++	}}
++	resp, err := client.Get("http://x/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	io.ReadAll(resp.Body)
++	resp.Body.Close()
++	mu.Lock()
++	defer mu.Unlock()
++	fc.mu.Lock()
++	defer fc.mu.Unlock()
++	if fc.peerGoverned {
++		t.Fatal("a stock server's health-check PING was taken for a governed server")
++	}
++}
++
++// TestFlowClientMalformedOwnedAckReachesStack drives a governed client through
++// its SETTINGS, a governed server's tagged PING and the write that carries
++// the client's own SETTINGS, forwards the ACK of the stack's SETTINGS, and
++// then has the server send a SETTINGS ACK with a payload, a FRAME_SIZE_ERROR:
++// it reaches the stack whole, for the stack to raise, and does not stand for
++// the ACK of the governor's SETTINGS.
++func TestFlowClientMalformedOwnedAckReachesStack(t *testing.T) {
++	sc := &scriptConn{}
++	c := newFlowClientConn(sc)
++	t.Cleanup(func() { c.Close() })
++	c.mode.Store(flowH2)
++	if _, err := c.writeToServer(frames(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20})
++	})); err != nil {
++		t.Fatal(err)
++	}
++	c.fromServer(frames(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
++		fr.WritePing(false, [8]byte{0x6b, 0x7a, 0x3f, 0x91, 1, 2, 3, 4})
++	}), nil)
++	if _, err := c.writeToServer(frames(func(fr *http2.Framer) {
++		fr.WritePing(true, [8]byte{0x6b, 0x7a, 0x3f, 0x91, 1, 2, 3, 4})
++	})); err != nil {
++		t.Fatal(err)
++	}
++	c.mu.Lock()
++	owned := len(c.settingsOwn) == 2 && c.settingsOwn[1]
++	c.mu.Unlock()
++	if !owned {
++		t.Fatal("the client sent no SETTINGS of its own")
++	}
++	if out := c.fromServer(frames(func(fr *http2.Framer) { fr.WriteSettingsAck() }), nil); len(out) != h2FrameHeader {
++		t.Fatalf("the ACK of the stack's SETTINGS reached it as %d bytes", len(out))
++	}
++	bad := []byte{0, 0, 6, h2Settings, h2FlagAck, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1}
++	if out := c.fromServer(append([]byte(nil), bad...), nil); len(out) != len(bad) {
++		t.Fatalf("a SETTINGS ACK with a payload reached the stack as %d of its %d bytes", len(out), len(bad))
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.settingsOwn) != 1 || !c.settingsOwn[0] {
++		t.Fatalf("the malformed ACK took the governor's SETTINGS off the queue: %v", c.settingsOwn)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
+index 03353904d..11f695f06 100644
+--- a/transport/internet/splithttp/h2flow_model_test.go
++++ b/transport/internet/splithttp/h2flow_model_test.go
+@@ -752,6 +752,15 @@ func (m *flowModel) check(q *[]rawFrame, b []byte, to string) {
+ 			}
+ 			continue
+ 		}
++		// A stream whose client sent past its window is reset by the governor
++		// with FLOW_CONTROL_ERROR, to both ends, see appendResets.
++		if got.typ == h2RSTStream && len(got.payload) == 4 && binary.BigEndian.Uint32(got.payload) == h2ErrFlowControl &&
++			(len(*q) == 0 || !sameFrame((*q)[0], got)) {
++			if to == "server" {
++				m.forget(got.stream)
++			}
++			continue
++		}
+ 		// A client governor that sees the server govern sends that server
+ 		// the stack's initial window in a SETTINGS of its own, see
+ 		// appendRestock.
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+index 222c4c36a..b9ce82397 100644
+--- a/transport/internet/splithttp/h2flow_shown_test.go
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -1,6 +1,7 @@
+ package splithttp
+ 
+ import (
++	"encoding/binary"
+ 	"testing"
+ 	"time"
+ 
+@@ -8,10 +9,13 @@ import (
+ )
+ 
+ // TestFlowClientPastShownWindow sends upload data up to the windows the
+-// client was shown, which the server takes, and then a byte more, which ends
+-// the connection as a stack shown those windows would. The server's stack is
+-// given larger windows than the client is shown, so without the governor's
+-// check a client could leave it several times as much unread.
++// client was shown, which the server takes, and then a byte more, which a
++// stack shown those windows answers as the stock one does: past the stream's
++// window the stream is reset with FLOW_CONTROL_ERROR, to the stack and to the
++// client, and another stream goes on; past the connection's the connection
++// ends. The server's stack is given larger windows than the client is shown,
++// so without the governor's check a client could leave it several times as
++// much unread.
+ func TestFlowClientPastShownWindow(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name       string
+@@ -43,13 +47,36 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 				}
+ 			}
+ 			shown := min(conn, h.toClient.streams[1])
++			t.Logf("stream window %d, connection window %d", h.toClient.streams[1], conn)
+ 			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, int(shown)) })
+ 			if h.readErr != nil || h.c.isBroken() {
+ 				t.Fatalf("data within the %d shown ended the connection: %v", shown, h.readErr)
+ 			}
+-			h.fromClient(func(fr *http2.Framer) { fr.WriteData(1, false, []byte{0}) })
+-			if h.readErr == nil || !h.c.isBroken() {
+-				t.Fatalf("a byte past the %d shown was taken", shown)
++			h.conn.take()
++			got := h.fromClient(func(fr *http2.Framer) { fr.WriteData(1, false, []byte{0}) })
++			if h.toClient.streams[1] >= conn {
++				if h.readErr == nil || !h.c.isBroken() {
++					t.Fatalf("a byte past the connection's %d shown was taken", shown)
++				}
++				return
++			}
++			if h.readErr != nil || h.c.isBroken() {
++				t.Fatalf("a byte past stream 1's %d shown ended the connection: %v", shown, h.readErr)
++			}
++			if !hasReset(t, got, 1) {
++				t.Fatal("the stack was not told stream 1 was reset")
++			}
++			h.sync()
++			if !hasReset(t, h.conn.take(), 1) {
++				t.Fatal("the client was not told stream 1 was reset")
++			}
++			// Another stream is still usable.
++			got = h.fromClient(func(fr *http2.Framer) {
++				fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: []byte{0x82}, EndHeaders: true})
++				fr.WriteData(3, false, make([]byte, 100))
++			})
++			if h.readErr != nil || h.c.isBroken() || len(dataFrames(got)) != 4+100 {
++				t.Fatalf("stream 3 after the reset: %d bytes of data reached the stack, error %v", len(dataFrames(got)), h.readErr)
+ 			}
+ 		})
+ 	}
+@@ -81,3 +108,14 @@ func TestFlowWindowHugeCredit(t *testing.T) {
+ 		t.Fatalf("model: cap %d after a round of 2^40, want the limit %d", w.cap, limit)
+ 	}
+ }
++
++// hasReset reports whether b carries an RST_STREAM with FLOW_CONTROL_ERROR
++// for id.
++func hasReset(t *testing.T, b []byte, id uint32) bool {
++	for _, f := range rawFrames(t, b) {
++		if f.typ == h2RSTStream && f.stream == id && len(f.payload) == 4 && binary.BigEndian.Uint32(f.payload) == h2ErrFlowControl {
++			return true
++		}
++	}
++	return false
++}
+-- 
+2.52.0.windows.1
+

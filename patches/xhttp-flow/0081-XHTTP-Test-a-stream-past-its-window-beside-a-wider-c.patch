@@ -1,0 +1,50 @@
+From 77af1b1819a25705482bf90127eecd3a9811f3e4 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 14:56:29 +0300
+Subject: [PATCH] XHTTP: Test a stream past its window beside a wider
+ connection window
+
+---
+ .../internet/splithttp/h2flow_shown_test.go     | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+index b9ce82397..cfef99fed 100644
+--- a/transport/internet/splithttp/h2flow_shown_test.go
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -21,10 +21,14 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 		name       string
+ 		connCredit uint32
+ 		streamCred uint32
++		// wideConn shows the client more of the connection than any stream
++		// holds, so that the stream's window is the one it sends past.
++		wideConn bool
+ 	}{
+-		{"no credit", 0, 0},
+-		{"connection credit", 8 << 20, 0},
+-		{"stream and connection credit", 8 << 20, 4 << 20},
++		{"no credit", 0, 0, false},
++		{"connection credit", 8 << 20, 0, false},
++		{"stream and connection credit", 8 << 20, 4 << 20, false},
++		{"connection window over the stream's", 8 << 20, 0, true},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			h := newFlowHarness(t)
+@@ -46,8 +50,13 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 					conn += int64(wu.Increment)
+ 				}
+ 			}
++			if tc.wideConn {
++				h.c.mu.Lock()
++				h.c.upConnForwarded += 8 << 20
++				h.c.mu.Unlock()
++				conn += 8 << 20
++			}
+ 			shown := min(conn, h.toClient.streams[1])
+-			t.Logf("stream window %d, connection window %d", h.toClient.streams[1], conn)
+ 			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, int(shown)) })
+ 			if h.readErr != nil || h.c.isBroken() {
+ 				t.Fatalf("data within the %d shown ended the connection: %v", shown, h.readErr)
+-- 
+2.52.0.windows.1
+

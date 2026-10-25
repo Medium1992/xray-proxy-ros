@@ -1,0 +1,100 @@
+From d95545503edebe0fa12175517432a66cf1a08d31 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:13:35 +0300
+Subject: [PATCH 83/84] XHTTP: Forget the streams a server's GOAWAY will not
+ take up
+
+GOAWAY passed unread, so a client stream past the last one it names
+stayed tracked until the connection closed, holding its share of the
+client's credit and a slot under the stream limit. The governor now
+reads the last stream id and forgets the client's streams past it, as
+the stacks do. The frame passes on unchanged.
+---
+ transport/internet/splithttp/h2flow.go        | 12 ++++++
+ .../internet/splithttp/h2flow_goaway_test.go  | 37 +++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+ create mode 100644 transport/internet/splithttp/h2flow_goaway_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index c06a78d56..a57e47abe 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -45,6 +45,7 @@ const (
+ 	h2Settings     = 0x4
+ 	h2PushPromise  = 0x5
+ 	h2Ping         = 0x6
++	h2GoAway       = 0x7
+ 	h2WindowUpdate = 0x8
+ 	h2Continuation = 0x9
+ 
+@@ -290,6 +291,8 @@ func (f h2Frame) control() bool {
+ 		return f.stream == 0 && f.length%6 == 0 && f.length <= h2MinMaxFrameSize
+ 	case h2Ping:
+ 		return f.stream == 0 && f.length == 8
++	case h2GoAway:
++		return f.stream == 0 && f.length >= 8 && f.length <= h2MinMaxFrameSize
+ 	case h2WindowUpdate:
+ 		return f.length == 4
+ 	}
+@@ -2077,6 +2080,15 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		if c.client && f.flags&h2FlagAck == 0 && !c.serverReplied && !c.peerGoverned && len(payload) == 8 && binary.BigEndian.Uint32(payload) == flowPingTag {
+ 			c.peerGoverned, c.restock = true, true
+ 		}
++	case h2GoAway:
++		// The server will not take up the client's streams past the last it
++		// names: the stacks forget them, so does the governor.
++		last := binary.BigEndian.Uint32(payload) & 0x7fffffff
++		for id := range c.streams {
++			if id > last && id%2 == 1 {
++				c.drop(id)
++			}
++		}
+ 	case h2WindowUpdate:
+ 		inc := int64(binary.BigEndian.Uint32(payload) & 0x7fffffff)
+ 		if f.stream == 0 && inc > 0 && c.up.enabled() {
+diff --git a/transport/internet/splithttp/h2flow_goaway_test.go b/transport/internet/splithttp/h2flow_goaway_test.go
+new file mode 100644
+index 000000000..61764c5a8
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_goaway_test.go
+@@ -0,0 +1,37 @@
++package splithttp
++
++import (
++	"bytes"
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// TestFlowGoAwayDropsStreamsPastLast has the server send GOAWAY naming
++// stream 1 as its last, with downloads open on 1 and 3: stream 3 is one the
++// server will not take up, and the governor forgets it as the stacks do,
++// where it held its share of the client's credit and a stream's slot until
++// the connection closed. Stream 1 stays, and the GOAWAY reaches the client as
++// it was sent.
++func TestFlowGoAwayDropsStreamsPastLast(t *testing.T) {
++	h := newFlowHarness(t)
++	t.Cleanup(func() { h.c.Close() })
++	h.openRequest(1)
++	h.openRequest(3)
++	goAway := frames(func(fr *http2.Framer) { fr.WriteGoAway(1, http2.ErrCodeNo, []byte("bye")) })
++	got, err := h.fromServerRaw(goAway)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Contains(got, goAway) {
++		t.Fatalf("the GOAWAY reached the client as %x, sent %x", got, goAway)
++	}
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	if h.c.streams[3] != nil || h.c.downOpen != 1 {
++		t.Fatalf("after GOAWAY(last=1) stream 3 tracked: %v, %d downloads open", h.c.streams[3] != nil, h.c.downOpen)
++	}
++	if h.c.streams[1] == nil {
++		t.Fatal("stream 1, the last the server takes up, was dropped")
++	}
++}
+-- 
+2.52.0.windows.1
+

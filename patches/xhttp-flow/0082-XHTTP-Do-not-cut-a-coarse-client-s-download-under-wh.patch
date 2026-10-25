@@ -1,0 +1,81 @@
+From 67713109441df3bd9e983ea3e8fe89ef313a6a9b Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:03:08 +0300
+Subject: [PATCH 82/84] XHTTP: Do not cut a coarse client's download under
+ where the guard lifts it
+
+A client that has not credited in small steps may wait for half of its
+window before it credits. The long-queue cut took such a download under
+that, the download stopped until the guard lifted it to half the window
+and 64 KiB, and the next cut stopped it again. Its floor is now that
+level; a client that credits in small steps is cut as before.
+---
+ transport/internet/splithttp/h2flow.go        | 11 ++++++-
+ .../splithttp/h2flow_cutaccount_test.go       | 32 +++++++++++++++++++
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 9c051e3f2..c06a78d56 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -2165,7 +2165,16 @@ func (c *flowConn) governDown(now time.Time, s *flowStream) {
+ 		s.down.qAt = now
+ 		before := s.down.cap
+ 		// The quarter cut as it always was, before/4*3, scaled by the gain.
+-		s.down.cap = max(c.down.init, before-int32(c.cutGain(now)*float64(before-before/4*3)))
++		// A client that has not shown it credits in small steps may wait for
++		// half of its own window before it credits at all: a cap under that
++		// stops the download until the guard lifts it, see unstick, and the
++		// next cut stops it again. Such a client is cut no lower than the
++		// guard would lift it.
++		floor := c.down.init
++		if !c.incremental {
++			floor = int32(min(int64(c.down.max), max(int64(floor), int64(c.clientInit)/2+flowSmallCredit)))
++		}
++		s.down.cap = max(min(floor, before), before-int32(c.cutGain(now)*float64(before-before/4*3)))
+ 		if !s.serverDone {
+ 			c.effect.cutBy(float64(before - s.down.cap))
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_cutaccount_test.go b/transport/internet/splithttp/h2flow_cutaccount_test.go
+index e4df3e8cb..f23ab0bae 100644
+--- a/transport/internet/splithttp/h2flow_cutaccount_test.go
++++ b/transport/internet/splithttp/h2flow_cutaccount_test.go
+@@ -78,3 +78,35 @@ func TestFlowLongQueueCutRounding(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestFlowCoarseClientCutAboveHalfWindow has a client that credits in large
++// steps, one that may wait for half of its 4 MiB window before it credits,
++// beside a long queue: cut after cut takes its cap no lower than half that
++// window and the credit the guard adds, where the download would stop until
++// the guard lifts it. A client that credits in small steps is cut on down.
++func TestFlowCoarseClientCutAboveHalfWindow(t *testing.T) {
++	for _, step := range []uint32{128 << 10, 4 << 10} {
++		h, s := queuedDownload(t)
++		h.c.mu.Lock()
++		s.down.cap = 4 << 20
++		floor := int32(h.c.clientInit/2 + flowSmallCredit)
++		h.c.mu.Unlock()
++		var low int32 = 4 << 20
++		for range 8 {
++			h.c.mu.Lock()
++			s.down.qAt = time.Time{}
++			h.c.mu.Unlock()
++			h.fromClient(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, step) })
++			h.c.mu.Lock()
++			low = min(low, s.down.cap)
++			h.c.mu.Unlock()
++		}
++		coarse := step >= flowSmallCredit
++		if coarse && low < floor {
++			t.Fatalf("a client crediting %d at a time was cut to %d, under half its window and the guard's credit, %d", step, low, floor)
++		}
++		if !coarse && low >= floor {
++			t.Fatalf("a client crediting %d at a time was held at %d, not cut under %d", step, low, floor)
++		}
++	}
++}
+-- 
+2.52.0.windows.1
+

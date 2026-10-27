@@ -1,0 +1,317 @@
+From a31a1db193e5e6b032784bc3ce1b428076da39a3 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:26:23 +0300
+Subject: [PATCH] XHTTP: Add the upstream h2Flow PR's remaining tests
+
+Client record sizes, the overrun tests waiting for the server's first connection WINDOW_UPDATE before they upload, the stock GOAWAY required in the header-block check, and a listener that closes before the client preface failing the settings-only check.
+---
+ .../internet/splithttp/h2flow_overrun_test.go |  89 ++++++-------
+ .../internet/splithttp/h2flow_records_test.go | 117 ++++++++++++++++++
+ .../splithttp/h2flow_verify_listener_test.go  |   7 ++
+ 3 files changed, 161 insertions(+), 52 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_records_test.go
+
+diff --git a/transport/internet/splithttp/h2flow_overrun_test.go b/transport/internet/splithttp/h2flow_overrun_test.go
+index 67b28a65..8bb0effc 100644
+--- a/transport/internet/splithttp/h2flow_overrun_test.go
++++ b/transport/internet/splithttp/h2flow_overrun_test.go
+@@ -82,16 +82,7 @@ func TestFlowUploadPastWindowAsStock(t *testing.T) {
+ 					t.Fatal(err)
+ 				}
+ 
+-				for {
+-					f, err := fr.ReadFrame()
+-					if err != nil {
+-						t.Fatal(err)
+-					}
+-					if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+-						fr.WriteSettingsAck()
+-						break
+-					}
+-				}
++				connWin := readServerPreface(t, fr)
+ 
+ 				var hb1, hb3 bytes.Buffer
+ 				enc1 := hpack.NewEncoder(&hb1)
+@@ -131,7 +122,7 @@ func TestFlowUploadPastWindowAsStock(t *testing.T) {
+ 				// Wait for the connection window to hold all the test sends
+ 				// on stream 1, the frame past its window too, so that only
+ 				// the stream's window is sent past.
+-				connWin := int64(h2InitWindow) - 4*16384
++				connWin -= 4 * 16384
+ 				for connWin < int64(flowShownUp)+8192 {
+ 					f, err := fr.ReadFrame()
+ 					if err != nil {
+@@ -295,16 +286,7 @@ func TestFlowSiblingUploadAfterDroppedOverrun(t *testing.T) {
+ 		conn.Write([]byte(h2Preface))
+ 		fr := http2.NewFramer(conn, conn)
+ 		fr.WriteSettings()
+-		for {
+-			f, err := fr.ReadFrame()
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+-				fr.WriteSettingsAck()
+-				break
+-			}
+-		}
++		readServerPreface(t, fr)
+ 
+ 		var hb1, hb3 bytes.Buffer
+ 		enc1 := hpack.NewEncoder(&hb1)
+@@ -446,16 +428,7 @@ func TestFlowSiblingUploadAfterReadingStreamOverrun(t *testing.T) {
+ 		conn.Write([]byte(h2Preface))
+ 		fr := http2.NewFramer(conn, conn)
+ 		fr.WriteSettings()
+-		for {
+-			f, err := fr.ReadFrame()
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+-				fr.WriteSettingsAck()
+-				break
+-			}
+-		}
++		readServerPreface(t, fr)
+ 
+ 		encodeHeaders := func(path string) []byte {
+ 			var hb bytes.Buffer
+@@ -605,16 +578,7 @@ func TestFlowSiblingUploadAfterFinishedStreamOverrun(t *testing.T) {
+ 		conn.Write([]byte(h2Preface))
+ 		fr := http2.NewFramer(conn, conn)
+ 		fr.WriteSettings()
+-		for {
+-			f, err := fr.ReadFrame()
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+-				fr.WriteSettingsAck()
+-				break
+-			}
+-		}
++		readServerPreface(t, fr)
+ 
+ 		encodeHeaders := func(path string) []byte {
+ 			var hb bytes.Buffer
+@@ -765,16 +729,7 @@ func TestFlowDataInHeaderBlockAsStock(t *testing.T) {
+ 		conn.Write([]byte(h2Preface))
+ 		fr := http2.NewFramer(conn, conn)
+ 		fr.WriteSettings()
+-		for {
+-			f, err := fr.ReadFrame()
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
+-				fr.WriteSettingsAck()
+-				break
+-			}
+-		}
++		connWin := readServerPreface(t, fr)
+ 
+ 		var hb1, hb3 bytes.Buffer
+ 		enc1 := hpack.NewEncoder(&hb1)
+@@ -790,7 +745,7 @@ func TestFlowDataInHeaderBlockAsStock(t *testing.T) {
+ 		for i := 0; i < 4; i++ {
+ 			fr.WriteData(3, false, make([]byte, 16384))
+ 		}
+-		connWin := int64(h2InitWindow) - 4*16384
++		connWin -= 4 * 16384
+ 		for connWin < int64(flowShownUp)+16384 {
+ 			f, err := fr.ReadFrame()
+ 			if err != nil {
+@@ -822,6 +777,9 @@ func TestFlowDataInHeaderBlockAsStock(t *testing.T) {
+ 	}
+ 
+ 	stockGA, stockCode := run(t, false)
++	if !stockGA {
++		t.Fatal("the stock server sent no GOAWAY: the control proves nothing")
++	}
+ 	govGA, govCode := run(t, true)
+ 	t.Logf("data inside header block -> stock: goAway=%v code=%v; governed: goAway=%v code=%v",
+ 		stockGA, stockCode, govGA, govCode)
+@@ -830,3 +788,30 @@ func TestFlowDataInHeaderBlockAsStock(t *testing.T) {
+ 			govGA, govCode, stockGA, stockCode)
+ 	}
+ }
++
++// readServerPreface reads the server's SETTINGS, acknowledges them, and reads
++// on to the server's first WINDOW_UPDATE on the connection. It returns the
++// connection window that the client then holds. A client that sends past
++// 65535 bytes before that WINDOW_UPDATE arrives is past the window.
++func readServerPreface(t *testing.T, fr *http2.Framer) int64 {
++	t.Helper()
++	connWin, settings := int64(h2InitWindow), false
++	for !settings || connWin == h2InitWindow {
++		f, err := fr.ReadFrame()
++		if err != nil {
++			t.Fatal(err)
++		}
++		switch f := f.(type) {
++		case *http2.SettingsFrame:
++			if !f.IsAck() {
++				fr.WriteSettingsAck()
++				settings = true
++			}
++		case *http2.WindowUpdateFrame:
++			if f.StreamID == 0 {
++				connWin += int64(f.Increment)
++			}
++		}
++	}
++	return connWin
++}
+diff --git a/transport/internet/splithttp/h2flow_records_test.go b/transport/internet/splithttp/h2flow_records_test.go
+new file mode 100644
+index 00000000..878548c5
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_records_test.go
+@@ -0,0 +1,117 @@
++package splithttp
++
++import (
++	"context"
++	gotls "crypto/tls"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++
++	"golang.org/x/net/http2"
++)
++
++// writeSizes records the size of each write to the connection under it: what
++// a TLS layer above the TCP connection would send as one record each.
++type writeSizes struct {
++	net.Conn
++	mu    sync.Mutex
++	sizes []int
++}
++
++func (w *writeSizes) Write(b []byte) (int, error) {
++	w.mu.Lock()
++	w.sizes = append(w.sizes, len(b))
++	w.mu.Unlock()
++	return w.Conn.Write(b)
++}
++
++// TestFlowClientRecordSizes logs the writes a client makes toward the server
++// at the start of a download, the TLS records an observer of the path would
++// see, for a stock client, a governed client toward a stock server and a
++// governed client toward a governed server, which sees the server govern and
++// sends its own SETTINGS. That SETTINGS goes in a write the client makes in
++// any case: toward a governed server it makes no more writes than a stock
++// client does.
++func TestFlowClientRecordSizes(t *testing.T) {
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write(make([]byte, 256<<10))
++	})
++	sizes := map[string][]int{}
++	for _, tc := range []struct {
++		name             string
++		server, governed bool
++	}{
++		{"stock client, stock server", false, false},
++		{"stock client, governed server", true, false},
++		{"governed client, stock server", false, true},
++		{"governed client, governed server", true, true},
++	} {
++		up, down := flowLimit{}, flowLimit{}
++		if tc.server {
++			up, down = testUp, testDown
++		}
++		_, addr := startFlowServer(t, up, down, false, handler)
++		rec := &writeSizes{}
++		var fc *flowConn
++		tr := &http2.Transport{
++			AllowHTTP: true,
++			DialTLSContext: func(ctx context.Context, network, _ string, _ *gotls.Config) (net.Conn, error) {
++				c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
++				if err != nil {
++					return nil, err
++				}
++				rec.Conn = c
++				if tc.governed {
++					g := newFlowClientConn(rec)
++					rec.mu.Lock()
++					fc = g
++					rec.mu.Unlock()
++					return g, nil
++				}
++				return rec, nil
++			},
++		}
++		// A governed connection holds its flowGroup until it closes: close
++		// it with the test, whichever way the test ends.
++		t.Cleanup(func() {
++			tr.CloseIdleConnections()
++			rec.mu.Lock()
++			g := fc
++			rec.mu.Unlock()
++			if g != nil {
++				g.Close()
++			}
++		})
++		client := &http.Client{Transport: tr}
++		resp, err := client.Get("http://x/")
++		if err != nil {
++			t.Fatal(err)
++		}
++		io.Copy(io.Discard, resp.Body)
++		resp.Body.Close()
++		client.CloseIdleConnections()
++		rec.mu.Lock()
++		got := append([]int(nil), rec.sizes...)
++		rec.mu.Unlock()
++		sizes[tc.name] = got
++		var b strings.Builder
++		for i, n := range got {
++			if i == 16 {
++				fmt.Fprintf(&b, " ... (%d writes)", len(got))
++				break
++			}
++			fmt.Fprintf(&b, " %d", n)
++		}
++		t.Logf("%s:%s", tc.name, b.String())
++	}
++	// Toward a governed server, the governed client differs from a stock one
++	// by its SETTINGS alone, 15 bytes in a write both make.
++	stock, governed := sizes["stock client, governed server"], sizes["governed client, governed server"]
++	if len(governed) > len(stock) {
++		t.Errorf("toward a governed server a governed client made %d writes, a stock one %d", len(governed), len(stock))
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_verify_listener_test.go b/transport/internet/splithttp/h2flow_verify_listener_test.go
+index 91034f05..4f6bd9a3 100644
+--- a/transport/internet/splithttp/h2flow_verify_listener_test.go
++++ b/transport/internet/splithttp/h2flow_verify_listener_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	gotls "crypto/tls"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -311,6 +312,12 @@ func TestFlowListenerSendsOnlySettingsBeforePreface(t *testing.T) {
+ 			for {
+ 				frame, err := fr.ReadFrame()
+ 				if err != nil {
++					// Only the deadline may end the wait: a server that
++					// closes here is not silent.
++					var ne net.Error
++					if !errors.As(err, &ne) || !ne.Timeout() {
++						t.Fatalf("after %v the connection ended before the client preface: %v", sent, err)
++					}
+ 					break
+ 				}
+ 				sent = append(sent, frame.Header().Type)
+-- 
+2.52.0.windows.1
+

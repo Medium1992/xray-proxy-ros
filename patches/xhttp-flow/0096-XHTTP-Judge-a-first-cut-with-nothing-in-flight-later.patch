@@ -1,0 +1,99 @@
+From 7ffc37b11432fdf1fb7784783204f26bf5a7fd0d Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:38:23 +0300
+Subject: [PATCH 96/97] XHTTP: Judge a first cut with nothing in flight later
+
+The first cut of a measurement is judged from what was in flight in the
+round before it. A peer that acknowledges all it was sent before it
+credits leaves nothing in flight then: the cut was judged against none,
+1 - x/0, never judged at all, and the gain stayed where it was for the
+rest of the episode. The first round after it with something in flight
+is now its reference. TestFlowEffectZeroFlightFirstCut and, through
+WINDOW_UPDATE frames, TestFlowEffectZeroFlightThroughCredit fail without
+it.
+---
+ transport/internet/splithttp/h2flow_effect.go |  8 +++
+ .../internet/splithttp/h2flow_effect_test.go  | 51 +++++++++++++++++++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/transport/internet/splithttp/h2flow_effect.go b/transport/internet/splithttp/h2flow_effect.go
+index 34f423e23..5d544cbfb 100644
+--- a/transport/internet/splithttp/h2flow_effect.go
++++ b/transport/internet/splithttp/h2flow_effect.go
+@@ -116,6 +116,14 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
+ 	if e.capsTop <= 0 {
+ 		return e.gain
+ 	}
++	// A cut taken in a round with nothing in flight has no flight to fall
++	// from: the first round after it with some is its reference, and until
++	// then it is not judged. Judged against none, it never would be, and
++	// the gain would stay where it was for the rest of the episode.
++	if e.flightTop <= 0 {
++		e.flightTop = x
++		return e.gain
++	}
+ 	if cut := min(e.cut/e.capsTop, 1-x/e.flightTop); cut >= flowEffectProbe {
+ 		e.gain = min(max((1-e.queue/e.qTop)/cut, 0), 1)
+ 		e.start(x, c)
+diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
+index a7e6fafe8..4a8ac7a3f 100644
+--- a/transport/internet/splithttp/h2flow_effect_test.go
++++ b/transport/internet/splithttp/h2flow_effect_test.go
+@@ -320,3 +320,54 @@ func TestFlowEffectDoesNotAttributePreCutFlightDrop(t *testing.T) {
+ 		t.Fatalf("gain=%g: no flight reduction occurred after the cut", gain)
+ 	}
+ }
++
++// TestFlowEffectZeroFlightFirstCut takes the first cut of an episode in a
++// round with nothing in flight, as a peer that has acknowledged all it was
++// sent before it credits does, and then a second cut that halves what is in
++// flight while the queue stays: the gain goes to none. Judged against no
++// flight, 1 - x/0, the cut was never judged and the gain stayed 1.
++func TestFlowEffectZeroFlightFirstCut(t *testing.T) {
++	for _, first := range []int64{1 << 20, 0} {
++		t.Run(map[bool]string{true: "positive-first-flight", false: "zero-first-flight"}[first > 0], func(t *testing.T) {
++			var e flowEffect
++			now := time.Unix(100, 0)
++			note := func(flight, caps int64) float64 {
++				now = now.Add(time.Second)
++				return e.note(now, 300*time.Millisecond, 100*time.Millisecond, 20*time.Millisecond, flight, caps)
++			}
++			note(first, 1<<20)
++			e.cutBy(256 << 10)
++			note(1<<20, 768<<10)
++			e.cutBy(256 << 10)
++			gain := note(512<<10, 512<<10)
++			t.Logf("first-flight=%d flightTop=%g flight=%g capsTop=%g cut=%g gain=%g", first, e.flightTop, e.flight, e.capsTop, e.cut, gain)
++			if gain != 0 {
++				t.Fatalf("gain=%g after a later 50%% flight reduction with a standing queue; flight reference remains %g", gain, e.flightTop)
++			}
++		})
++	}
++}
++
++// TestFlowEffectZeroFlightThroughCredit is the same through WINDOW_UPDATE
++// frames on a server: the first credit comes with nothing in flight, and the
++// cut that later lands in flight is judged.
++func TestFlowEffectZeroFlightThroughCredit(t *testing.T) {
++	h, s := queuedDownload(t)
++	for i, flight := range []int64{0, 128 << 10, 64 << 10} {
++		h.c.mu.Lock()
++		h.c.kstat.inFlight = flight
++		h.c.effect.at = time.Now().Add(-time.Second)
++		s.down.qAt = time.Time{}
++		s.down.mark = time.Now()
++		h.c.mu.Unlock()
++		cap := credit(h, s)
++		h.c.mu.Lock()
++		t.Logf("credit %d: flight=%d cap=%d reference=%g cut=%g gain=%g", i+1, flight, cap, h.c.effect.flightTop, h.c.effect.cut, h.c.effect.gain)
++		h.c.mu.Unlock()
++	}
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	if h.c.effect.gain != 0 {
++		t.Fatalf("real WINDOW_UPDATE path never judges the later landed cut: %+v", h.c.effect)
++	}
++}
+-- 
+2.52.0.windows.1
+

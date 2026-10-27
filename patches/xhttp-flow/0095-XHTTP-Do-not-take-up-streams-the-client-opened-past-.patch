@@ -1,0 +1,117 @@
+From 52ead8feed5519a1c3eb8cddd74e55e3dd1de444 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:38:22 +0300
+Subject: [PATCH 95/97] XHTTP: Do not take up streams the client opened past a
+ GOAWAY's last
+
+The streams past the last a server's GOAWAY named were dropped when it
+passed, but the last was not kept: HEADERS the client sent before it saw
+the GOAWAY arrived later and were tracked and credited as new streams,
+for good, and their credit counted against the send window of the
+streams still draining. The smallest last is kept, and no new client
+stream past it is taken up; the stack drops it as well.
+TestFlowGoAwayLaterStreamNotTaken fails without it.
+---
+ transport/internet/splithttp/h2flow.go        | 12 ++++-
+ .../internet/splithttp/h2flow_goaway_test.go  | 44 +++++++++++++++++++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index b16463712..4cf2efa04 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -771,6 +771,10 @@ type flowConn struct {
+ 	pingReady    bool
+ 	closed       bool
+ 	broken       bool
++	// goneAway says the server sent GOAWAY, and goAwayLast is the last
++	// client stream it named: it takes up none past that.
++	goneAway   bool
++	goAwayLast uint32
+ 
+ 	// Connection-level window of the upload: DATA the client sent, credit
+ 	// the server returned on stream 0, and credit handed on to the client.
+@@ -1899,7 +1903,10 @@ func (r *flowReader) frame(f h2Frame) (drop bool) {
+ 	switch f.typ {
+ 	case h2Headers:
+ 		s := c.stream(f.stream)
+-		if s == nil && f.stream%2 == 1 && !c.closed {
++		// A stream the client opened before it saw the server's GOAWAY is
++		// one the server will not take up: the stack drops it, and so does
++		// the governor.
++		if s == nil && f.stream%2 == 1 && !c.closed && !(c.goneAway && f.stream > c.goAwayLast) {
+ 			if len(c.streams) >= flowMaxStreams {
+ 				c.giveUp()
+ 				return false
+@@ -2213,6 +2220,9 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		// The server will not take up the client's streams past the last it
+ 		// names: the stacks forget them, so does the governor.
+ 		last := binary.BigEndian.Uint32(payload) & 0x7fffffff
++		if !c.goneAway || last < c.goAwayLast {
++			c.goneAway, c.goAwayLast = true, last
++		}
+ 		for id := range c.streams {
+ 			if id > last && id%2 == 1 {
+ 				c.drop(id)
+diff --git a/transport/internet/splithttp/h2flow_goaway_test.go b/transport/internet/splithttp/h2flow_goaway_test.go
+index 61764c5a8..8b4a69e89 100644
+--- a/transport/internet/splithttp/h2flow_goaway_test.go
++++ b/transport/internet/splithttp/h2flow_goaway_test.go
+@@ -3,6 +3,7 @@ package splithttp
+ import (
+ 	"bytes"
+ 	"testing"
++	"time"
+ 
+ 	"golang.org/x/net/http2"
+ )
+@@ -35,3 +36,46 @@ func TestFlowGoAwayDropsStreamsPastLast(t *testing.T) {
+ 		t.Fatal("stream 1, the last the server takes up, was dropped")
+ 	}
+ }
++
++// TestFlowGoAwayLaterStreamNotTaken has the server send GOAWAY naming stream 1
++// as its last, and then the client's HEADERS for stream 3, sent before it saw
++// the GOAWAY, arrive: the server takes up no stream past its last, and the
++// governor neither tracks stream 3 nor credits it. Before, it did both, and
++// the credit counted against the send window of the streams still draining.
++func TestFlowGoAwayLaterStreamNotTaken(t *testing.T) {
++	h := newFlowHarnessWindow(t, flowServerSendWindow)
++	t.Cleanup(func() { h.c.Close() })
++	h.track()
++	h.openStream(4 << 20) // opens stream 1
++	h.fromServer(func(fr *http2.Framer) {
++		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: flowServerReceiveWindow})
++	})
++	now := time.Now()
++	h.c.mu.Lock()
++	h.c.downLearned.note(now, h.c.down.init, flowServerSendWindow)
++	h.c.upLearned.note(now, h.c.up.init, 2<<20)
++	h.c.mu.Unlock()
++
++	// Server sends GOAWAY(last=1) while stream 1 is still active.
++	goAway := frames(func(fr *http2.Framer) { fr.WriteGoAway(1, http2.ErrCodeNo, nil) })
++	if _, err := h.fromServerRaw(goAway); err != nil {
++		t.Fatal(err)
++	}
++
++	// Client's in-flight HEADERS for stream 3 arrives at flowReader after GOAWAY(last=1).
++	h.conn.take()
++	h.fromClient(func(fr *http2.Framer) {
++		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: []byte{0x82}, EndHeaders: true})
++	})
++	h.sync()
++	toClient := h.conn.take()
++
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	t.Logf("after post-GOAWAY HEADERS(3): streams[3]=%v, downOpen=%d, downOpenForwarded=%d, clientHolds=%d (sendWindow=%d), toClient=%x",
++		h.c.streams[3] != nil, h.c.downOpen, h.c.downOpenForwarded, h.c.clientHolds(), h.c.sendWindow, toClient)
++	if h.c.streams[3] != nil || h.c.downOpen != 1 || len(toClient) != 0 {
++		t.Fatalf("post-GOAWAY(last=1) in-flight stream 3 was tracked, leaked, and credited: streams[3]=%v, downOpen=%d, clientHolds=%d/%d, toClient=%x",
++			h.c.streams[3] != nil, h.c.downOpen, h.c.clientHolds(), h.c.sendWindow, toClient)
++	}
++}
+-- 
+2.52.0.windows.1
+

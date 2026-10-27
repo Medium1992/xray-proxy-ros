@@ -1,0 +1,417 @@
+From 4b392175428965e1c1d71b1634fcac0a5341195f Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:38:22 +0300
+Subject: [PATCH 94/97] XHTTP: Let no data past a stream's shown upload window
+ reach the handler
+
+The governor reset a stream whose client sent past the window it was
+shown, but forwarded the offending DATA frame to its stack first; the
+stack, given a larger window, took it into the request body, and with
+END_STREAM the handler read past the window and saw the body end
+cleanly before the reset came. Stock rejects the frame before any of it
+reaches the body. The frame is now dropped, and its bytes count as
+returned on the connection, as a stack returns connection credit for
+data it refused.
+
+TestFlowUploadPastWindowAsStock compares the handler's body with a stock
+server's, with and without END_STREAM; TestFlowClientPastShownWindow
+also checks that nothing of the frame reaches the stack and that the
+connection counts it returned.
+
+An empty frame takes no window and is past none: a server that lowered
+its window can leave a stream past it before an empty frame with
+END_STREAM comes, and that frame passes on as before
+(TestFlowModelProtocol). The handler test waits for the connection
+window it sends into, where it waited a fixed 200 ms and now and then
+sent past the connection's window instead of the stream's.
+---
+ transport/internet/splithttp/h2flow.go        |  38 ++--
+ .../internet/splithttp/h2flow_frame_test.go   |   5 +-
+ .../internet/splithttp/h2flow_overrun_test.go | 184 ++++++++++++++++++
+ .../internet/splithttp/h2flow_shown_test.go   |  15 ++
+ transport/internet/splithttp/h2flow_test.go   |   2 +-
+ 5 files changed, 230 insertions(+), 14 deletions(-)
+ create mode 100644 transport/internet/splithttp/h2flow_overrun_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 9153e4224..b16463712 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -319,8 +319,10 @@ func validSettings(payload []byte) bool {
+ 	return true
+ }
+ 
++// frame sees each frame's header before its payload passes on; a frame it
++// drops passes on neither.
+ type frameHandler interface {
+-	frame(f h2Frame)
++	frame(f h2Frame) (drop bool)
+ 	control(f h2Frame, header, payload, out []byte) []byte
+ 	boundary(out []byte) []byte
+ }
+@@ -331,6 +333,7 @@ type frameParser struct {
+ 	hdrLen  int
+ 	ctrl    []byte
+ 	remain  int
++	skip    bool
+ 	collect bool
+ 	inBlock bool
+ }
+@@ -344,7 +347,9 @@ func (p *frameParser) feed(in, out []byte, h frameHandler) []byte {
+ 		switch {
+ 		case p.remain > 0:
+ 			n := min(p.remain, len(in))
+-			out = append(out, in[:n]...)
++			if !p.skip {
++				out = append(out, in[:n]...)
++			}
+ 			in, p.remain = in[n:], p.remain-n
+ 			if p.remain == 0 {
+ 				out = p.done(out, h)
+@@ -379,8 +384,10 @@ func (p *frameParser) feed(in, out []byte, h frameHandler) []byte {
+ 				}
+ 				continue
+ 			}
+-			h.frame(p.f)
+-			out = append(out, p.hdr[:]...)
++			p.skip = h.frame(p.f)
++			if !p.skip {
++				out = append(out, p.hdr[:]...)
++			}
+ 			p.remain = p.f.length
+ 			if p.remain == 0 {
+ 				out = p.done(out, h)
+@@ -1887,7 +1894,7 @@ func capFrameSize(payload []byte) {
+ // flowReader handles frames from the client to the server.
+ type flowReader flowConn
+ 
+-func (r *flowReader) frame(f h2Frame) {
++func (r *flowReader) frame(f h2Frame) (drop bool) {
+ 	c := (*flowConn)(r)
+ 	switch f.typ {
+ 	case h2Headers:
+@@ -1895,7 +1902,7 @@ func (r *flowReader) frame(f h2Frame) {
+ 		if s == nil && f.stream%2 == 1 && !c.closed {
+ 			if len(c.streams) >= flowMaxStreams {
+ 				c.giveUp()
+-				return
++				return false
+ 			}
+ 			now := c.fedNow()
+ 			s = &flowStream{}
+@@ -1920,17 +1927,24 @@ func (r *flowReader) frame(f h2Frame) {
+ 		up := !c.client && c.up.enabled()
+ 		if up && c.upConnSent > h2InitWindow+c.upConnForwarded {
+ 			c.giveUp()
+-			return
++			return false
+ 		}
+ 		if s := c.stream(f.stream); s != nil {
+ 			s.upSent += int64(f.length)
+ 			// Past a stream's window is the stream's error alone, as with a
+ 			// stack shown that window: the stream is reset both ways, see
+-			// appendResets, and the connection goes on.
+-			if up && s.upSent > int64(c.serverShown)+s.upForwarded {
++			// appendResets, and the connection goes on. The frame is dropped:
++			// a stack shown the window takes none of it into the body, and one
++			// that ended the stream would end the body cleanly before the
++			// reset. Its bytes count as returned on the connection, as a
++			// stack returns connection credit for data it refused.
++			// An empty frame takes no window and is past none, though a
++			// lowered window may leave what came before it past.
++			if up && f.length > 0 && s.upSent > int64(c.serverShown)+s.upForwarded {
+ 				c.resets = append(c.resets, f.stream)
+ 				c.drop(f.stream)
+-				return
++				c.upConnReturned += int64(f.length)
++				return true
+ 			}
+ 			if f.flags&h2FlagEndStream != 0 {
+ 				s.clientDone = true
+@@ -1940,6 +1954,7 @@ func (r *flowReader) frame(f h2Frame) {
+ 	case h2RSTStream:
+ 		c.drop(f.stream)
+ 	}
++	return false
+ }
+ 
+ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+@@ -2113,7 +2128,7 @@ func (r *flowReader) boundary(out []byte) []byte {
+ // flowWriter handles frames from the server to the client.
+ type flowWriter flowConn
+ 
+-func (w *flowWriter) frame(f h2Frame) {
++func (w *flowWriter) frame(f h2Frame) (drop bool) {
+ 	c := (*flowConn)(w)
+ 	s := c.stream(f.stream)
+ 	switch f.typ {
+@@ -2141,6 +2156,7 @@ func (w *flowWriter) frame(f h2Frame) {
+ 	case h2RSTStream:
+ 		c.drop(f.stream)
+ 	}
++	return false
+ }
+ 
+ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+diff --git a/transport/internet/splithttp/h2flow_frame_test.go b/transport/internet/splithttp/h2flow_frame_test.go
+index 9a3e0b19e..2e5b2af4b 100644
+--- a/transport/internet/splithttp/h2flow_frame_test.go
++++ b/transport/internet/splithttp/h2flow_frame_test.go
+@@ -19,15 +19,16 @@ type dataSniffer struct {
+ 	max *atomic.Int64
+ }
+ 
+-func (d dataSniffer) frame(f h2Frame) {
++func (d dataSniffer) frame(f h2Frame) bool {
+ 	if f.typ == h2Data {
+ 		for {
+ 			cur := d.max.Load()
+ 			if int64(f.length) <= cur || d.max.CompareAndSwap(cur, int64(f.length)) {
+-				return
++				return false
+ 			}
+ 		}
+ 	}
++	return false
+ }
+ 
+ func (dataSniffer) control(_ h2Frame, header, payload, out []byte) []byte {
+diff --git a/transport/internet/splithttp/h2flow_overrun_test.go b/transport/internet/splithttp/h2flow_overrun_test.go
+new file mode 100644
+index 000000000..39bec6283
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_overrun_test.go
+@@ -0,0 +1,184 @@
++package splithttp
++
++import (
++	"bytes"
++	"io"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	"golang.org/x/net/http2"
++	"golang.org/x/net/http2/hpack"
++)
++
++// TestFlowUploadPastWindowAsStock sends a stream its whole shown upload
++// window and then a frame past it, with and without END_STREAM, to a stock
++// server and to a governed one, and has each handler read the body once the
++// reset is out: the governed handler gets what the stock one does. The
++// governor forwarded the frame before the reset, its stack took it into the
++// body, and with END_STREAM the handler read past the window with no error.
++func TestFlowUploadPastWindowAsStock(t *testing.T) {
++	for _, endStream := range []bool{true, false} {
++		t.Run(map[bool]string{true: "end_stream_true", false: "end_stream_false"}[endStream], func(t *testing.T) {
++			type result struct {
++				n   int
++				err error
++			}
++			run := func(t *testing.T, governed bool) result {
++				startRead := make(chan struct{})
++				gotCh := make(chan result, 2)
++				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					if r.URL.Path == "/bump" {
++						io.Copy(io.Discard, r.Body)
++						return
++					}
++					<-startRead
++					b, err := io.ReadAll(r.Body)
++					gotCh <- result{len(b), err}
++				})
++
++				ln, err := net.Listen("tcp", "127.0.0.1:0")
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer ln.Close()
++
++				var listener net.Listener = ln
++				h2cfg := &http.HTTP2Config{
++					MaxReceiveBufferPerStream:     flowShownUp, // 1 MiB on stock
++					MaxReceiveBufferPerConnection: flowServerReceiveWindow,
++				}
++				if governed {
++					h2cfg = (&Config{H2Flow: &H2FlowConfig{Mode: 1}}).h2ReceiveConfig(true)
++					listener = &flowListener{
++						Listener:   ln,
++						up:         flowDefault,
++						down:       flowDefault,
++						connWindow: h2ConnWindow(h2cfg),
++					}
++				}
++				protocols := new(http.Protocols)
++				protocols.SetUnencryptedHTTP2(true)
++				srv := &http.Server{
++					Handler:   handler,
++					Protocols: protocols,
++					HTTP2:     h2cfg,
++				}
++				go srv.Serve(listener)
++				defer srv.Close()
++
++				conn, err := net.Dial("tcp", ln.Addr().String())
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(5 * time.Second))
++				if _, err := conn.Write([]byte(h2Preface)); err != nil {
++					t.Fatal(err)
++				}
++				fr := http2.NewFramer(conn, conn)
++				if err := fr.WriteSettings(); err != nil {
++					t.Fatal(err)
++				}
++
++				for {
++					f, err := fr.ReadFrame()
++					if err != nil {
++						t.Fatal(err)
++					}
++					if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
++						fr.WriteSettingsAck()
++						break
++					}
++				}
++
++				var hb1, hb3 bytes.Buffer
++				enc1 := hpack.NewEncoder(&hb1)
++				for _, kv := range [][2]string{
++					{":method", "POST"},
++					{":scheme", "http"},
++					{":path", "/upload"},
++					{":authority", "example.com"},
++				} {
++					enc1.WriteField(hpack.HeaderField{Name: kv[0], Value: kv[1]})
++				}
++				enc3 := hpack.NewEncoder(&hb3)
++				for _, kv := range [][2]string{
++					{":method", "POST"},
++					{":scheme", "http"},
++					{":path", "/bump"},
++					{":authority", "example.com"},
++				} {
++					enc3.WriteField(hpack.HeaderField{Name: kv[0], Value: kv[1]})
++				}
++
++				// Open stream 1 (handler waits on startRead) and stream 3 (handler
++				// drains 64 KiB without closing stream 3 so connection window grows
++				// by 256 KiB while stream 1's window stays 1 MiB).
++				if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb1.Bytes(), EndHeaders: true}); err != nil {
++					t.Fatal(err)
++				}
++				if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: hb3.Bytes(), EndHeaders: true}); err != nil {
++					t.Fatal(err)
++				}
++				for i := 0; i < 4; i++ {
++					if err := fr.WriteData(3, false, make([]byte, 16384)); err != nil {
++						t.Fatal(err)
++					}
++				}
++
++				// Wait for the connection window to hold all the test sends
++				// on stream 1, the frame past its window too, so that only
++				// the stream's window is sent past.
++				connWin := int64(h2InitWindow) - 4*16384
++				for connWin < int64(flowShownUp)+8192 {
++					f, err := fr.ReadFrame()
++					if err != nil {
++						t.Fatal(err)
++					}
++					if wu, ok := f.(*http2.WindowUpdateFrame); ok && wu.StreamID == 0 {
++						connWin += int64(wu.Increment)
++					}
++				}
++				conn.SetDeadline(time.Now().Add(5 * time.Second))
++
++				// Send 1 MiB on stream 1 (its entire shown window), then an
++				// offending 8 KiB DATA frame past stream 1's 1 MiB window.
++				chunk := make([]byte, 16384)
++				for sent := 0; sent < flowShownUp; sent += len(chunk) {
++					if err := fr.WriteData(1, false, chunk); err != nil {
++						t.Fatal(err)
++					}
++				}
++				if err := fr.WriteData(1, endStream, make([]byte, 8192)); err != nil {
++					t.Fatal(err)
++				}
++
++				// Wait for the server's RST_STREAM(1, FLOW_CONTROL_ERROR) on the wire,
++				// proving the server already processed the offending DATA frame, then
++				// let the handler read r.Body.
++				for {
++					f, err := fr.ReadFrame()
++					if err != nil {
++						t.Fatal(err)
++					}
++					if rst, ok := f.(*http2.RSTStreamFrame); ok && rst.StreamID == 1 {
++						break
++					}
++				}
++				close(startRead)
++				return <-gotCh
++			}
++
++			stockRes := run(t, false)
++			govRes := run(t, true)
++			t.Logf("endStream=%v -> stock handler: n=%d err=%v; governed handler: n=%d err=%v",
++				endStream, stockRes.n, stockRes.err, govRes.n, govRes.err)
++			if govRes.n != stockRes.n || (govRes.err == nil) != (stockRes.err == nil) {
++				t.Fatalf("endStream=%v: governed handler got (n=%d, err=%v), want stock behavior (n=%d, err=%v)",
++					endStream, govRes.n, govRes.err, stockRes.n, stockRes.err)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+index 638fbf5cd..b51596c94 100644
+--- a/transport/internet/splithttp/h2flow_shown_test.go
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -62,6 +62,9 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 				t.Fatalf("data within the %d shown ended the connection: %v", shown, h.readErr)
+ 			}
+ 			h.conn.take()
++			h.c.mu.Lock()
++			unread := h.c.upConnSent - h.c.upConnReturned
++			h.c.mu.Unlock()
+ 			got := h.fromClient(func(fr *http2.Framer) { fr.WriteData(1, false, []byte{0}) })
+ 			if h.toClient.streams[1] >= conn {
+ 				if h.readErr == nil || !h.c.isBroken() {
+@@ -75,6 +78,18 @@ func TestFlowClientPastShownWindow(t *testing.T) {
+ 			if !hasReset(t, got, 1) {
+ 				t.Fatal("the stack was not told stream 1 was reset")
+ 			}
++			// Of the frame past the window the stack takes nothing into the
++			// body, and the connection counts it returned, as a stack that
++			// refused it returns its connection credit.
++			if d := dataFrames(got); len(d) != 0 {
++				t.Fatalf("%d bytes of the frame past stream 1's window reached the stack", len(d)-4)
++			}
++			h.c.mu.Lock()
++			after := h.c.upConnSent - h.c.upConnReturned
++			h.c.mu.Unlock()
++			if after != unread {
++				t.Fatalf("the refused frame left %d bytes unread on the connection", after-unread)
++			}
+ 			h.sync()
+ 			if !hasReset(t, h.conn.take(), 1) {
+ 				t.Fatal("the client was not told stream 1 was reset")
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index 275e1c14b..1e15c9bdc 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -26,7 +26,7 @@ import (
+ 
+ type passFrames struct{}
+ 
+-func (passFrames) frame(h2Frame) {}
++func (passFrames) frame(h2Frame) bool { return false }
+ func (passFrames) control(_ h2Frame, header, payload, out []byte) []byte {
+ 	return append(append(out, header...), payload...)
+ }
+-- 
+2.52.0.windows.1
+

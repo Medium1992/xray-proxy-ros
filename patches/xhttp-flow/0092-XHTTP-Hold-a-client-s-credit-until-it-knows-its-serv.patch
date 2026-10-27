@@ -1,0 +1,192 @@
+From d789d76ff73cf53e218dc802180df4e77f288da3 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:38:21 +0300
+Subject: [PATCH 92/97] XHTTP: Hold a client's credit until it knows its server
+
+A governed client forwarded a new stream credit beyond what its stack
+returned, against the protocol default it showed the server. When the
+server's first PING showed that it governs, restock raised the shown
+initial window to the stack's own, and the server added the raise on top
+of that credit: the stream's window at the server stood above its
+stack's by what had been forwarded ahead. A reader that paused until the
+server stopped writing was sent past its stack's window, and the stack
+closed the whole connection with FLOW_CONTROL_ERROR.
+
+Until the server's first reply shows whether it governs, and until
+restock has gone out, a client now forwards credit only as its stack
+returns it, so there is nothing ahead for the raise to land on. Showing
+the stack's window less what was ahead, tried first, kept the
+connection but had the server count that credit as held on streams that
+had taken nothing: the send window ran out, the server's own downloads
+paused, and the cut gain read a cut that did not land, so the queue
+beside eight downloads stood at 180-290 ms instead of 65.
+
+TestFlowChainedPausedReaderKeepsConnection runs a governed client behind
+a governed server with a reader that waits for the server's writes to
+stop: without the hold, three of its four governed cases lose the
+connection; a stock client is the control.
+---
+ transport/internet/splithttp/h2flow.go        |  14 ++-
+ .../internet/splithttp/h2flow_restock_test.go | 118 ++++++++++++++++++
+ 2 files changed, 131 insertions(+), 1 deletion(-)
+ create mode 100644 transport/internet/splithttp/h2flow_restock_test.go
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index ce784d731..f40fe54c2 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -1782,6 +1782,16 @@ func (c *flowConn) downRelease(s *flowStream) int64 {
+ 		ahead := max(int64(s.down.cap)-flowShownFull, flowShownFull-flowShownLimited)
+ 		rel = min(rel, s.downSent+ahead-s.downForwarded)
+ 	}
++	if c.client && (c.restock || !c.peerGoverned && !c.serverReplied) {
++		// Until the server's first reply shows whether it governs, and until
++		// restock has shown a server that does the stack's window, a client
++		// forwards credit only as its stack returns it. The server adds the
++		// raise restock shows to every open stream, and credit forwarded
++		// ahead of the stack before it would stand above the stack's window:
++		// a reader that paused would be sent past it, and the stack would
++		// close the connection.
++		rel = min(rel, s.down.returned-s.downForwarded)
++	}
+ 	if rel <= 0 || c.client || c.sendWindow == 0 {
+ 		return rel
+ 	}
+@@ -2012,7 +2022,9 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
+ // and hands on all the credit it held back. The server then governs these
+ // downloads, the client's memory with them, as it does an official
+ // client's; two governors that each held back credit took rate and memory
+-// a server-side governor alone keeps.
++// a server-side governor alone keeps. No stream has been forwarded more than
++// its stack returned by then, see downRelease: the server adds the raise of
++// the initial window to every open stream, on top of what it was forwarded.
+ func (c *flowConn) appendRestock(out []byte) []byte {
+ 	c.restock = false
+ 	out = append(out, 0, 0, 6, h2Settings, 0, 0, 0, 0, 0)
+diff --git a/transport/internet/splithttp/h2flow_restock_test.go b/transport/internet/splithttp/h2flow_restock_test.go
+new file mode 100644
+index 000000000..a404bc251
+--- /dev/null
++++ b/transport/internet/splithttp/h2flow_restock_test.go
+@@ -0,0 +1,118 @@
++package splithttp
++
++import (
++	"context"
++	gotls "crypto/tls"
++	"io"
++	"net"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// TestFlowChainedPausedReaderKeepsConnection has a governed client behind a
++// governed server, as ListenXH and the dialer set them up, and a reader that
++// waits until the server can send no more before it reads the body. Credit
++// the client forwarded before it saw the server's tag went against the
++// protocol default; a restock that raised the shown window to the stack's
++// own added the raise on top of it, the server sent past the stack's window,
++// and the stack closed the connection with FLOW_CONTROL_ERROR. A stock client
++// is the control.
++func TestFlowChainedPausedReaderKeepsConnection(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		window   int
++		governed bool
++	}{
++		{"governed 96 KiB", 96 << 10, true},
++		{"governed 512 KiB", 512 << 10, true},
++		{"governed 2 MiB", 2 << 20, true},
++		{"governed default", 0, true},
++		{"stock 256 KiB", 256 << 10, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var written atomic.Int64
++			tl, addr := startFlowServer(t, testUp, testDown, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.WriteHeader(http.StatusOK)
++				w.(http.Flusher).Flush()
++				buf := make([]byte, 16<<10)
++				for range 640 {
++					n, err := w.Write(buf)
++					written.Add(int64(n))
++					if err != nil {
++						return
++					}
++					w.(http.Flusher).Flush()
++				}
++			}))
++			tl.mu.Lock()
++			tl.sendWindow = flowServerSendWindow
++			tl.mu.Unlock()
++			var conf *http.HTTP2Config
++			if tc.window != 0 {
++				conf = &http.HTTP2Config{MaxReceiveBufferPerStream: tc.window}
++			}
++			tr := newH2Transport(conf)
++			tr.AllowHTTP = true
++			var mu sync.Mutex
++			var gc *flowConn
++			tr.DialTLSContext = func(ctx context.Context, network, _ string, _ *gotls.Config) (net.Conn, error) {
++				c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
++				if err != nil || !tc.governed {
++					return c, err
++				}
++				g := newFlowClientConn(c)
++				mu.Lock()
++				gc = g
++				mu.Unlock()
++				return g, nil
++			}
++			t.Cleanup(func() {
++				tr.CloseIdleConnections()
++				mu.Lock()
++				defer mu.Unlock()
++				if gc != nil {
++					gc.Close()
++				}
++			})
++			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++			defer cancel()
++			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://x/", nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			resp, err := (&http.Client{Transport: tr}).Do(req)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer resp.Body.Close()
++			// The reader waits until the server's writes stop: its window
++			// at the server is used up.
++			last, still := int64(-1), 0
++			for still < 10 {
++				time.Sleep(20 * time.Millisecond)
++				if n := written.Load(); n == last {
++					still++
++				} else {
++					last, still = n, 0
++				}
++			}
++			if tc.governed {
++				mu.Lock()
++				g := gc
++				mu.Unlock()
++				g.mu.Lock()
++				peer := g.peerGoverned
++				g.mu.Unlock()
++				if !peer {
++					t.Fatal("the client did not see the server govern: no restock to test")
++				}
++			}
++			if n, err := io.Copy(io.Discard, resp.Body); err != nil {
++				t.Fatalf("server wrote %d before the reader read; read %d of the body: %v", last, n, err)
++			}
++		})
++	}
++}
+-- 
+2.52.0.windows.1
+

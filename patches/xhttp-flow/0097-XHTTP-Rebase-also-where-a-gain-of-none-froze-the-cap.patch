@@ -1,0 +1,171 @@
+From 9a60ba101681c3d63823a7bf9b0a94a0e2e9097b Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:38:23 +0300
+Subject: [PATCH 97/97] XHTTP: Rebase also where a gain of none froze the caps
+
+rebase took the path's own round trip only with the downloads' caps at
+init, which tells a queue of the server's own from a path that moved.
+A gain of none, a cut that landed in flight and moved the queue not at
+all, turns the cuts off, and the caps stay where the cuts before it left
+them: on a path whose window was over twice init before its round trip
+rose they never come down to init, and the download stayed at the rate
+of a cap meant for the shorter round trip.
+
+A gain of none now counts as well where the queue stood through the
+window, its least at nine tenths of its most or more; where it moved, the
+next window looks again. A queue of the server's own that many
+connections share moves as the others cut, and one that other traffic
+keeps moves too: taken for the path, its gain was learnt again and the
+download cut anew. With three quarters, a 20 s burst of other traffic
+was taken for the path once a run, and its second half fell from 18.2
+to 15.2 Mbit/s over twelve runs; at nine tenths it is 17.9 and 18.0.
+
+On the RTT-step stand, 20 to 120 ms held 60 s, official client, three
+runs each: at 100 Mbit/s 15.4 Mbit/s over the step before, 89.2 after
+(94.7 without the governor); at 200 Mbit/s 24.0 before, 178.5 after
+(188.6); at 50 Mbit/s, where the cap was already near init, the same.
+
+TestFlowRebaseWhereGainFroze steps the round trip under caps of 256 and
+512 KiB, and has the queue keep moving under 512 KiB: with rebase
+waiting for caps at init the first fails, without the standing queue
+the second.
+---
+ transport/internet/splithttp/h2flow.go        | 26 ++++++-
+ .../internet/splithttp/h2flow_rebase_test.go  | 73 +++++++++++++++++++
+ 2 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 4cf2efa04..9b0fe5d45 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -819,6 +819,8 @@ type flowConn struct {
+ 	baseStep time.Duration
+ 	baseWin  flowMinWindow
+ 	lowGain  time.Time
++	// lowQueue is the most the queue stood at since lowGain began.
++	lowQueue time.Duration
+ 	// pinned says the downloads that took data lately all have caps at
+ 	// init, see cutGain.
+ 	pinned bool
+@@ -939,17 +941,33 @@ func (c *flowConn) rebase(now time.Time) {
+ 			c.base = 0
+ 		}
+ 	}
+-	if c.effect.active && c.effect.gain < 0.5 && c.pinned {
++	// A gain of none, a cut that landed in flight and moved the queue not at
++	// all, turns the cuts off: the caps stay where the cuts before it left
++	// them, and on a path whose window was over twice init before it moved
++	// they never come down to init. A gain of none counts as well where the
++	// queue stood through the window, its least at nine tenths of its most
++	// or more: a path that moved holds it whatever the connections do, while
++	// a queue of the server's own that many connections share moves as the
++	// others cut and grow, and so does one that other traffic keeps, which
++	// taken for the path would have its gain learnt again and cut anew.
++	if c.effect.active && (c.effect.gain < 0.5 && c.pinned || c.effect.gain == 0) {
+ 		if c.lowGain.IsZero() {
+-			c.lowGain = now
++			c.lowGain, c.lowQueue = now, 0
+ 		}
++		c.lowQueue = max(c.lowQueue, c.kstat.rtt-floor)
+ 	} else {
+ 		c.lowGain = time.Time{}
+ 	}
+ 	if c.base == 0 && !c.lowGain.IsZero() && now.Sub(c.lowGain) >= flowBaseWindow && c.baseWin.full(now) &&
+ 		least > floor+2*set {
+-		c.base, c.baseStep = least, least-floor
+-		c.lowGain = time.Time{}
++		if c.pinned || 10*(least-floor) >= 9*c.lowQueue {
++			c.base, c.baseStep = least, least-floor
++			c.lowGain = time.Time{}
++		} else {
++			// The queue moved: the server's own, or its own on top of a path
++			// that moved and has drained since. The next window looks again.
++			c.lowGain, c.lowQueue = now, c.kstat.rtt-floor
++		}
+ 	}
+ 	if c.client && c.group != nil {
+ 		c.probeClient(now, floor, least, set)
+diff --git a/transport/internet/splithttp/h2flow_rebase_test.go b/transport/internet/splithttp/h2flow_rebase_test.go
+index d2d1296ca..4649ee7ef 100644
+--- a/transport/internet/splithttp/h2flow_rebase_test.go
++++ b/transport/internet/splithttp/h2flow_rebase_test.go
+@@ -88,3 +88,76 @@ func TestFlowRebaseKeepsBaseThroughJitter(t *testing.T) {
+ 		t.Fatalf("the path came back and the base stayed at %v", c.base)
+ 	}
+ }
++
++// TestFlowRebaseWhereGainFroze has the empty path's round trip step from 20
++// to 120 ms under a download whose cap is above twice init, from the start
++// window and from 512 KiB, while the kernel keeps its min_rtt at 20 ms. The
++// first cut lands in flight and the queue, the path's own, does not move:
++// the gain goes to none, the cuts stop and the cap stays above twice init.
++// rebase waited for caps at init and never ran; the gain of none is now
++// enough for it. Where the queue then keeps moving by two fifths, as a queue
++// of the server's own does while the connections that share it cut and
++// grow, with the cap still over twice init, it is not the path's, and
++// rebase does not run.
++func TestFlowRebaseWhereGainFroze(t *testing.T) {
++	const oldMinRTT = 20 * time.Millisecond
++	const newPathRTT = 120 * time.Millisecond
++	for _, tc := range []struct {
++		name   string
++		rtt    func(since time.Duration) time.Duration
++		caps   []int32
++		rebase bool
++	}{
++		{"path moved", func(time.Duration) time.Duration { return newPathRTT }, []int32{flowStartWindow, 512 << 10}, true},
++		// From 512 KiB the cap stays over twice init as it follows the round
++		// trip: it is the queue that does not stand that tells this from a
++		// path.
++		{"queue moves", func(since time.Duration) time.Duration {
++			if since < time.Second || since/(400*time.Millisecond)%2 == 0 {
++				return newPathRTT
++			}
++			return 80 * time.Millisecond
++		}, []int32{512 << 10}, false},
++	} {
++		for _, startCap := range tc.caps {
++			h, s := queuedDownload(t)
++			now := time.Unix(1000, 0)
++			h.c.mu.Lock()
++			h.c.incremental = true
++			h.c.rttBase = oldMinRTT
++			s.down.cap = startCap
++			s.down.flat = flowFullRounds
++			s.down.mark, s.down.markBase = now, s.down.returned
++			s.down.qAt = now
++			h.c.mu.Unlock()
++			// A second at the old path's setpoint seeds the base window.
++			for end := now.Add(time.Second); now.Before(end); now = now.Add(oldMinRTT) {
++				h.c.mu.Lock()
++				h.c.kstat = tcpStats{rtt: oldMinRTT + flowPIMinSet, minRTT: oldMinRTT, rttVar: time.Millisecond, inFlight: int64(s.down.cap)}
++				h.c.rebase(now)
++				s.down.returned += int64(s.down.cap)
++				h.c.governDown(now, s)
++				h.c.mu.Unlock()
++			}
++			// The round trip rises; the kernel's min_rtt stays. The download
++			// is held by its cap, and the reader returns a cap per round trip.
++			step := now
++			for end := now.Add(3 * flowBaseWindow); now.Before(end); now = now.Add(oldMinRTT) {
++				rtt := tc.rtt(now.Sub(step))
++				h.c.mu.Lock()
++				h.c.kstat = tcpStats{rtt: rtt, minRTT: oldMinRTT, rttVar: time.Millisecond, inFlight: int64(s.down.cap)}
++				h.c.rebase(now)
++				s.down.returned += int64(s.down.cap) * int64(oldMinRTT) / int64(rtt)
++				h.c.governDown(now, s)
++				h.c.mu.Unlock()
++			}
++			h.c.mu.Lock()
++			base, cap, pinned, gain := h.c.base, s.down.cap, h.c.pinned, h.c.effect.gain
++			h.c.mu.Unlock()
++			if (base != 0) != tc.rebase {
++				t.Fatalf("%s, cap %d: base %v (cap %d, pinned %v, gain %v), want a rebase: %v",
++					tc.name, startCap, base, cap, pinned, gain, tc.rebase)
++			}
++		}
++	}
++}
+-- 
+2.52.0.windows.1
+

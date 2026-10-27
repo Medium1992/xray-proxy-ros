@@ -1,0 +1,202 @@
+From 74e1e6b7ce66ce57bd3019f4725732a2172ab92e Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 15:03:55 +0300
+Subject: [PATCH 89/91] XHTTP: Widen a probing client's windows once a round
+
+While its group probed, a governed client multiplied a settled
+download's cap by the probe's gain on every credit frame, though the
+model sets the cap once a round: forty WINDOW_UPDATEs in one round took
+a 64 KiB cap to 493 MB, and the probe released far more than it
+measured. The gain now scales the target the model sets for a new
+round; within the round the cap stays.
+---
+ transport/internet/splithttp/h2flow.go        | 17 ++--
+ .../internet/splithttp/h2flow_group_test.go   | 80 +++++++++++++++++++
+ .../splithttp/h2flow_model_path_test.go       |  4 +-
+ .../internet/splithttp/h2flow_shown_test.go   |  2 +-
+ 4 files changed, 93 insertions(+), 10 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index 876ec5d5b..30d1a4803 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -517,8 +517,10 @@ func (w *flowWindow) settled() bool {
+ }
+ 
+ // model sets the cap from the path model; rtprop is the empty path's round
+-// trip.
+-func (w *flowWindow) model(now time.Time, rtprop time.Duration, init, limit int32) {
++// trip. gain scales the cap a new round sets, as a probe widens it, from init
++// too: a probe is asked for where the caps sit at init; within a round the cap
++// stays where that round set it.
++func (w *flowWindow) model(now time.Time, rtprop time.Duration, init, limit int32, gain float64) {
+ 	round := max(rtprop, flowModelMinRound)
+ 	if w.rateAt == 0 && w.prev > 0 {
+ 		// The ramp's last round seeds the filter, so one slow first round
+@@ -536,8 +538,8 @@ func (w *flowWindow) model(now time.Time, rtprop time.Duration, init, limit int3
+ 	for _, r := range w.rates {
+ 		bw = max(bw, r)
+ 	}
+-	target := int64(min(float64(bw)*rtprop.Seconds()*flowModelGainPercent/100, float64(limit)))
+-	w.cap = int32(min(max(target, int64(init)), int64(limit)))
++	target := min(float64(bw)*rtprop.Seconds()*flowModelGainPercent/100, float64(limit))
++	w.cap = int32(min(max(target, float64(init))*gain, float64(limit)))
+ }
+ 
+ // flowRate is bytes per second, in floats and held well inside int64: credit
+@@ -2197,7 +2199,7 @@ func (w *flowWriter) control(f h2Frame, header, payload, out []byte) []byte {
+ 		var q int
+ 		switch {
+ 		case c.modelled(now) && s.up.settled():
+-			s.up.model(now, c.currentRTT(), c.up.init, c.up.max)
++			s.up.model(now, c.currentRTT(), c.up.init, c.up.max, 1)
+ 		case c.modelled(now):
+ 			s.up.adjust(now, c.currentRTT(), c.up.init, c.up.max, true, false)
+ 		default:
+@@ -2235,10 +2237,11 @@ func (c *flowConn) governDown(now time.Time, s *flowStream) {
+ 	}
+ 	switch {
+ 	case c.client && c.modelled(now) && s.down.settled():
+-		s.down.model(now, c.currentRTT(), c.down.init, c.down.max)
++		gain := 1.0
+ 		if c.wide {
+-			s.down.cap = int32(min(float64(s.down.cap)*flowProbeGain, float64(c.down.max)))
++			gain = flowProbeGain
+ 		}
++		s.down.model(now, c.currentRTT(), c.down.init, c.down.max, gain)
+ 	case !c.client && !c.noQueueCuts && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
+ 		// Only clients that credit in small steps: one that waits for
+ 		// half of its own window could be held below that half. Only
+diff --git a/transport/internet/splithttp/h2flow_group_test.go b/transport/internet/splithttp/h2flow_group_test.go
+index 801fdec44..be3d32baa 100644
+--- a/transport/internet/splithttp/h2flow_group_test.go
++++ b/transport/internet/splithttp/h2flow_group_test.go
+@@ -3,6 +3,8 @@ package splithttp
+ import (
+ 	"testing"
+ 	"time"
++
++	"golang.org/x/net/http2"
+ )
+ 
+ // TestFlowGroupProbe runs a probe of a group whose connections carry a
+@@ -113,3 +115,81 @@ func TestFlowGroupNoProbeAtSteadyRate(t *testing.T) {
+ 		t.Fatal("no probe once the rate fell to a quarter")
+ 	}
+ }
++
++// TestFlowClientProbeWidensOnce is a client whose group probes while a
++// settled download credits forty times within one model round: the probe
++// widens the round's target once, not the cap with every credit.
++func TestFlowClientProbeWidensOnce(t *testing.T) {
++	h, s := queuedDownload(t)
++	now := time.Now()
++	h.c.mu.Lock()
++	h.c.client = true
++	h.c.group = joinFlowGroup("probe-once")
++	h.c.group.phase, h.c.group.at, h.c.group.span = flowProbeWide, now, time.Second
++	h.c.rebase(now)
++	s.down.cap = h2InitWindow
++	s.down.steady = flowSettledRounds
++	s.down.mark = now
++	h.c.kAt = now.Add(time.Hour)
++	h.c.mu.Unlock()
++	if _, err := h.c.Write(frames(func(fr *http2.Framer) {
++		for range 40 {
++			fr.WriteWindowUpdate(1, 4096)
++		}
++	})); err != nil {
++		t.Fatal(err)
++	}
++	h.c.mu.Lock()
++	if s.down.cap > h2InitWindow*5/4+1 {
++		h.c.mu.Unlock()
++		t.Fatalf("cap=%d after one model round", s.down.cap)
++	}
++	// The round is over: the next credit sets the cap to the widened target
++	// of a reader that took 10 MB/s.
++	s.down.mark = s.down.mark.Add(-time.Second)
++	s.down.rates[0], s.down.rateAt = 10e6, 1
++	plain := s.down
++	plain.returned += 4096
++	plain.model(time.Now(), h.c.currentRTT(), h.c.down.init, h.c.down.max, 1)
++	h.c.mu.Unlock()
++	if plain.cap <= h2InitWindow*2 {
++		t.Fatalf("cap=%d without the probe, too low to tell a widening", plain.cap)
++	}
++	if _, err := h.c.Write(frames(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, 4096) })); err != nil {
++		t.Fatal(err)
++	}
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	if float64(s.down.cap) < float64(plain.cap)*(1+flowProbeGain)/2 {
++		t.Fatalf("cap=%d in a new round of a probe, %d without it", s.down.cap, plain.cap)
++	}
++}
++
++// TestFlowClientProbeWidensFromInit is a probe of a client whose download's
++// model sits under init, as it does where the kernel's floor stayed at the
++// path's old round trip: the new round widens the cap from init, or the
++// probe would see no answer for a path that moved.
++func TestFlowClientProbeWidensFromInit(t *testing.T) {
++	h, s := queuedDownload(t)
++	now := time.Now()
++	h.c.mu.Lock()
++	h.c.client = true
++	h.c.group = joinFlowGroup("probe-init")
++	h.c.group.phase, h.c.group.at, h.c.group.span = flowProbeWide, now, time.Second
++	h.c.rebase(now)
++	s.down.cap = h2InitWindow
++	s.down.steady = flowSettledRounds
++	s.down.rates, s.down.rateAt = [flowModelRounds]int64{}, 1
++	s.down.mark, s.down.markBase = now.Add(-time.Second), s.down.returned
++	h.c.kAt = now.Add(time.Hour)
++	h.c.mu.Unlock()
++	if _, err := h.c.Write(frames(func(fr *http2.Framer) { fr.WriteWindowUpdate(1, 4096) })); err != nil {
++		t.Fatal(err)
++	}
++	h.c.mu.Lock()
++	defer h.c.mu.Unlock()
++	gain := flowProbeGain
++	if want := int32(h2InitWindow * gain); s.down.cap != want {
++		t.Fatalf("cap=%d in a new round of a probe from init, want %d", s.down.cap, want)
++	}
++}
+diff --git a/transport/internet/splithttp/h2flow_model_path_test.go b/transport/internet/splithttp/h2flow_model_path_test.go
+index 61bbddf6d..11c426143 100644
+--- a/transport/internet/splithttp/h2flow_model_path_test.go
++++ b/transport/internet/splithttp/h2flow_model_path_test.go
+@@ -14,7 +14,7 @@ func TestFlowWindowModel(t *testing.T) {
+ 		for range rounds {
+ 			now = now.Add(rtprop)
+ 			w.returned += perRound
+-			w.model(now, rtprop, h2InitWindow, 1<<30)
++			w.model(now, rtprop, h2InitWindow, 1<<30, 1)
+ 		}
+ 	}
+ 
+@@ -46,7 +46,7 @@ func TestFlowWindowModelSeed(t *testing.T) {
+ 	start := time.Unix(0, 0)
+ 	w := flowWindow{cap: 4 << 20, mark: start, ramped: true, prev: 1_000_000}
+ 	w.returned = 100_000
+-	w.model(start.Add(rtprop), rtprop, h2InitWindow, 1<<30)
++	w.model(start.Add(rtprop), rtprop, h2InitWindow, 1<<30, 1)
+ 	if want := int32(1_250_000); w.cap != want {
+ 		t.Fatalf("a slow first round dropped the cap to %d, want %d from the ramp", w.cap, want)
+ 	}
+diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
+index cfef99fed..638fbf5cd 100644
+--- a/transport/internet/splithttp/h2flow_shown_test.go
++++ b/transport/internet/splithttp/h2flow_shown_test.go
+@@ -112,7 +112,7 @@ func TestFlowWindowHugeCredit(t *testing.T) {
+ 	}
+ 	w.returned += 1 << 40
+ 	now = now.Add(60 * time.Millisecond)
+-	w.model(now, 50*time.Millisecond, h2InitWindow, limit)
++	w.model(now, 50*time.Millisecond, h2InitWindow, limit, 1)
+ 	if w.cap != limit {
+ 		t.Fatalf("model: cap %d after a round of 2^40, want the limit %d", w.cap, limit)
+ 	}
+-- 
+2.52.0.windows.1
+

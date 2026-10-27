@@ -1,0 +1,206 @@
+From 6cac337f2792a874b9bd5a7d87914592a31fa3d2 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:00:02 +0300
+Subject: [PATCH 91/91] XHTTP: Close test clients with their test
+
+newFlowTestClient left its governed connections to the server's close:
+each released its flowGroup only once its read loop saw EOF, which can
+come after the test returns, and TestFlowGroupShared, which runs next,
+found the group. The helper now takes the test and closes its transport
+and connections in a cleanup registered when it makes them;
+flowConn.Close releases the group before it returns.
+TestH2WindowsEndToEnd, which dials governed connections itself, does the
+same. On one CPU, each client test before TestFlowGroupShared, ten
+times: four of them left a group in 2 to 8 of 10 runs before, none
+after.
+---
+ .../internet/splithttp/h2flow_client_test.go  | 29 +++++++++++++------
+ .../internet/splithttp/h2flow_config_test.go  | 18 +++++++++++-
+ .../internet/splithttp/h2flow_frame_test.go   |  4 +--
+ .../internet/splithttp/h2flow_shrink_test.go  |  2 +-
+ transport/internet/splithttp/h2flow_test.go   |  2 +-
+ 5 files changed, 41 insertions(+), 14 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
+index 1573a8088..61563c12b 100644
+--- a/transport/internet/splithttp/h2flow_client_test.go
++++ b/transport/internet/splithttp/h2flow_client_test.go
+@@ -23,15 +23,17 @@ import (
+ 
+ // flowClient is an XHTTP-like HTTP/2 client: x/net's transport over a dialed
+ // connection, optionally governed, keeping the governed connections around.
++// They close with the test: a governed connection holds its flowGroup until
++// it closes, and one left to the server's close lingers past the test.
+ type flowClient struct {
+ 	*http.Client
+ 	mu    sync.Mutex
+ 	conns []*flowConn
+ }
+ 
+-func newFlowTestClient(addr string, governed bool) *flowClient {
++func newFlowTestClient(t testing.TB, addr string, governed bool) *flowClient {
+ 	fc := &flowClient{}
+-	fc.Client = &http.Client{Transport: &http2.Transport{
++	tr := &http2.Transport{
+ 		AllowHTTP: true,
+ 		DialTLSContext: func(ctx context.Context, network, _ string, _ *gotls.Config) (net.Conn, error) {
+ 			c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+@@ -44,7 +46,16 @@ func newFlowTestClient(addr string, governed bool) *flowClient {
+ 			fc.mu.Unlock()
+ 			return g, nil
+ 		},
+-	}}
++	}
++	fc.Client = &http.Client{Transport: tr}
++	t.Cleanup(func() {
++		tr.CloseIdleConnections()
++		fc.mu.Lock()
++		defer fc.mu.Unlock()
++		for _, c := range fc.conns {
++			c.Close()
++		}
++	})
+ 	return fc
+ }
+ 
+@@ -81,7 +92,7 @@ func TestFlowClientSlowReaderBounded(t *testing.T) {
+ 					}
+ 				}
+ 			}))
+-			client := newFlowTestClient(addr, governed)
++			client := newFlowTestClient(t, addr, governed)
+ 			resp, err := client.Get("http://x/down")
+ 			if err != nil {
+ 				t.Fatal(err)
+@@ -120,7 +131,7 @@ func TestFlowClientSlowReaderBounded(t *testing.T) {
+ func TestFlowClientIntegrityDuplex(t *testing.T) {
+ 	for _, sc := range clientCases {
+ 		_, addr := startFlowServer(t, sc.up, sc.down, true, http.HandlerFunc(echoHandler))
+-		client := newFlowTestClient(addr, true)
++		client := newFlowTestClient(t, addr, true)
+ 		var wg sync.WaitGroup
+ 		errs := make(chan error, 16)
+ 		for i := 0; i < 16; i++ {
+@@ -179,7 +190,7 @@ func clientDownloadRate(t *testing.T, sc struct {
+ 			}
+ 		}
+ 	}))
+-	client := newFlowTestClient(lagProxy(t, addr, rtt/2), governed)
++	client := newFlowTestClient(t, lagProxy(t, addr, rtt/2), governed)
+ 	if resp, err := client.Get("http://x/warm"); err == nil {
+ 		resp.Body.Read(make([]byte, 1))
+ 		resp.Body.Close()
+@@ -236,7 +247,7 @@ func TestFlowClientMeasuresRTT(t *testing.T) {
+ 			time.Sleep(100 * time.Millisecond)
+ 		}
+ 	}))
+-	client := newFlowTestClient(lagProxy(t, addr, 25*time.Millisecond), true)
++	client := newFlowTestClient(t, lagProxy(t, addr, 25*time.Millisecond), true)
+ 	resp, err := client.Get("http://x/")
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -262,7 +273,7 @@ func TestFlowClientStreamStateReleased(t *testing.T) {
+ 				w.Write(make([]byte, 100<<10))
+ 			}
+ 		}))
+-		client := newFlowTestClient(addr, true)
++		client := newFlowTestClient(t, addr, true)
+ 		var wg sync.WaitGroup
+ 		for i := 0; i < 300; i++ {
+ 			wg.Add(1)
+@@ -367,7 +378,7 @@ func chainedSlowReaders(t *testing.T, sendWindow int64) {
+ 	tl.mu.Lock()
+ 	tl.sendWindow = sendWindow
+ 	tl.mu.Unlock()
+-	client := newFlowTestClient(addr, true)
++	client := newFlowTestClient(t, addr, true)
+ 	serverConns := func() []*flowConn {
+ 		tl.mu.Lock()
+ 		defer tl.mu.Unlock()
+diff --git a/transport/internet/splithttp/h2flow_config_test.go b/transport/internet/splithttp/h2flow_config_test.go
+index 724948330..d32e137cc 100644
+--- a/transport/internet/splithttp/h2flow_config_test.go
++++ b/transport/internet/splithttp/h2flow_config_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"io"
+ 	gonet "net"
+ 	"net/http"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -215,13 +216,28 @@ func TestH2WindowsEndToEnd(t *testing.T) {
+ 		MaxConnectionReceiveWindow: 16 << 20,
+ 	}}).h2ReceiveConfig(false))
+ 	h2.AllowHTTP = true
++	var mu sync.Mutex
++	var conns []*flowConn
+ 	h2.DialTLSContext = func(ctx context.Context, network, _ string, _ *gotls.Config) (gonet.Conn, error) {
+ 		c, err := (&gonet.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		return newFlowClientConn(c), nil
++		fc := newFlowClientConn(c)
++		mu.Lock()
++		conns = append(conns, fc)
++		mu.Unlock()
++		return fc, nil
+ 	}
++	// The governed connections hold their flowGroup until they close.
++	t.Cleanup(func() {
++		h2.CloseIdleConnections()
++		mu.Lock()
++		defer mu.Unlock()
++		for _, c := range conns {
++			c.Close()
++		}
++	})
+ 	client := &http.Client{Transport: h2}
+ 
+ 	const size = 32 << 20
+diff --git a/transport/internet/splithttp/h2flow_frame_test.go b/transport/internet/splithttp/h2flow_frame_test.go
+index b217a9ce7..9a3e0b19e 100644
+--- a/transport/internet/splithttp/h2flow_frame_test.go
++++ b/transport/internet/splithttp/h2flow_frame_test.go
+@@ -127,9 +127,9 @@ func TestFlowCapsFrameSize(t *testing.T) {
+ 		go srv.Serve(tl)
+ 		addr := ln.Addr().String()
+ 		if tc.client {
+-			transferBoth(t, newFlowTestClient(addr, true).Client)
++			transferBoth(t, newFlowTestClient(t, addr, true).Client)
+ 		} else if tc.name == "stock server, x/net client" {
+-			transferBoth(t, newFlowTestClient(addr, false).Client)
++			transferBoth(t, newFlowTestClient(t, addr, false).Client)
+ 		} else {
+ 			transferBoth(t, h2Client(addr))
+ 		}
+diff --git a/transport/internet/splithttp/h2flow_shrink_test.go b/transport/internet/splithttp/h2flow_shrink_test.go
+index 6d148cc31..6b900758d 100644
+--- a/transport/internet/splithttp/h2flow_shrink_test.go
++++ b/transport/internet/splithttp/h2flow_shrink_test.go
+@@ -31,7 +31,7 @@ func TestFlowWindowShrinks(t *testing.T) {
+ 		var get func(string) (*http.Response, error)
+ 		var client *flowClient
+ 		if role == "client" {
+-			client = newFlowTestClient(proxy, true)
++			client = newFlowTestClient(t, proxy, true)
+ 			get = client.Get
+ 		} else {
+ 			get = h2Client(proxy).Get
+diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
+index ef743a282..275e1c14b 100644
+--- a/transport/internet/splithttp/h2flow_test.go
++++ b/transport/internet/splithttp/h2flow_test.go
+@@ -1211,7 +1211,7 @@ func TestFlowCloseUnderLoad(t *testing.T) {
+ 	tl, addr := startFlowServer(t, testUp, testDown, true, http.HandlerFunc(echoHandler))
+ 	before := goroutines()
+ 	for round := 0; round < 10; round++ {
+-		client := newFlowTestClient(addr, true)
++		client := newFlowTestClient(t, addr, true)
+ 		var wg sync.WaitGroup
+ 		for i := 0; i < 8; i++ {
+ 			wg.Add(1)
+-- 
+2.52.0.windows.1
+

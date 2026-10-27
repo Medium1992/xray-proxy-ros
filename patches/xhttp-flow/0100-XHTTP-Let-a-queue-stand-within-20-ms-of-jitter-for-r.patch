@@ -1,0 +1,116 @@
+From 6ad758f6e851d7971152280f19b6c39cb14875d9 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:08:49 +0300
+Subject: [PATCH 100/100] XHTTP: Let a queue stand within 20 ms of jitter for
+ rebase
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Where a gain of none froze the caps, rebase took the path's round trip
+only where the queue's least over the window was at nine tenths of its
+most. A smoothed round trip that wanders by a few milliseconds on its own
+broke that on a short step: from 20 to 70 ms, ±3 ms restarted the window
+every time, and the caps stayed frozen as before C4. The queue now
+stands where its least is no more than a tenth of its most or 20 ms
+(flowBaseJitter) under it.
+
+A logging build put each check on the stands. On the RTT step with
+netem jitter the smoothed queue spread by up to 14 ms; a 20 s burst of
+other traffic spreads it by 38 to 370 ms while the queue fills, and the
+queue that moves in TestFlowRebaseWhereGainFroze by 40 ms. The burst is
+still not taken for the path. With 64 connections the server's own
+queue stands within 12-15 ms at times, but there the cuts do nothing
+and most connections already rebase from pinned caps: the stand shows
+no cost.
+
+TestFlowRebaseWhereGainFroze gains a case of ±8 ms around a path moved
+to 70 ms, from the start window and from 512 KiB; the old check fails it
+from 512 KiB, and no check fails "queue moves".
+---
+ transport/internet/splithttp/h2flow.go        | 16 +++++++++------
+ .../internet/splithttp/h2flow_rebase_test.go  | 20 +++++++++++++++----
+ 2 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
+index ae6615d3c..f41d4c3c8 100644
+--- a/transport/internet/splithttp/h2flow.go
++++ b/transport/internet/splithttp/h2flow.go
+@@ -917,6 +917,10 @@ func (c *flowConn) kernelStats(now time.Time) bool {
+ // min_rtt, with cuts that do not move it, before that is the path's own.
+ const flowBaseWindow = 2500 * time.Millisecond
+ 
++// flowBaseJitter is how far a path's smoothed round trip wanders by itself
++// while the path stands still: a queue that moves by no more stands.
++const flowBaseJitter = 20 * time.Millisecond
++
+ // rebase has the queue counted from the path's round trip where the path
+ // itself has moved. The kernel keeps its min_rtt for minutes, so a route or
+ // cell that adds to the round trip reads as a standing queue: cuts do not
+@@ -946,11 +950,11 @@ func (c *flowConn) rebase(now time.Time) {
+ 	// all, turns the cuts off: the caps stay where the cuts before it left
+ 	// them, and on a path whose window was over twice init before it moved
+ 	// they never come down to init. A gain of none counts as well where the
+-	// queue stood through the window, its least at nine tenths of its most
+-	// or more: a path that moved holds it whatever the connections do, while
+-	// a queue of the server's own that many connections share moves as the
+-	// others cut and grow, and so does one that other traffic keeps, which
+-	// taken for the path would have its gain learnt again and cut anew.
++	// queue stood through the window, its least no more than a tenth of its
++	// most or flowBaseJitter under it: a path that moved holds it whatever
++	// the connections do, while one that other traffic keeps fills and
++	// drains by more, and taken for the path would have its gain learnt
++	// again and cut anew.
+ 	if c.effect.active && (c.effect.gain < 0.5 && c.pinned || c.effect.gain == 0) {
+ 		if c.lowGain.IsZero() {
+ 			c.lowGain, c.lowQueue = now, 0
+@@ -961,7 +965,7 @@ func (c *flowConn) rebase(now time.Time) {
+ 	}
+ 	if c.base == 0 && !c.lowGain.IsZero() && now.Sub(c.lowGain) >= flowBaseWindow && c.baseWin.full(now) &&
+ 		least > floor+2*set {
+-		if c.pinned || 10*(least-floor) >= 9*c.lowQueue {
++		if c.pinned || c.lowQueue-(least-floor) <= max(c.lowQueue/10, flowBaseJitter) {
+ 			c.base, c.baseStep = least, least-floor
+ 			c.lowGain = time.Time{}
+ 		} else {
+diff --git a/transport/internet/splithttp/h2flow_rebase_test.go b/transport/internet/splithttp/h2flow_rebase_test.go
+index 4649ee7ef..9c1c61c87 100644
+--- a/transport/internet/splithttp/h2flow_rebase_test.go
++++ b/transport/internet/splithttp/h2flow_rebase_test.go
+@@ -95,10 +95,12 @@ func TestFlowRebaseKeepsBaseThroughJitter(t *testing.T) {
+ // first cut lands in flight and the queue, the path's own, does not move:
+ // the gain goes to none, the cuts stop and the cap stays above twice init.
+ // rebase waited for caps at init and never ran; the gain of none is now
+-// enough for it. Where the queue then keeps moving by two fifths, as a queue
+-// of the server's own does while the connections that share it cut and
+-// grow, with the cap still over twice init, it is not the path's, and
+-// rebase does not run.
++// enough for it. A smoothed round trip that wanders by 8 ms either way on a
++// path that moved to 70 ms is still the path's: the base was taken only
++// where the round trip stood within a tenth. Where the queue keeps moving by
++// two fifths, as a queue of the server's own does while the connections
++// that share it cut and grow, with the cap still over twice init, it is not
++// the path's, and rebase does not run.
+ func TestFlowRebaseWhereGainFroze(t *testing.T) {
+ 	const oldMinRTT = 20 * time.Millisecond
+ 	const newPathRTT = 120 * time.Millisecond
+@@ -109,6 +111,16 @@ func TestFlowRebaseWhereGainFroze(t *testing.T) {
+ 		rebase bool
+ 	}{
+ 		{"path moved", func(time.Duration) time.Duration { return newPathRTT }, []int32{flowStartWindow, 512 << 10}, true},
++		{"path moved with jitter", func(since time.Duration) time.Duration {
++			// A triangle of ±8 ms around 70 ms, 400 ms round.
++			const amp = 8 * time.Millisecond
++			p := since % (400 * time.Millisecond)
++			off := amp - 2*amp*p/(200*time.Millisecond)
++			if p >= 200*time.Millisecond {
++				off = -3*amp + 2*amp*p/(200*time.Millisecond)
++			}
++			return 70*time.Millisecond + off
++		}, []int32{flowStartWindow, 512 << 10}, true},
+ 		// From 512 KiB the cap stays over twice init as it follows the round
+ 		// trip: it is the queue that does not stand that tells this from a
+ 		// path.
+-- 
+2.52.0.windows.1
+

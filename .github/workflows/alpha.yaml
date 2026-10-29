@@ -132,9 +132,7 @@ jobs:
                 git checkout -q --detach "$SHA"
                 for p in /patches/*.patch; do git apply "$p"; done
                 export GOTOOLCHAIN=local CGO_ENABLED=0
-                for tags in "" http2legacy; do
-                  go test -short -count=1 -tags "$tags" -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/
-                done'; then
+                go test -short -count=1 -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/'; then
             echo "flow=required" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::XHTTP flow patches do not apply or fail their tests on ${{ needs.alpha-check.outputs.version }}; this alpha is built without them"

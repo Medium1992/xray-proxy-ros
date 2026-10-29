@@ -49,15 +49,6 @@ ARG PIPE_BUFFER_KB=64
 # значение, пока не принят.
 ARG H2_SCRATCH_KB=32
 
-# http2legacy возвращает x/net/http2 его собственный пул соединений. Под Go 1.27
-# без тега x/net оборачивает net/http, а тот дозванивается отдельно для каждого
-# запроса, пока соединения нет: когда TLS-хендшейк глохнет на пути, каждая
-# сессия открывает свой TCP, xmux.maxConnections перестаёт ограничивать сокеты,
-# и память растёт до OOM (XTLS/Xray-core#6797). Замер на сервере, который не
-# отвечает на ClientHello: 40 сессий — 40 дозвонов без тега и 3 с ним. Пустое
-# значение собирает без тегов. Убрать, когда это починят в Xray или Go.
-ARG GO_BUILD_TAGS=http2legacy
-
 # Регулятор окон HTTP/2 для XHTTP из форка mux-ka (patches/xhttp-flow): окно
 # приёма загрузки растёт только по тому, что читатель реально вычитал за RTT,
 # как автоподстройка TCP. Без него Go держит до 4 МиБ непрочитанного на каждый
@@ -174,14 +165,6 @@ RUN set -eu; \
       || { echo "pipe buffer patch did not apply (features/policy/policy.go)" >&2; exit 1; }; \
     echo "Dispatcher pipe buffer set to ${PIPE_BUFFER_KB} KiB (non-ARM branch)"
 
-# Поднимает golang.org/x/net до XNET_MIN, если в go.mod апстрима версия ниже.
-ARG XNET_MIN=v0.61.0
-RUN set -eu; \
-    cur=$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod); \
-    if [ "$(printf '%s\n%s\n' "$cur" "$XNET_MIN" | sort -V | head -n1)" != "$XNET_MIN" ]; then \
-      go get "golang.org/x/net@${XNET_MIN}"; \
-    fi
-
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
       go mod download && exit 0; \
@@ -191,15 +174,9 @@ RUN set -eu; \
     echo "go mod download failed after 5 attempts" >&2; \
     exit 1
 
-# Где живёт frameScratchBufferLen, зависит от тулчейна. С Go 1.27 x/net/http2
-# стал обёрткой над stdlib: его transport.go собирается только с тегом
-# http2legacy (//go:build !(go1.27 && !http2legacy)), а работает копия в
-# $GOROOT/src/net/http/internal/http2. Правка только в vendor/ поэтому ничего
-# не меняла — это показал замер памяти, куча на соединение не сдвинулась.
-# Патчим оба места: какое из них скомпилируется, то и будет с правкой.
-# Stdlib собирается из исходников GOROOT, изменённый файл пересоберётся сам.
-# Дерево вендорится ради копии в x/net; без правки vendor/ не создаётся и
-# сборка идёт по модулям, как у апстрима.
+# С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
+# работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается
+# из исходников GOROOT, изменённый файл пересоберётся сам.
 RUN set -eu; \
     if [ -z "$H2_SCRATCH_KB" ]; then \
       echo "HTTP/2 scratch buffer left at upstream defaults"; \
@@ -207,20 +184,13 @@ RUN set -eu; \
     fi; \
     printf '%s' "$H2_SCRATCH_KB" | grep -Eq '^[1-9][0-9]*$' \
       || { echo "H2_SCRATCH_KB is not a positive number: $H2_SCRATCH_KB" >&2; exit 1; }; \
-    go mod vendor; \
-    patched=0; \
-    for T in "$(go env GOROOT)/src/net/http/internal/http2/transport.go" \
-             vendor/golang.org/x/net/http2/transport.go; do \
-      [ -f "$T" ] || continue; \
-      grep -Fq 'const max = 512 << 10' "$T" \
-        || { echo "frameScratchBufferLen no longer has the shape this patch expects ($T)" >&2; exit 1; }; \
-      sed -i "s|const max = 512 << 10|const max = ${H2_SCRATCH_KB} << 10|" "$T"; \
-      grep -Fq "const max = ${H2_SCRATCH_KB} << 10" "$T" \
-        || { echo "h2 scratch patch did not apply ($T)" >&2; exit 1; }; \
-      echo "HTTP/2 uplink scratch buffer capped at ${H2_SCRATCH_KB} KiB in $T"; \
-      patched=$((patched+1)); \
-    done; \
-    [ "$patched" -gt 0 ] || { echo "no HTTP/2 transport source found to patch" >&2; exit 1; }
+    T="$(go env GOROOT)/src/net/http/internal/http2/transport.go"; \
+    grep -Fq 'const max = 512 << 10' "$T" \
+      || { echo "frameScratchBufferLen no longer has the shape this patch expects ($T)" >&2; exit 1; }; \
+    sed -i "s|const max = 512 << 10|const max = ${H2_SCRATCH_KB} << 10|" "$T"; \
+    grep -Fq "const max = ${H2_SCRATCH_KB} << 10" "$T" \
+      || { echo "h2 scratch patch did not apply ($T)" >&2; exit 1; }; \
+    echo "HTTP/2 uplink scratch buffer capped at ${H2_SCRATCH_KB} KiB in $T"
 
 # Флаги один в один с XTLS/Xray-core .github/workflows/release.yml, чтобы свой
 # бинарник отличался от официального только версией тулчейна и правками выше.
@@ -230,26 +200,7 @@ RUN set -eu; \
 # полный, и describe видит теги — причём только аннотированные: версионные
 # теги вроде v26.7.28 лёгкие, ближайший аннотированный это v1.260327.0, и
 # строка сборки получалась как v1.260327.0-226-gcd4ce973. Берём SHA напрямую.
-#
-# Режим модулей задаётся явно. Go включил бы vendor-режим и сам, раз каталог
-# есть, но тогда сбой автоопределения означал бы тихую сборку по модулям — то
-# есть без правки в x/net, и узнать об этом было бы неоткуда. С -mod=vendor
-# отсутствующий или рассогласованный vendor/ роняет сборку.
 RUN set -eu; \
-    if [ -d vendor ]; then \
-      MODMODE=-mod=vendor; \
-    else \
-      MODMODE=-mod=mod; \
-    fi; \
-    echo "Module mode: ${MODMODE}"; \
-    echo "Build tags: ${GO_BUILD_TAGS:-none}"; \
-    case ",${GO_BUILD_TAGS}," in \
-      *,http2legacy,*) \
-        go list "$MODMODE" -tags "$GO_BUILD_TAGS" -f '{{join .GoFiles " "}}' golang.org/x/net/http2 \
-          | tr ' ' '\n' | grep -qx transport.go \
-          || { echo "http2legacy no longer selects x/net's own transport" >&2; exit 1; }; \
-        ;; \
-    esac; \
     case "$TARGETARCH" in \
       arm) \
         case "$TARGETVARIANT" in \
@@ -264,7 +215,7 @@ RUN set -eu; \
     COMMID="$(git rev-parse --short=7 HEAD)"; \
     echo "Building ${XRAY_REPO}@${XRAY_REF} (${COMMID}) for ${TARGETOS}/${TARGETARCH}${TARGETVARIANT:+/}${TARGETVARIANT} with $(go version)"; \
     GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
-    go build "$MODMODE" -tags "$GO_BUILD_TAGS" -o /final/xray -trimpath -buildvcs=false \
+    go build -o /final/xray -trimpath -buildvcs=false \
       -gcflags="all=-l=4" \
       -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
       -v ./main

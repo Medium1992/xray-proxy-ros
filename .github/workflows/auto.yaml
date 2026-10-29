@@ -106,9 +106,7 @@ jobs:
               git checkout -q --detach "$REF"
               for p in /patches/*.patch; do git apply "$p"; done
               export GOTOOLCHAIN=local CGO_ENABLED=0
-              for tags in "" http2legacy; do
-                go test -short -count=1 -tags "$tags" -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/
-              done'
+              go test -short -count=1 -run "Flow|FrameParser|RewriteInitial" ./transport/internet/splithttp/'
 
   build:
     needs: [check, flow]

@@ -1,0 +1,306 @@
+diff --git a/infra/conf/transport_security.go b/infra/conf/transport_security.go
+index 00e5387a9..5671284d2 100644
+--- a/infra/conf/transport_security.go
++++ b/infra/conf/transport_security.go
+@@ -36,6 +36,7 @@ type REALITYConfig struct {
+ 	MinClientVer string          `json:"minClientVer"`
+ 	MaxClientVer string          `json:"maxClientVer"`
+ 	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
++	AllowX25519  bool            `json:"allowX25519"`
+ 	ShortIds     []string        `json:"shortIds"`
+ 	Mldsa65Seed  string          `json:"mldsa65Seed"`
+ 
+@@ -150,6 +151,7 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
+ 		config.Xver = c.Xver
+ 		config.ServerNames = c.ServerNames
+ 		config.MaxTimeDiff = c.MaxTimeDiff
++		config.AllowX25519 = c.AllowX25519
+ 
+ 		if c.Mldsa65Seed != "" {
+ 			if c.Mldsa65Seed == c.PrivateKey {
+diff --git a/testing/scenarios/reality_x25519_test.go b/testing/scenarios/reality_x25519_test.go
+new file mode 100644
+index 000000000..d81f08ec6
+--- /dev/null
++++ b/testing/scenarios/reality_x25519_test.go
+@@ -0,0 +1,211 @@
++package scenarios
++
++import (
++	gotls "crypto/tls"
++	"encoding/base64"
++	"encoding/hex"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/log"
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/common/uuid"
++	core "github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/proxy/vless/inbound"
++	"github.com/xtls/xray-core/proxy/vless/outbound"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/reality"
++	transtcp "github.com/xtls/xray-core/transport/internet/tcp"
++)
++
++// TestVlessRealityAllowX25519 connects through REALITY with a fingerprint
++// whose only key share is X25519 (edge) and with one that also sends
++// X25519MLKEM768 (chrome): the X25519-only Client Hello is let in only with
++// allowX25519, the hybrid one always.
++func TestVlessRealityAllowX25519(t *testing.T) {
++	for _, c := range []struct {
++		fingerprint string
++		allow       bool
++		pass        bool
++	}{
++		{"edge", false, false},
++		{"edge", true, true},
++		{"chrome", false, true},
++		{"chrome", true, true},
++	} {
++		err := realityX25519Conn(t, c.fingerprint, c.allow)
++		if (err == nil) != c.pass {
++			t.Errorf("fingerprint %s, allowX25519 %v: err %v, want pass %v", c.fingerprint, c.allow, err, c.pass)
++		}
++	}
++}
++
++// realityTarget serves TLS 1.3 for localhost, as REALITY's target.
++func realityTarget(t *testing.T) net.Destination {
++	t.Helper()
++	ct, _ := cert.MustGenerate(nil, cert.DNSNames("localhost"))
++	certPEM, keyPEM := ct.ToPEM()
++	pair, err := gotls.X509KeyPair(certPEM, keyPEM)
++	common.Must(err)
++	ln, err := gotls.Listen("tcp", "127.0.0.1:0", &gotls.Config{
++		MinVersion:   gotls.VersionTLS13,
++		Certificates: []gotls.Certificate{pair},
++	})
++	common.Must(err)
++	t.Cleanup(func() { ln.Close() })
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(10 * time.Second))
++				conn.(*gotls.Conn).Handshake()
++				buf := make([]byte, 1024)
++				for {
++					if _, err := conn.Read(buf); err != nil {
++						return
++					}
++				}
++			}()
++		}
++	}()
++	return net.DestinationFromAddr(ln.Addr())
++}
++
++func realityX25519Conn(t *testing.T, fingerprint string, allow bool) error {
++	tcpServer := tcp.Server{
++		MsgProcessor: xor,
++	}
++	dest, err := tcpServer.Start()
++	common.Must(err)
++	defer tcpServer.Close()
++	target := realityTarget(t)
++
++	userID := protocol.NewID(uuid.New())
++	serverPort := tcp.PickPort()
++	privateKey, _ := base64.RawURLEncoding.DecodeString("aGSYystUbf59_9_6LKRxD27rmSW_-2_nyd9YG_Gwbks")
++	publicKey, _ := base64.RawURLEncoding.DecodeString("E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM")
++	shortID := make([]byte, 8)
++	hex.Decode(shortID, []byte("0123456789abcdef"))
++	serverConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&log.Config{
++				ErrorLogType: log.LogType_None,
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++					StreamSettings: &internet.StreamConfig{
++						ProtocolName: "tcp",
++						SecurityType: serial.GetMessageType(&reality.Config{}),
++						SecuritySettings: []*serial.TypedMessage{
++							serial.ToTypedMessage(&reality.Config{
++								Dest:        target.NetAddr(),
++								ServerNames: []string{"localhost"},
++								PrivateKey:  privateKey,
++								ShortIds:    [][]byte{shortID},
++								Type:        "tcp",
++								AllowX25519: allow,
++							}),
++						},
++					},
++				}),
++				ProxySettings: serial.ToTypedMessage(&inbound.Config{
++					Users: []*protocol.User{
++						{
++							Account: serial.ToTypedMessage(&vless.Account{
++								Id: userID.String(),
++							}),
++						},
++					},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&freedom.Config{
++					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++				}),
++			},
++		},
++	}
++
++	clientPort := tcp.PickPort()
++	clientConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&log.Config{
++				ErrorLogType: log.LogType_None,
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(dest.Address),
++					RewritePort:     uint32(dest.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&outbound.Config{
++					Vnext: &protocol.ServerEndpoint{
++						Address: net.NewIPOrDomain(net.LocalHostIP),
++						Port:    uint32(serverPort),
++						User: &protocol.User{
++							Account: serial.ToTypedMessage(&vless.Account{
++								Id: userID.String(),
++							}),
++						},
++					},
++				}),
++				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
++					StreamSettings: &internet.StreamConfig{
++						ProtocolName: "tcp",
++						TransportSettings: []*internet.TransportConfig{
++							{
++								ProtocolName: "tcp",
++								Settings:     serial.ToTypedMessage(&transtcp.Config{}),
++							},
++						},
++						SecurityType: serial.GetMessageType(&reality.Config{}),
++						SecuritySettings: []*serial.TypedMessage{
++							serial.ToTypedMessage(&reality.Config{
++								Fingerprint: fingerprint,
++								ServerName:  "localhost",
++								PublicKey:   publicKey,
++								ShortId:     shortID,
++								SpiderX:     "/",
++							}),
++						},
++					},
++				}),
++			},
++		},
++	}
++
++	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
++	common.Must(err)
++	defer CloseAllServers(servers)
++
++	return testTCPConn(clientPort, 64*1024, 5*time.Second)()
++}
+diff --git a/transport/internet/reality/config.go b/transport/internet/reality/config.go
+index 4e1b625dc..c2fbbdf2c 100644
+--- a/transport/internet/reality/config.go
++++ b/transport/internet/reality/config.go
+@@ -27,6 +27,7 @@ func (c *Config) GetREALITYConfig() *reality.Config {
+ 		MinClientVer: c.MinClientVer,
+ 		MaxClientVer: c.MaxClientVer,
+ 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
++		AllowX25519:  c.AllowX25519,
+ 
+ 		NextProtos:             nil, // should be nil
+ 		SessionTicketsDisabled: true,
+diff --git a/transport/internet/reality/config.pb.go b/transport/internet/reality/config.pb.go
+index ceb65204d..2c51ed355 100644
+--- a/transport/internet/reality/config.pb.go
++++ b/transport/internet/reality/config.pb.go
+@@ -36,6 +36,7 @@ type Config struct {
+ 	Mldsa65Seed           []byte                 `protobuf:"bytes,11,opt,name=mldsa65_seed,json=mldsa65Seed,proto3" json:"mldsa65_seed,omitempty"`
+ 	LimitFallbackUpload   *LimitFallback         `protobuf:"bytes,12,opt,name=limit_fallback_upload,json=limitFallbackUpload,proto3" json:"limit_fallback_upload,omitempty"`
+ 	LimitFallbackDownload *LimitFallback         `protobuf:"bytes,13,opt,name=limit_fallback_download,json=limitFallbackDownload,proto3" json:"limit_fallback_download,omitempty"`
++	AllowX25519           bool                   `protobuf:"varint,50,opt,name=allow_x25519,json=allowX25519,proto3" json:"allow_x25519,omitempty"`
+ 	Fingerprint           string                 `protobuf:"bytes,21,opt,name=Fingerprint,proto3" json:"Fingerprint,omitempty"`
+ 	ServerName            string                 `protobuf:"bytes,22,opt,name=server_name,json=serverName,proto3" json:"server_name,omitempty"`
+ 	PublicKey             []byte                 `protobuf:"bytes,23,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+@@ -169,6 +170,13 @@ func (x *Config) GetLimitFallbackDownload() *LimitFallback {
+ 	return nil
+ }
+ 
++func (x *Config) GetAllowX25519() bool {
++	if x != nil {
++		return x.AllowX25519
++	}
++	return false
++}
++
+ func (x *Config) GetFingerprint() string {
+ 	if x != nil {
+ 		return x.Fingerprint
+@@ -289,7 +297,7 @@ var File_transport_internet_reality_config_proto protoreflect.FileDescriptor
+ 
+ const file_transport_internet_reality_config_proto_rawDesc = "" +
+ 	"\n" +
+-	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\x98\x06\n" +
++	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xbb\x06\n" +
+ 	"\x06Config\x12\x12\n" +
+ 	"\x04show\x18\x01 \x01(\bR\x04show\x12\x12\n" +
+ 	"\x04dest\x18\x02 \x01(\tR\x04dest\x12\x12\n" +
+@@ -305,7 +313,8 @@ const file_transport_internet_reality_config_proto_rawDesc = "" +
+ 	" \x03(\fR\bshortIds\x12!\n" +
+ 	"\fmldsa65_seed\x18\v \x01(\fR\vmldsa65Seed\x12b\n" +
+ 	"\x15limit_fallback_upload\x18\f \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x13limitFallbackUpload\x12f\n" +
+-	"\x17limit_fallback_download\x18\r \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x15limitFallbackDownload\x12 \n" +
++	"\x17limit_fallback_download\x18\r \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x15limitFallbackDownload\x12!\n" +
++	"\fallow_x25519\x182 \x01(\bR\vallowX25519\x12 \n" +
+ 	"\vFingerprint\x18\x15 \x01(\tR\vFingerprint\x12\x1f\n" +
+ 	"\vserver_name\x18\x16 \x01(\tR\n" +
+ 	"serverName\x12\x1d\n" +
+diff --git a/transport/internet/reality/config.proto b/transport/internet/reality/config.proto
+index 7da43629f..04568155c 100644
+--- a/transport/internet/reality/config.proto
++++ b/transport/internet/reality/config.proto
+@@ -21,6 +21,7 @@ message Config {
+   bytes mldsa65_seed = 11;
+   LimitFallback limit_fallback_upload = 12;
+   LimitFallback limit_fallback_download = 13;
++  bool allow_x25519 = 50;
+ 
+   string Fingerprint = 21;
+   string server_name = 22;

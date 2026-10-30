@@ -62,6 +62,13 @@ ARG XHTTP_FLOW=required
 # extra. required — патч обязан лечь; off — без него. Требует XHTTP_FLOW=required.
 ARG XHTTP_MUX=required
 
+# "allowX25519" в realitySettings (patches/reality): сервер снова принимает
+# Client Hello только с X25519, без X25519MLKEM768. Такой Client Hello влезает в
+# один TCP-сегмент, гибридный никогда, и путь, который режет второй сегмент,
+# иначе отрезает всех клиентов. По умолчанию выключено, как у апстрима.
+# required — патчи обязаны лечь; off — без них.
+ARG REALITY_X25519=required
+
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
 # ошибкой, а не тихой подменой.
@@ -173,6 +180,29 @@ RUN set -eu; \
     done; \
     echo "go mod download failed after 5 attempts" >&2; \
     exit 1
+
+# xtls/reality той версии, что требует go.mod апстрима, копируется из кэша
+# модулей в third_party/reality, на неё и на код Xray ложатся патчи, и replace
+# направляет сборку на эту копию.
+COPY patches/reality /patches/reality
+RUN set -eu; \
+    case "$REALITY_X25519" in \
+      off) echo "REALITY allowX25519: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "REALITY_X25519 must be required or off, got '$REALITY_X25519'" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p third_party; \
+    cp -r "$(go list -m -f '{{.Dir}}' github.com/xtls/reality)" third_party/reality; \
+    chmod -R u+w third_party/reality; \
+    for p in /patches/reality/*.patch; do \
+      git apply "$p" \
+        || { echo "REALITY patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    go mod edit -replace github.com/xtls/reality=./third_party/reality; \
+    grep -q 'AllowX25519 bool' third_party/reality/common.go \
+      && grep -q 'AllowX25519' infra/conf/transport_security.go \
+      || { echo "REALITY allowX25519 hooks are missing after patching" >&2; exit 1; }; \
+    echo "REALITY allowX25519: included"
 
 # С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
 # работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается

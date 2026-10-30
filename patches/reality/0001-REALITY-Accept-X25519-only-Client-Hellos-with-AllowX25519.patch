@@ -1,0 +1,36 @@
+diff --git a/third_party/reality/common.go b/third_party/reality/common.go
+index 3600ce427..10ebc12b7 100644
+--- a/third_party/reality/common.go
++++ b/third_party/reality/common.go
+@@ -600,6 +600,10 @@ type Config struct {
+ 	MaxTimeDiff  time.Duration
+ 	ShortIds     map[[8]byte]bool
+ 
++	// AllowX25519 accepts a Client Hello whose only usable key share is
++	// X25519, as before X25519MLKEM768 became required.
++	AllowX25519 bool
++
+ 	Mldsa65Key *mldsa.PrivateKey
+ 
+ 	LimitFallbackUpload   LimitFallback
+@@ -1056,6 +1060,7 @@ func (c *Config) Clone() *Config {
+ 		MaxClientVer:          c.MaxClientVer,
+ 		MaxTimeDiff:           c.MaxTimeDiff,
+ 		ShortIds:              c.ShortIds,
++		AllowX25519:           c.AllowX25519,
+ 		Mldsa65Key:            c.Mldsa65Key,
+ 		LimitFallbackUpload:   c.LimitFallbackUpload,
+ 		LimitFallbackDownload: c.LimitFallbackDownload,
+diff --git a/third_party/reality/tls.go b/third_party/reality/tls.go
+index 51decd7ee..bc8b92caa 100644
+--- a/third_party/reality/tls.go
++++ b/third_party/reality/tls.go
+@@ -231,7 +231,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
+ 					break // ensure order
+ 				}
+ 			}
+-			if peerPub2 == nil {
++			if peerPub2 == nil && !(config.AllowX25519 && peerPub != nil) {
+ 				break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
+ 			}
+ 			if peerPub == nil {

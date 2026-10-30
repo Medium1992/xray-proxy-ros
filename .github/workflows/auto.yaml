@@ -348,7 +348,7 @@ jobs:
             local file="telegram-images/xray-proxy-ros-${name}-${xray}.tar.gz"
 
             retry docker pull --platform "${platform}" "${image}"
-            docker save "${image}" | gzip -9 > "${file}"
+            docker save --platform "${platform}" "${image}" | gzip -9 > "${file}"
             docker image rm "${image}" || true
           }
 

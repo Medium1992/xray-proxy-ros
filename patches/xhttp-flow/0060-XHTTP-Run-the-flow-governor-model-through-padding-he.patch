@@ -1,8 +1,8 @@
-From 481cc03ec7fa007ff0fd62be991f17a746544b88 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 15:58:36 +0000
-Subject: [PATCH] XHTTP: Run the flow governor model through padding, header
- blocks, SETTINGS and GOAWAY on both sides
+Subject: [PATCH 060/105] XHTTP: Run the flow governor model through padding,
+ header blocks, SETTINGS and GOAWAY on both sides
 
 The model now also runs a client's governor, and checks that every frame but WINDOW_UPDATE and the governor's own PINGs reaches the other peer as it was sent.
 ---
@@ -653,5 +653,5 @@ index 0834afe2..eef46b25 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

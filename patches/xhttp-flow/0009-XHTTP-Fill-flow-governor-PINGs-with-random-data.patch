@@ -1,7 +1,7 @@
-From 0601b3de08581e1321384cd36eeda59626fe85d2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 23:26:36 +0300
-Subject: [PATCH 09/12] XHTTP: Fill flow governor PINGs with random data
+Subject: [PATCH 009/105] XHTTP: Fill flow governor PINGs with random data
 
 The governor's PINGs carried a fixed tag and a counter, which anything
 that terminates TLS in front of the server could match. They now carry
@@ -123,5 +123,5 @@ index 00000000..e20e8c64
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

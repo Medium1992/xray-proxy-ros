@@ -1,8 +1,8 @@
-From 3a919a3775b6d945fb03d7d716a4d5cad766e61b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 21:29:30 +0300
-Subject: [PATCH] XHTTP: Hold flow governor connections to the settled rule in
- tests
+Subject: [PATCH 049/105] XHTTP: Hold flow governor connections to the settled
+ rule in tests
 
 With the kernel vouching for the path, an upload on a server and a download on a governed client that are one low round into their start have to keep their caps, and to follow the path model after a second such round. A reader that grows a tenth a round has flat rounds and has not ended its ramp: it is not settled.
 ---
@@ -12,7 +12,7 @@ With the kernel vouching for the path, an upload on a server and a download on a
  create mode 100644 transport/internet/splithttp/h2flow_settled_test.go
 
 diff --git a/transport/internet/splithttp/h2flow_ramp_test.go b/transport/internet/splithttp/h2flow_ramp_test.go
-index 113967a2f..5e7545170 100644
+index 113967a2..5e754517 100644
 --- a/transport/internet/splithttp/h2flow_ramp_test.go
 +++ b/transport/internet/splithttp/h2flow_ramp_test.go
 @@ -73,6 +73,28 @@ func TestFlowWindowSettles(t *testing.T) {
@@ -46,7 +46,7 @@ index 113967a2f..5e7545170 100644
  	start := time.Unix(0, 0)
 diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
 new file mode 100644
-index 000000000..2fab0747f
+index 00000000..2fab0747
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_settled_test.go
 @@ -0,0 +1,116 @@
@@ -167,5 +167,5 @@ index 000000000..2fab0747f
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

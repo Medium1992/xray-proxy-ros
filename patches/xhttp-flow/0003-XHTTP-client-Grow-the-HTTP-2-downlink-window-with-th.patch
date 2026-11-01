@@ -1,8 +1,8 @@
-From b92f05c5661c6171b6dc42e4eef25adeb00aa91f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 16:29:34 +0300
-Subject: [PATCH 3/6] XHTTP client: Grow the HTTP/2 downlink window with the
- reader
+Subject: [PATCH 003/105] XHTTP client: Grow the HTTP/2 downlink window with
+ the reader
 
 A node that dials XHTTP over HTTP/2, such as a transit hop, buffers up
 to its 4 MiB stream window of downlink data whenever the local reader
@@ -25,10 +25,10 @@ unchanged, stock or governed.
  create mode 100644 transport/internet/splithttp/h2flow_client_test.go
 
 diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
-index 9bac57a1..dd775f5d 100644
+index b52f5a71..c042b4fa 100644
 --- a/transport/internet/splithttp/dialer.go
 +++ b/transport/internet/splithttp/dialer.go
-@@ -257,7 +257,11 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+@@ -253,7 +253,11 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
  		}
  		transport = &http2.Transport{
  			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
@@ -656,5 +656,5 @@ index a42e3c78..4f7a590d 100644
  			var got []byte
  			for {
 -- 
-2.52.0.windows.1
+2.47.3
 

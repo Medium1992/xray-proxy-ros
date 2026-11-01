@@ -1,7 +1,7 @@
-From 6ad758f6e851d7971152280f19b6c39cb14875d9 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 15:08:49 +0300
-Subject: [PATCH 100/100] XHTTP: Let a queue stand within 20 ms of jitter for
+Subject: [PATCH 100/105] XHTTP: Let a queue stand within 20 ms of jitter for
  rebase
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -33,7 +33,7 @@ from 512 KiB, and no check fails "queue moves".
  2 files changed, 26 insertions(+), 10 deletions(-)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index ae6615d3c..f41d4c3c8 100644
+index ae6615d3..f41d4c3c 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -917,6 +917,10 @@ func (c *flowConn) kernelStats(now time.Time) bool {
@@ -74,7 +74,7 @@ index ae6615d3c..f41d4c3c8 100644
  			c.lowGain = time.Time{}
  		} else {
 diff --git a/transport/internet/splithttp/h2flow_rebase_test.go b/transport/internet/splithttp/h2flow_rebase_test.go
-index 4649ee7ef..9c1c61c87 100644
+index 4649ee7e..9c1c61c8 100644
 --- a/transport/internet/splithttp/h2flow_rebase_test.go
 +++ b/transport/internet/splithttp/h2flow_rebase_test.go
 @@ -95,10 +95,12 @@ func TestFlowRebaseKeepsBaseThroughJitter(t *testing.T) {
@@ -112,5 +112,5 @@ index 4649ee7ef..9c1c61c87 100644
  		// trip: it is the queue that does not stand that tells this from a
  		// path.
 -- 
-2.52.0.windows.1
+2.47.3
 

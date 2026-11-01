@@ -1,8 +1,8 @@
-From 7fecd2996bbd9d4927f2041ed686a8de9d60a488 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 19:57:14 +0300
-Subject: [PATCH] XHTTP: Take no connection window for a dropped frame, as
- stock
+Subject: [PATCH 101/105] XHTTP: Take no connection window for a dropped frame,
+ as stock
 
 A frame dropped past a stream's window is taken off the connection's sent count instead of being returned, and no WINDOW_UPDATE goes to the client for it, as with the stock server.
 ---
@@ -458,5 +458,5 @@ index 73fa45e6..67b28a65 100644
  // inside an open header block: the governed server ends the connection as a
  // stock one does. The governor dropped the frame and reset the stream, and
 -- 
-2.52.0.windows.1
+2.47.3
 

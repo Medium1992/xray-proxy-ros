@@ -1,7 +1,7 @@
-From d95545503edebe0fa12175517432a66cf1a08d31 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 19:13:35 +0300
-Subject: [PATCH 83/84] XHTTP: Forget the streams a server's GOAWAY will not
+Subject: [PATCH 083/105] XHTTP: Forget the streams a server's GOAWAY will not
  take up
 
 GOAWAY passed unread, so a client stream past the last one it names
@@ -16,7 +16,7 @@ the stacks do. The frame passes on unchanged.
  create mode 100644 transport/internet/splithttp/h2flow_goaway_test.go
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index c06a78d56..a57e47abe 100644
+index c06a78d5..a57e47ab 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -45,6 +45,7 @@ const (
@@ -54,7 +54,7 @@ index c06a78d56..a57e47abe 100644
  		if f.stream == 0 && inc > 0 && c.up.enabled() {
 diff --git a/transport/internet/splithttp/h2flow_goaway_test.go b/transport/internet/splithttp/h2flow_goaway_test.go
 new file mode 100644
-index 000000000..61764c5a8
+index 00000000..61764c5a
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_goaway_test.go
 @@ -0,0 +1,37 @@
@@ -96,5 +96,5 @@ index 000000000..61764c5a8
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

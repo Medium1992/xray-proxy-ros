@@ -1,8 +1,8 @@
-From 298295593b7f555ae657d8985b49c7d44d1ae5c1 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 22:18:59 +0300
-Subject: [PATCH] XHTTP: Count the flow governor's settling rounds from the end
- of the ramp
+Subject: [PATCH 051/105] XHTTP: Count the flow governor's settling rounds from
+ the end of the ramp
 
 A reader that grew slowly was settled by the first low round after that growth, and the path model had that round to go by. Flat rounds are counted from the round that ends the ramp.
 ---
@@ -121,5 +121,5 @@ index 2fab0747..700423b6 100644
  	w.mark, w.markBase = time.Now().Add(-time.Second), w.returned
  }
 -- 
-2.52.0.windows.1
+2.47.3
 

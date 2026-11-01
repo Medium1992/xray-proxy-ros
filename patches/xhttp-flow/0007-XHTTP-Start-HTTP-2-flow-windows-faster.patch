@@ -1,7 +1,7 @@
-From 98df204918785f2d0cfe1469a2144b4c7a006123 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 02:32:36 +0300
-Subject: [PATCH 7/8] XHTTP: Start HTTP/2 flow windows faster
+Subject: [PATCH 007/105] XHTTP: Start HTTP/2 flow windows faster
 
 New streams start at 256 KiB or the window the connection recently
 needed, which now halves every minute instead of every 5 seconds. Before
@@ -137,5 +137,5 @@ index 00000000..75c9569f
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

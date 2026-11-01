@@ -1,7 +1,7 @@
-From 1f21c2f067c8b0eb505d12042db2523089b1d1f2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 13:18:08 +0300
-Subject: [PATCH 38/38] XHTTP: Have the chained flow governor test reach its
+Subject: [PATCH 038/105] XHTTP: Have the chained flow governor test reach its
  state, let the fuzz target see a given up connection
 
 ---
@@ -110,5 +110,5 @@ index a0fb67b3..a6e8e9d7 100644
  				in = in[n:]
  			}
 -- 
-2.52.0.windows.1
+2.47.3
 

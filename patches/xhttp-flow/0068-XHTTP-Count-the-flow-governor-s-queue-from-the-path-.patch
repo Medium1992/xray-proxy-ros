@@ -1,8 +1,8 @@
-From 5c915b79e52ee6bd351801676ef14970ae0e461a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 14:22:43 +0300
-Subject: [PATCH] XHTTP: Count the flow governor's queue from the path's own
- round trip once the path has moved
+Subject: [PATCH 068/105] XHTTP: Count the flow governor's queue from the
+ path's own round trip once the path has moved
 
 ---
  transport/internet/splithttp/h2flow.go        | 85 +++++++++++++++++-
@@ -11,7 +11,7 @@ Subject: [PATCH] XHTTP: Count the flow governor's queue from the path's own
  create mode 100644 transport/internet/splithttp/h2flow_rebase_test.go
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index f7e77688b..d8499aaef 100644
+index f7e77688..d8499aae 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -725,6 +725,17 @@ type flowConn struct {
@@ -134,7 +134,7 @@ index f7e77688b..d8499aaef 100644
  // still in slow start, so the kernel's min_rtt, taken at the TCP handshake,
 diff --git a/transport/internet/splithttp/h2flow_rebase_test.go b/transport/internet/splithttp/h2flow_rebase_test.go
 new file mode 100644
-index 000000000..d2d1296ca
+index 00000000..d2d1296c
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_rebase_test.go
 @@ -0,0 +1,90 @@
@@ -229,5 +229,5 @@ index 000000000..d2d1296ca
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

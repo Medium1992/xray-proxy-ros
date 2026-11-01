@@ -1,7 +1,7 @@
-From 6cac337f2792a874b9bd5a7d87914592a31fa3d2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 19:00:02 +0300
-Subject: [PATCH 91/91] XHTTP: Close test clients with their test
+Subject: [PATCH 091/105] XHTTP: Close test clients with their test
 
 newFlowTestClient left its governed connections to the server's close:
 each released its flowGroup only once its read loop saw EOF, which can
@@ -22,7 +22,7 @@ after.
  5 files changed, 41 insertions(+), 14 deletions(-)
 
 diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
-index 1573a8088..61563c12b 100644
+index 1573a808..61563c12 100644
 --- a/transport/internet/splithttp/h2flow_client_test.go
 +++ b/transport/internet/splithttp/h2flow_client_test.go
 @@ -23,15 +23,17 @@ import (
@@ -118,7 +118,7 @@ index 1573a8088..61563c12b 100644
  		tl.mu.Lock()
  		defer tl.mu.Unlock()
 diff --git a/transport/internet/splithttp/h2flow_config_test.go b/transport/internet/splithttp/h2flow_config_test.go
-index 724948330..d32e137cc 100644
+index 72494833..d32e137c 100644
 --- a/transport/internet/splithttp/h2flow_config_test.go
 +++ b/transport/internet/splithttp/h2flow_config_test.go
 @@ -9,6 +9,7 @@ import (
@@ -160,7 +160,7 @@ index 724948330..d32e137cc 100644
  
  	const size = 32 << 20
 diff --git a/transport/internet/splithttp/h2flow_frame_test.go b/transport/internet/splithttp/h2flow_frame_test.go
-index b217a9ce7..9a3e0b19e 100644
+index b217a9ce..9a3e0b19 100644
 --- a/transport/internet/splithttp/h2flow_frame_test.go
 +++ b/transport/internet/splithttp/h2flow_frame_test.go
 @@ -127,9 +127,9 @@ func TestFlowCapsFrameSize(t *testing.T) {
@@ -176,7 +176,7 @@ index b217a9ce7..9a3e0b19e 100644
  			transferBoth(t, h2Client(addr))
  		}
 diff --git a/transport/internet/splithttp/h2flow_shrink_test.go b/transport/internet/splithttp/h2flow_shrink_test.go
-index 6d148cc31..6b900758d 100644
+index 6d148cc3..6b900758 100644
 --- a/transport/internet/splithttp/h2flow_shrink_test.go
 +++ b/transport/internet/splithttp/h2flow_shrink_test.go
 @@ -31,7 +31,7 @@ func TestFlowWindowShrinks(t *testing.T) {
@@ -189,7 +189,7 @@ index 6d148cc31..6b900758d 100644
  		} else {
  			get = h2Client(proxy).Get
 diff --git a/transport/internet/splithttp/h2flow_test.go b/transport/internet/splithttp/h2flow_test.go
-index ef743a282..275e1c14b 100644
+index ef743a28..275e1c14 100644
 --- a/transport/internet/splithttp/h2flow_test.go
 +++ b/transport/internet/splithttp/h2flow_test.go
 @@ -1211,7 +1211,7 @@ func TestFlowCloseUnderLoad(t *testing.T) {
@@ -202,5 +202,5 @@ index ef743a282..275e1c14b 100644
  		for i := 0; i < 8; i++ {
  			wg.Add(1)
 -- 
-2.52.0.windows.1
+2.47.3
 

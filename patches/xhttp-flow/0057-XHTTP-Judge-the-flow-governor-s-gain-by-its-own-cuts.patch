@@ -1,7 +1,7 @@
-From 9eec9a013bcdc423c5a130b3a1748118b07a46bb Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 20 Oct 2026 00:09:58 +0300
-Subject: [PATCH] XHTTP: Judge the flow governor's gain by its own cuts
+Subject: [PATCH 057/105] XHTTP: Judge the flow governor's gain by its own cuts
 
 Only the bytes pi and the cut at a long queue take count as a cut, once what is in flight has come down with them; a loss, the caps following the round trip and a dip of other traffic's queue no longer read as one. A download that returns no credit in a round stays in the caps for a second, and a queue that halves gives the cuts their gain back.
 ---
@@ -401,5 +401,5 @@ index 5a272f0b..d871996b 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

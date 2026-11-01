@@ -6,10 +6,10 @@ downlink with a Mux.Cool KeepAlive frame ("muxKeepAliveSecs",
 "muxKeepAliveBytes" in the XHTTP "extra").
 ---
 diff --git a/app/proxyman/inbound/inbound.go b/app/proxyman/inbound/inbound.go
-index 411de859..e046513a 100644
+index c0ced47a..5ddb59ad 100644
 --- a/app/proxyman/inbound/inbound.go
 +++ b/app/proxyman/inbound/inbound.go
-@@ -174,9 +174,9 @@ func NewHandler(ctx context.Context, config *core.InboundHandlerConfig) (inbound
+@@ -174,7 +174,7 @@ func NewHandler(ctx context.Context, config *core.InboundHandlerConfig) (inbound
  			Mark: streamSettings.SocketSettings.Mark,
  		})
  	}
@@ -18,8 +18,6 @@ index 411de859..e046513a 100644
  		ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
  	}
  
- 	return NewAlwaysOnInboundHandler(ctx, tag, receiverSettings, proxySettings)
- }
 diff --git a/common/mux/server.go b/common/mux/server.go
 index c23a3789..f892be36 100644
 --- a/common/mux/server.go
@@ -280,7 +278,7 @@ index 4158bf46..c166e284 100644
 +	}
 +}
 diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
-index 9360b264..6aa8f51a 100644
+index ea57926c..fc10b90f 100644
 --- a/infra/conf/transport_method.go
 +++ b/infra/conf/transport_method.go
 @@ -290,6 +290,8 @@ type SplitHTTPConfig struct {
@@ -292,7 +290,7 @@ index 9360b264..6aa8f51a 100644
  	H2Flow               *H2FlowConfig     `json:"h2Flow"`
  	ServerMaxHeaderBytes int32             `json:"serverMaxHeaderBytes"`
  	Xmux                 XmuxConfig        `json:"xmux"`
-@@ -544,6 +546,8 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
+@@ -548,6 +550,8 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
  		ScMinPostsIntervalMs: newRangeConfig(c.ScMinPostsIntervalMs),
  		ScMaxBufferedPosts:   c.ScMaxBufferedPosts,
  		ScStreamUpServerSecs: newRangeConfig(c.ScStreamUpServerSecs),
@@ -302,19 +300,25 @@ index 9360b264..6aa8f51a 100644
  		SessionIDTable:       c.SessionIDTable,
  		SessionIDLength:      newRangeConfig(c.SessionIDLength),
 diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
-index 2790704f..80db30af 100644
+index 8a7e7d86..a507e0d3 100644
 --- a/transport/internet/splithttp/config.pb.go
 +++ b/transport/internet/splithttp/config.pb.go
-@@ -264,6 +264,8 @@ type Config struct {
- 	ServerMaxHeaderBytes int32                  `protobuf:"varint,27,opt,name=serverMaxHeaderBytes,proto3" json:"serverMaxHeaderBytes,omitempty"`
- 	SessionIDTable       string                 `protobuf:"bytes,28,opt,name=sessionIDTable,proto3" json:"sessionIDTable,omitempty"`
- 	SessionIDLength      *RangeConfig           `protobuf:"bytes,29,opt,name=sessionIDLength,proto3" json:"sessionIDLength,omitempty"`
-+	MuxKeepAliveSecs     *RangeConfig           `protobuf:"bytes,30,opt,name=muxKeepAliveSecs,proto3" json:"muxKeepAliveSecs,omitempty"`
-+	MuxKeepAliveBytes    *RangeConfig           `protobuf:"bytes,31,opt,name=muxKeepAliveBytes,proto3" json:"muxKeepAliveBytes,omitempty"`
- 	H2Flow               *H2FlowConfig          `protobuf:"bytes,32,opt,name=h2Flow,proto3" json:"h2Flow,omitempty"`
- 	unknownFields        protoimpl.UnknownFields
- 	sizeCache            protoimpl.SizeCache
-@@ -502,6 +504,20 @@ func (x *Config) GetSessionIDLength() *RangeConfig {
+@@ -277,9 +277,11 @@ type Config struct {
+ 	H2Params             []byte                 `protobuf:"bytes,30,opt,name=h2Params,proto3" json:"h2Params,omitempty"`
+ 	// Fork-owned fields take the 100+ block, so upstream's next numbers stay
+ 	// free: renumber them if upstream ever claims these.
+-	H2Flow        *H2FlowConfig `protobuf:"bytes,102,opt,name=h2Flow,proto3" json:"h2Flow,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
++	MuxKeepAliveSecs  *RangeConfig  `protobuf:"bytes,100,opt,name=muxKeepAliveSecs,proto3" json:"muxKeepAliveSecs,omitempty"`
++	MuxKeepAliveBytes *RangeConfig  `protobuf:"bytes,101,opt,name=muxKeepAliveBytes,proto3" json:"muxKeepAliveBytes,omitempty"`
++	H2Flow            *H2FlowConfig `protobuf:"bytes,102,opt,name=h2Flow,proto3" json:"h2Flow,omitempty"`
++	unknownFields     protoimpl.UnknownFields
++	sizeCache         protoimpl.SizeCache
+ }
+ 
+ func (x *Config) Reset() {
+@@ -522,6 +524,20 @@ func (x *Config) GetH2Params() []byte {
  	return nil
  }
  
@@ -335,27 +339,27 @@ index 2790704f..80db30af 100644
  func (x *Config) GetH2Flow() *H2FlowConfig {
  	if x != nil {
  		return x.H2Flow
-@@ -529,7 +545,7 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+@@ -550,7 +566,7 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	"\x0ecMaxReuseTimes\x18\x03 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0ecMaxReuseTimes\x12Z\n" +
  	"\x10hMaxRequestTimes\x18\x04 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxRequestTimes\x12Z\n" +
  	"\x10hMaxReusableSecs\x18\x05 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxReusableSecs\x12*\n" +
--	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\x95\r\n" +
-+	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xcf\x0e\n" +
+-	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xb1\r\n" +
++	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xeb\x0e\n" +
  	"\x06Config\x12\x12\n" +
  	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
  	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-@@ -560,7 +576,9 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
- 	"\x0fuplinkChunkSize\x18\x1a \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fuplinkChunkSize\x122\n" +
+@@ -582,7 +598,9 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	"\x14serverMaxHeaderBytes\x18\x1b \x01(\x05R\x14serverMaxHeaderBytes\x12&\n" +
  	"\x0esessionIDTable\x18\x1c \x01(\tR\x0esessionIDTable\x12X\n" +
--	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12G\n" +
-+	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12Z\n" +
-+	"\x10muxKeepAliveSecs\x18\x1e \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10muxKeepAliveSecs\x12\\\n" +
-+	"\x11muxKeepAliveBytes\x18\x1f \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x11muxKeepAliveBytes\x12G\n" +
- 	"\x06h2Flow\x18  \x01(\v2/.xray.transport.internet.splithttp.H2FlowConfigR\x06h2Flow\x1a:\n" +
+ 	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12\x1a\n" +
+-	"\bh2Params\x18\x1e \x01(\fR\bh2Params\x12G\n" +
++	"\bh2Params\x18\x1e \x01(\fR\bh2Params\x12Z\n" +
++	"\x10muxKeepAliveSecs\x18d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10muxKeepAliveSecs\x12\\\n" +
++	"\x11muxKeepAliveBytes\x18e \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x11muxKeepAliveBytes\x12G\n" +
+ 	"\x06h2Flow\x18f \x01(\v2/.xray.transport.internet.splithttp.H2FlowConfigR\x06h2Flow\x1a:\n" +
  	"\fHeadersEntry\x12\x10\n" +
  	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-@@ -603,12 +621,14 @@ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
+@@ -625,12 +643,14 @@ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
  	5,  // 11: xray.transport.internet.splithttp.Config.downloadSettings:type_name -> xray.transport.internet.StreamConfig
  	0,  // 12: xray.transport.internet.splithttp.Config.uplinkChunkSize:type_name -> xray.transport.internet.splithttp.RangeConfig
  	0,  // 13: xray.transport.internet.splithttp.Config.sessionIDLength:type_name -> xray.transport.internet.splithttp.RangeConfig
@@ -377,16 +381,16 @@ index 2790704f..80db30af 100644
  
  func init() { file_transport_internet_splithttp_config_proto_init() }
 diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
-index f2b18e4f..a26a544e 100644
+index fcf41e01..0f306c72 100644
 --- a/transport/internet/splithttp/config.proto
 +++ b/transport/internet/splithttp/config.proto
-@@ -66,5 +66,7 @@ message Config {
-   int32 serverMaxHeaderBytes = 27;
-   string sessionIDTable = 28;
-   RangeConfig sessionIDLength = 29;
-+  RangeConfig muxKeepAliveSecs = 30;
-+  RangeConfig muxKeepAliveBytes = 31;
-   H2FlowConfig h2Flow = 32;
+@@ -72,5 +72,7 @@ message Config {
+   bytes h2Params = 30;
+   // Fork-owned fields take the 100+ block, so upstream's next numbers stay
+   // free: renumber them if upstream ever claims these.
++  RangeConfig muxKeepAliveSecs = 100;
++  RangeConfig muxKeepAliveBytes = 101;
+   H2FlowConfig h2Flow = 102;
  }
 diff --git a/transport/internet/splithttp/connection.go b/transport/internet/splithttp/connection.go
 index 613e1f36..addf2274 100644
@@ -500,11 +504,32 @@ index 00000000..2e920fab
 +		}
 +	})
 +}
+diff --git a/transport/internet/splithttp/h2flow_verify_memory_test.go b/transport/internet/splithttp/h2flow_verify_memory_test.go
+index 04d0a47a..ef1d7022 100644
+--- a/transport/internet/splithttp/h2flow_verify_memory_test.go
++++ b/transport/internet/splithttp/h2flow_verify_memory_test.go
+@@ -272,12 +272,12 @@ func TestFlowInjectedQueueBounded(t *testing.T) {
+ 	}
+ }
+ 
+-// TestFlowProtoFieldNumbers pins the fork-owned h2Flow field of the generated
+-// descriptor, moved to 102 when upstream gave 30 to h2Params, and checks a
+-// wire round trip.
++// TestFlowProtoFieldNumbers pins the fork-owned fields of the generated
++// descriptor, moved to 100-102 when upstream gave 30 to h2Params, and checks
++// a wire round trip.
+ func TestFlowProtoFieldNumbers(t *testing.T) {
+ 	fields := (&Config{}).ProtoReflect().Descriptor().Fields()
+-	for number, name := range map[int32]string{30: "h2Params", 102: "h2Flow"} {
++	for number, name := range map[int32]string{30: "h2Params", 100: "muxKeepAliveSecs", 101: "muxKeepAliveBytes", 102: "h2Flow"} {
+ 		if fd := fields.ByNumber(protoreflect.FieldNumber(number)); fd == nil || string(fd.Name()) != name {
+ 			t.Fatalf("field %d: %v, want %s", number, fd, name)
+ 		}
 diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
-index c6578955..7e124afc 100644
+index e124baaf..0e127f78 100644
 --- a/transport/internet/splithttp/hub.go
 +++ b/transport/internet/splithttp/hub.go
-@@ -386,6 +386,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
+@@ -388,6 +388,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
  		}
  		if sessionId != "" { // if not stream-one
  			conn.reader = currentSession.uploadQueue

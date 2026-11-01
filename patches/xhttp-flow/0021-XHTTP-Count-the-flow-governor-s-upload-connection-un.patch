@@ -1,8 +1,8 @@
-From 9c9650da13ec2187bd0e0d643fcb3db025c62460 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 14:35:03 +0300
-Subject: [PATCH] XHTTP: Count the flow governor's upload connection unread
- from its own counters
+Subject: [PATCH 021/105] XHTTP: Count the flow governor's upload connection
+ unread from its own counters
 
 A request that ends with its body and waits for its response got
 connection credit back but no stream credit, so it stayed unread in the
@@ -391,11 +391,11 @@ index 5e522b56..b4090bac 100644
 -	}
 -}
 diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
-index 884e1214..b575596c 100644
+index 340eb2d0..d1ddff57 100644
 --- a/transport/internet/splithttp/hub.go
 +++ b/transport/internet/splithttp/hub.go
-@@ -568,7 +568,13 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
- 			HTTP2:             l.config.h2ReceiveConfig(true),
+@@ -578,7 +578,13 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 			HTTP2:             http2Config,
  		}
  		if l.config.h2FlowOn() {
 -			l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
@@ -410,5 +410,5 @@ index 884e1214..b575596c 100644
  		go func() {
  			if err := l.server.Serve(l.listener); err != nil {
 -- 
-2.52.0.windows.1
+2.47.3
 

@@ -1,8 +1,8 @@
-From 0e9b40762af8001d0d75c551fb8d0d83911accb8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 18:23:41 +0300
-Subject: [PATCH] XHTTP: Count the queue PINGs see from the path's own round
- trip once it has risen
+Subject: [PATCH 075/105] XHTTP: Count the queue PINGs see from the path's own
+ round trip once it has risen
 
 ---
  transport/internet/splithttp/h2flow.go        | 39 +++++++++++++++---
@@ -122,5 +122,5 @@ index 00000000..3be6e6f8
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

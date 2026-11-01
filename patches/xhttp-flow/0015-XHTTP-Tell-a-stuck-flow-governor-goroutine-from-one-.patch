@@ -1,8 +1,8 @@
-From 1d038d67a79c42ed5eac0f4d00e4958f7e6ffadb Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 15:17:24 +0300
-Subject: [PATCH] XHTTP: Tell a stuck flow governor goroutine from one passing
- a lock
+Subject: [PATCH 015/105] XHTTP: Tell a stuck flow governor goroutine from one
+ passing a lock
 
 The churn test failed once under load: its one stack snapshot caught a
 governor goroutine merely waiting for a lock. Take up to three snapshots
@@ -45,5 +45,5 @@ index 41facd6f..e57ae91c 100644
  	t.Logf("goroutines %d before, %d after (idle server connections included)", before, runtime.NumGoroutine())
  }
 -- 
-2.52.0.windows.1
+2.47.3
 

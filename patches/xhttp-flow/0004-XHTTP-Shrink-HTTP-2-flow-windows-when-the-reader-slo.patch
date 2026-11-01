@@ -1,8 +1,8 @@
-From 07d54bfd5f38d066a8b240d59b3fcec1e9912f4a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 18:15:26 +0300
-Subject: [PATCH 4/6] XHTTP: Shrink HTTP/2 flow windows when the reader slows
- down
+Subject: [PATCH 004/105] XHTTP: Shrink HTTP/2 flow windows when the reader
+ slows down
 
 A window grown by a fast reader stayed at that size, so a reader that
 settled to a lower rate, such as a video player once its buffer is
@@ -304,5 +304,5 @@ index 2755c339..41facd6f 100644
  	rtt := 40 * time.Millisecond
  	for _, upload := range []bool{false, true} {
 -- 
-2.52.0.windows.1
+2.47.3
 

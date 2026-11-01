@@ -1,7 +1,7 @@
-From c63819802085a9d139d08155ae3edd667de4e3ff Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 13:41:09 +0300
-Subject: [PATCH 099/100] XHTTP: Pass data inside an open header block to the
+Subject: [PATCH 099/105] XHTTP: Pass data inside an open header block to the
  stack whole
 
 Inside a header block nothing but CONTINUATION may come, and anything
@@ -19,7 +19,7 @@ the connection with the same GOAWAY.
  2 files changed, 118 insertions(+), 1 deletion(-)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index b1d35bda2..ae6615d3c 100644
+index b1d35bda..ae6615d3 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -385,7 +385,7 @@ func (p *frameParser) feed(in, out []byte, h frameHandler) []byte {
@@ -32,7 +32,7 @@ index b1d35bda2..ae6615d3c 100644
  				out = append(out, p.hdr[:]...)
  			}
 diff --git a/transport/internet/splithttp/h2flow_overrun_test.go b/transport/internet/splithttp/h2flow_overrun_test.go
-index 68503054c..73fa45e6e 100644
+index 68503054..73fa45e6 100644
 --- a/transport/internet/splithttp/h2flow_overrun_test.go
 +++ b/transport/internet/splithttp/h2flow_overrun_test.go
 @@ -370,3 +370,120 @@ func TestFlowSiblingUploadAfterDroppedOverrun(t *testing.T) {
@@ -157,5 +157,5 @@ index 68503054c..73fa45e6e 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

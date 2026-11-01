@@ -1,8 +1,8 @@
-From 35f2d0400a47de18f29ab195a6a3a9970bc6b6db Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 01:27:12 +0300
-Subject: [PATCH] XHTTP: Show a governed server the client's own window and
- leave its downloads to it
+Subject: [PATCH 077/105] XHTTP: Show a governed server the client's own window
+ and leave its downloads to it
 
 ---
  transport/internet/splithttp/h2flow.go        | 150 +++++++++++++-----
@@ -15,7 +15,7 @@ Subject: [PATCH] XHTTP: Show a governed server the client's own window and
  7 files changed, 241 insertions(+), 76 deletions(-)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index 31ad33ffc..e3e731ffc 100644
+index 31ad33ff..e3e731ff 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -687,6 +687,16 @@ type flowConn struct {
@@ -241,7 +241,7 @@ index 31ad33ffc..e3e731ffc 100644
  	c := (*flowConn)(w)
  	if c.client || !c.settingsSent {
 diff --git a/transport/internet/splithttp/h2flow_chain_test.go b/transport/internet/splithttp/h2flow_chain_test.go
-index 8b8e8e754..9eab8ded0 100644
+index 8b8e8e75..9eab8ded 100644
 --- a/transport/internet/splithttp/h2flow_chain_test.go
 +++ b/transport/internet/splithttp/h2flow_chain_test.go
 @@ -187,14 +187,13 @@ func TestFlowChainedStallAtSendWindow(t *testing.T) {
@@ -284,7 +284,7 @@ index 8b8e8e754..9eab8ded0 100644
  		})
  	}
 diff --git a/transport/internet/splithttp/h2flow_client_test.go b/transport/internet/splithttp/h2flow_client_test.go
-index e92a34b04..1573a8088 100644
+index e92a34b0..1573a808 100644
 --- a/transport/internet/splithttp/h2flow_client_test.go
 +++ b/transport/internet/splithttp/h2flow_client_test.go
 @@ -100,12 +100,19 @@ func TestFlowClientSlowReaderBounded(t *testing.T) {
@@ -354,7 +354,7 @@ index e92a34b04..1573a8088 100644
  	t.Logf("lowest cap seen: server %d, client %d", lowServer, lowClient)
  }
 diff --git a/transport/internet/splithttp/h2flow_credit_test.go b/transport/internet/splithttp/h2flow_credit_test.go
-index 807e1ca5a..74172dfcd 100644
+index 807e1ca5..74172dfc 100644
 --- a/transport/internet/splithttp/h2flow_credit_test.go
 +++ b/transport/internet/splithttp/h2flow_credit_test.go
 @@ -250,6 +250,9 @@ func TestFlowClientDownloadCreditNotHeld(t *testing.T) {
@@ -368,7 +368,7 @@ index 807e1ca5a..74172dfcd 100644
  			ch.cg.mu.Unlock()
  			for i := 0; i < pieces; i++ {
 diff --git a/transport/internet/splithttp/h2flow_guard_test.go b/transport/internet/splithttp/h2flow_guard_test.go
-index 5907ee087..3c9c8ff97 100644
+index 5907ee08..3c9c8ff9 100644
 --- a/transport/internet/splithttp/h2flow_guard_test.go
 +++ b/transport/internet/splithttp/h2flow_guard_test.go
 @@ -3,6 +3,8 @@ package splithttp
@@ -422,7 +422,7 @@ index 5907ee087..3c9c8ff97 100644
 +	}
 +}
 diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
-index d4149b1b3..03353904d 100644
+index d4149b1b..03353904 100644
 --- a/transport/internet/splithttp/h2flow_model_test.go
 +++ b/transport/internet/splithttp/h2flow_model_test.go
 @@ -54,26 +54,27 @@ type modelStream struct {
@@ -516,7 +516,7 @@ index d4149b1b3..03353904d 100644
 +	return f.typ == h2Settings && f.flags&h2FlagAck != 0
 +}
 diff --git a/transport/internet/splithttp/h2flow_settled_test.go b/transport/internet/splithttp/h2flow_settled_test.go
-index 80ff1da5d..0ea1831ef 100644
+index 80ff1da5..0ea1831e 100644
 --- a/transport/internet/splithttp/h2flow_settled_test.go
 +++ b/transport/internet/splithttp/h2flow_settled_test.go
 @@ -97,6 +97,9 @@ func TestFlowClientDownloadFollowsModelOnceSettled(t *testing.T) {
@@ -530,5 +530,5 @@ index 80ff1da5d..0ea1831ef 100644
  			start := s.down.cap
  			lowRoundBehind(&s.down, tc.flat)
 -- 
-2.52.0.windows.1
+2.47.3
 

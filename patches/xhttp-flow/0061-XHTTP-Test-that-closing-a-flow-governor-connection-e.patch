@@ -1,8 +1,8 @@
-From de18f60d4b0842d89a2560038a0fd381d9eeda8a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 15:31:36 +0000
-Subject: [PATCH] XHTTP: Test that closing a flow governor connection ends its
- waits and goroutines
+Subject: [PATCH 061/105] XHTTP: Test that closing a flow governor connection
+ ends its waits and goroutines
 
 ---
  transport/internet/splithttp/h2flow_test.go | 349 ++++++++++++++++++++
@@ -373,5 +373,5 @@ index 3d9b8f31..ef743a28 100644
 +	goroutinesSettle(t, before)
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

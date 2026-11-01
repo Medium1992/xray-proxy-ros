@@ -1,7 +1,7 @@
-From 67713109441df3bd9e983ea3e8fe89ef313a6a9b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 19:03:08 +0300
-Subject: [PATCH 82/84] XHTTP: Do not cut a coarse client's download under
+Subject: [PATCH 082/105] XHTTP: Do not cut a coarse client's download under
  where the guard lifts it
 
 A client that has not credited in small steps may wait for half of its
@@ -15,7 +15,7 @@ level; a client that credits in small steps is cut as before.
  2 files changed, 42 insertions(+), 1 deletion(-)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index 9c051e3f2..c06a78d56 100644
+index 9c051e3f..c06a78d5 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -2165,7 +2165,16 @@ func (c *flowConn) governDown(now time.Time, s *flowStream) {
@@ -37,7 +37,7 @@ index 9c051e3f2..c06a78d56 100644
  			c.effect.cutBy(float64(before - s.down.cap))
  		}
 diff --git a/transport/internet/splithttp/h2flow_cutaccount_test.go b/transport/internet/splithttp/h2flow_cutaccount_test.go
-index e4df3e8cb..f23ab0bae 100644
+index e4df3e8c..f23ab0ba 100644
 --- a/transport/internet/splithttp/h2flow_cutaccount_test.go
 +++ b/transport/internet/splithttp/h2flow_cutaccount_test.go
 @@ -78,3 +78,35 @@ func TestFlowLongQueueCutRounding(t *testing.T) {
@@ -77,5 +77,5 @@ index e4df3e8cb..f23ab0bae 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

@@ -1,7 +1,7 @@
-From 428457c981222d34b50d426678b0d3b81733fa10 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 11:24:06 +0300
-Subject: [PATCH] XHTTP: Withdraw the flow governor credit quanta
+Subject: [PATCH 044/105] XHTTP: Withdraw the flow governor credit quanta
 
 With credit that crosses the network no longer held, what was left held a server's download credit until 16 to 32 KiB had gathered. On the stand that saves no processor time: eight downloads cost 24.7 s per gigabyte on the server with it and 24.1 without under CUBIC, 25.1 and 24.8 under BBR.
 
@@ -15,7 +15,7 @@ Every piece of credit a reader returns goes on as it comes, in both directions a
  rename transport/internet/splithttp/{h2flow_hold_test.go => h2flow_credit_test.go} (54%)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index 89deb4c4b..c04837ddb 100644
+index 89deb4c4..c04837dd 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -67,11 +67,6 @@ const (
@@ -89,7 +89,7 @@ index 89deb4c4b..c04837ddb 100644
  		}
  		c.forwardDown(s, rel)
 diff --git a/transport/internet/splithttp/h2flow_chain_test.go b/transport/internet/splithttp/h2flow_chain_test.go
-index a40f930e6..8b8e8e754 100644
+index a40f930e..8b8e8e75 100644
 --- a/transport/internet/splithttp/h2flow_chain_test.go
 +++ b/transport/internet/splithttp/h2flow_chain_test.go
 @@ -108,9 +108,8 @@ func (ch *chain) sendAll(id uint32) int64 {
@@ -117,7 +117,7 @@ diff --git a/transport/internet/splithttp/h2flow_hold_test.go b/transport/intern
 similarity index 54%
 rename from transport/internet/splithttp/h2flow_hold_test.go
 rename to transport/internet/splithttp/h2flow_credit_test.go
-index fa45a1792..4a38fbb10 100644
+index fa45a179..4a38fbb1 100644
 --- a/transport/internet/splithttp/h2flow_hold_test.go
 +++ b/transport/internet/splithttp/h2flow_credit_test.go
 @@ -9,87 +9,6 @@ import (
@@ -246,7 +246,7 @@ index fa45a1792..4a38fbb10 100644
 +	}
 +}
 diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
-index 7d553abb4..d58f135bc 100644
+index 7d553abb..d58f135b 100644
 --- a/transport/internet/splithttp/h2flow_sendwindow_test.go
 +++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
 @@ -609,8 +609,8 @@ func TestFlowSendWindowSettingsCost(t *testing.T) {
@@ -283,5 +283,5 @@ index 7d553abb4..d58f135bc 100644
  	out := make([]byte, 0, 64)
  	allocs := testing.AllocsPerRun(1000, func() {
 -- 
-2.52.0.windows.1
+2.47.3
 

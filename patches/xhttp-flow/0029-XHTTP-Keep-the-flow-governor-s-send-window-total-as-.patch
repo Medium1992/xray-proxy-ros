@@ -1,7 +1,7 @@
-From b1c0f904390177aec9530c3bd25969fb99bdb31f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 03:33:01 +0300
-Subject: [PATCH] XHTTP: Keep the flow governor's send window total as
+Subject: [PATCH 029/105] XHTTP: Keep the flow governor's send window total as
  counters, let the guard lift it
 
 downRelease walked every stream of the connection for each stream it looked
@@ -31,10 +31,10 @@ measurement of its own, and it let a PING that was due wait.
  10 files changed, 385 insertions(+), 89 deletions(-)
 
 diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
-index 2592ee51..753ec7c3 100644
+index 86d4d6e7..06f6e90c 100644
 --- a/infra/conf/transport_method.go
 +++ b/infra/conf/transport_method.go
-@@ -303,7 +303,7 @@ type SplitHTTPConfig struct {
+@@ -302,7 +302,7 @@ type SplitHTTPConfig struct {
  // "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
  // receive windows are what this side grants for data it receives.
  // "maxConnectionSendWindow" is what a governed server lets one connection's
@@ -44,7 +44,7 @@ index 2592ee51..753ec7c3 100644
  	Enabled                    *bool `json:"enabled"`
  	MaxStreamReceiveWindow     int32 `json:"maxStreamReceiveWindow"`
 diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
-index 667faac9..a0e0e9be 100644
+index 17da192e..e587c744 100644
 --- a/transport/internet/splithttp/config.pb.go
 +++ b/transport/internet/splithttp/config.pb.go
 @@ -83,9 +83,9 @@ type H2FlowConfig struct {
@@ -61,7 +61,7 @@ index 667faac9..a0e0e9be 100644
  	unknownFields           protoimpl.UnknownFields
  	sizeCache               protoimpl.SizeCache
 diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
-index dc8ce919..52dd771d 100644
+index 44a871fe..f2b96840 100644
 --- a/transport/internet/splithttp/config.proto
 +++ b/transport/internet/splithttp/config.proto
 @@ -21,9 +21,9 @@ message H2FlowConfig {
@@ -805,5 +805,5 @@ index af91f6ae..d5dc8d89 100644
  }
  
 -- 
-2.52.0.windows.1
+2.47.3
 

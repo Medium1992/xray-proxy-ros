@@ -1,8 +1,8 @@
-From ac12820838da5847fca1837ed17b8beb1b3cf00d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 03:21:02 +0300
-Subject: [PATCH] XHTTP: Do not hold flow governor credit that crosses the
- network to quanta
+Subject: [PATCH 043/105] XHTTP: Do not hold flow governor credit that crosses
+ the network to quanta
 
 A download that followed an upload on the same connection after an idle second started slower than before the quanta: its first 3 MB took up to 1.02 s at 100 Mbit/s and RTT 50 ms where they took up to 0.76 s.
 
@@ -16,7 +16,7 @@ Upload credit from a server and download credit from a governed client go on as 
  3 files changed, 74 insertions(+), 85 deletions(-)
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index 8f79dd4f8..89deb4c4b 100644
+index 8f79dd4f..89deb4c4 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -67,10 +67,9 @@ const (
@@ -108,7 +108,7 @@ index 8f79dd4f8..89deb4c4b 100644
  	out = append(out, header...)
  	return append(out, payload...)
 diff --git a/transport/internet/splithttp/h2flow_hold_test.go b/transport/internet/splithttp/h2flow_hold_test.go
-index 3765c9634..fa45a1792 100644
+index 3765c963..fa45a179 100644
 --- a/transport/internet/splithttp/h2flow_hold_test.go
 +++ b/transport/internet/splithttp/h2flow_hold_test.go
 @@ -90,11 +90,34 @@ func TestFlowCreditWaitsForAQuantum(t *testing.T) {
@@ -254,7 +254,7 @@ index 3765c9634..fa45a1792 100644
  	}
  }
 diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
-index 256c248ef..7d553abb4 100644
+index 256c248e..7d553abb 100644
 --- a/transport/internet/splithttp/h2flow_sendwindow_test.go
 +++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
 @@ -600,6 +600,9 @@ func TestFlowSendWindowSettingsCost(t *testing.T) {
@@ -268,5 +268,5 @@ index 256c248ef..7d553abb4 100644
  		t.Fatalf("ten times the streams made a SETTINGS frame %d times dearer", many/few)
  	}
 -- 
-2.52.0.windows.1
+2.47.3
 

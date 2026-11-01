@@ -1,7 +1,7 @@
-From d27098e5987479f45754054230e916b43714e194 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 11:42:36 +0300
-Subject: [PATCH] XHTTP: Hold upload windows to a model of the path
+Subject: [PATCH 014/105] XHTTP: Hold upload windows to a model of the path
 
 Where the kernel vouches for the round trip of the empty path, a ramped
 upload window on a server, or download window on a client, now follows a
@@ -225,5 +225,5 @@ index 00000000..61bbddf6
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

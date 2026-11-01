@@ -1,7 +1,7 @@
-From 801cb82ad8320011140a81d38a41d9f53412da48 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 02:21:18 +0300
-Subject: [PATCH 12/12] XHTTP: Hold upload windows to the queue a PING sees
+Subject: [PATCH 012/105] XHTTP: Hold upload windows to the queue a PING sees
 
 Larger upload windows let a greedy upload fill the queue at the client's
 bottleneck, which the server's kernel cannot see. A PING's ACK waits in
@@ -294,5 +294,5 @@ index e20e8c64..28ebd060 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

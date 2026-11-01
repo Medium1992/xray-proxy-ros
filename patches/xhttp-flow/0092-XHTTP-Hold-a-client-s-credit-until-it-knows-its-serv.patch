@@ -1,7 +1,8 @@
-From d789d76ff73cf53e218dc802180df4e77f288da3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 04:38:21 +0300
-Subject: [PATCH 92/97] XHTTP: Hold a client's credit until it knows its server
+Subject: [PATCH 092/105] XHTTP: Hold a client's credit until it knows its
+ server
 
 A governed client forwarded a new stream credit beyond what its stack
 returned, against the protocol default it showed the server. When the
@@ -32,7 +33,7 @@ connection; a stock client is the control.
  create mode 100644 transport/internet/splithttp/h2flow_restock_test.go
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index ce784d731..f40fe54c2 100644
+index ce784d73..f40fe54c 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -1782,6 +1782,16 @@ func (c *flowConn) downRelease(s *flowStream) int64 {
@@ -65,7 +66,7 @@ index ce784d731..f40fe54c2 100644
  	out = append(out, 0, 0, 6, h2Settings, 0, 0, 0, 0, 0)
 diff --git a/transport/internet/splithttp/h2flow_restock_test.go b/transport/internet/splithttp/h2flow_restock_test.go
 new file mode 100644
-index 000000000..a404bc251
+index 00000000..a404bc25
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_restock_test.go
 @@ -0,0 +1,118 @@
@@ -188,5 +189,5 @@ index 000000000..a404bc251
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

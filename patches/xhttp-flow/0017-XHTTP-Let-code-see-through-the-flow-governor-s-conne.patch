@@ -1,7 +1,7 @@
-From 6511b92c78dcda8e717bf8233a459670c00777aa Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 22:02:34 +0300
-Subject: [PATCH 17/19] XHTTP: Let code see through the flow governor's
+Subject: [PATCH 017/105] XHTTP: Let code see through the flow governor's
  connection wrapper
 
 The governor wraps the accepted connection without NetConn, so code
@@ -55,5 +55,5 @@ index 00000000..1cfd2380
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

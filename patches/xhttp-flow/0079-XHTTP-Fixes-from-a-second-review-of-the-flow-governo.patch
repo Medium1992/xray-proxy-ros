@@ -1,7 +1,8 @@
-From 79693d1134854ce114aaf7b6ccfcdb1d28cf71c8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 14:54:14 +0300
-Subject: [PATCH] XHTTP: Fixes from a second review of the flow governor
+Subject: [PATCH 079/105] XHTTP: Fixes from a second review of the flow
+ governor
 
 ---
  transport/internet/splithttp/h2flow.go        |  71 +++++++++--
@@ -15,7 +16,7 @@ Subject: [PATCH] XHTTP: Fixes from a second review of the flow governor
  create mode 100644 transport/internet/splithttp/h2flow_cutaccount_test.go
 
 diff --git a/transport/internet/splithttp/h2flow.go b/transport/internet/splithttp/h2flow.go
-index 26c4c0af7..9c051e3f2 100644
+index 26c4c0af..9c051e3f 100644
 --- a/transport/internet/splithttp/h2flow.go
 +++ b/transport/internet/splithttp/h2flow.go
 @@ -48,6 +48,9 @@ const (
@@ -166,7 +167,7 @@ index 26c4c0af7..9c051e3f2 100644
  
 diff --git a/transport/internet/splithttp/h2flow_cutaccount_test.go b/transport/internet/splithttp/h2flow_cutaccount_test.go
 new file mode 100644
-index 000000000..e4df3e8cb
+index 00000000..e4df3e8c
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_cutaccount_test.go
 @@ -0,0 +1,80 @@
@@ -251,7 +252,7 @@ index 000000000..e4df3e8cb
 +	}
 +}
 diff --git a/transport/internet/splithttp/h2flow_effect.go b/transport/internet/splithttp/h2flow_effect.go
-index 7cc452aa1..8bf5e64fa 100644
+index 7cc452aa..8bf5e64f 100644
 --- a/transport/internet/splithttp/h2flow_effect.go
 +++ b/transport/internet/splithttp/h2flow_effect.go
 @@ -79,7 +79,12 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
@@ -269,7 +270,7 @@ index 7cc452aa1..8bf5e64fa 100644
  	// own cuts, this connection's or its neighbours': cuts have their gain
  	// back. Other traffic's queue at a full buffer wanders by a tenth, and
 diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
-index 6d775749a..d9da32c01 100644
+index 6d775749..d9da32c0 100644
 --- a/transport/internet/splithttp/h2flow_effect_test.go
 +++ b/transport/internet/splithttp/h2flow_effect_test.go
 @@ -192,7 +192,9 @@ func TestFlowEffectCountsDownloadsOnly(t *testing.T) {
@@ -326,7 +327,7 @@ index 6d775749a..d9da32c01 100644
  }
  
 diff --git a/transport/internet/splithttp/h2flow_guard_test.go b/transport/internet/splithttp/h2flow_guard_test.go
-index 3c9c8ff97..42c40f5aa 100644
+index 3c9c8ff9..42c40f5a 100644
 --- a/transport/internet/splithttp/h2flow_guard_test.go
 +++ b/transport/internet/splithttp/h2flow_guard_test.go
 @@ -1,6 +1,12 @@
@@ -470,7 +471,7 @@ index 3c9c8ff97..42c40f5aa 100644
 +	}
 +}
 diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
-index 03353904d..11f695f06 100644
+index 03353904..11f695f0 100644
 --- a/transport/internet/splithttp/h2flow_model_test.go
 +++ b/transport/internet/splithttp/h2flow_model_test.go
 @@ -752,6 +752,15 @@ func (m *flowModel) check(q *[]rawFrame, b []byte, to string) {
@@ -490,7 +491,7 @@ index 03353904d..11f695f06 100644
  		// the stack's initial window in a SETTINGS of its own, see
  		// appendRestock.
 diff --git a/transport/internet/splithttp/h2flow_shown_test.go b/transport/internet/splithttp/h2flow_shown_test.go
-index 222c4c36a..b9ce82397 100644
+index 222c4c36..b9ce8239 100644
 --- a/transport/internet/splithttp/h2flow_shown_test.go
 +++ b/transport/internet/splithttp/h2flow_shown_test.go
 @@ -1,6 +1,7 @@
@@ -575,5 +576,5 @@ index 222c4c36a..b9ce82397 100644
 +	return false
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

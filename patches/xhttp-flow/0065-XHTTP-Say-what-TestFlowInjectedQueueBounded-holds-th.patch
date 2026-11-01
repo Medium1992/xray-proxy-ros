@@ -1,8 +1,8 @@
-From 89e3636d0e78f5fa3c9facc753ea093192c7131d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 23:08:51 +0000
-Subject: [PATCH] XHTTP: Say what TestFlowInjectedQueueBounded holds the
- governor to
+Subject: [PATCH 065/105] XHTTP: Say what TestFlowInjectedQueueBounded holds
+ the governor to
 
 Its comment still described a queue that grows with what the client sends, and its log and failure still named wqueue, while the test measures every frame the governor queues for the client, its credit included. The credit now goes with its stream and the test fails if the queue grows; the comment, log and failure say so.
 ---
@@ -41,5 +41,5 @@ index dc97314d..eca8f756 100644
  }
  
 -- 
-2.52.0.windows.1
+2.47.3
 

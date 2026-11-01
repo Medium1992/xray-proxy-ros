@@ -1,7 +1,7 @@
-From c4711a52bd22b81305edfe3736fdfa626fa269da Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 18:48:00 +0300
-Subject: [PATCH 5/6] XHTTP: Advertise the default 16 KiB HTTP/2 frame size
+Subject: [PATCH 005/105] XHTTP: Advertise the default 16 KiB HTTP/2 frame size
 
 Go's HTTP/2 frame reader keeps a buffer as large as the largest frame
 it has read, for the life of the connection, and both sides let the
@@ -217,5 +217,5 @@ index 00000000..b217a9ce
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

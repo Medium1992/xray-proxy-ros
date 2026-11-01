@@ -1,7 +1,8 @@
-From 2d52dbf6f02e94520b5b2b22048d5eb4f972b734 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 18:20:40 +0300
-Subject: [PATCH] XHTTP: Hold a full download path's queue with a PI controller
+Subject: [PATCH 016/105] XHTTP: Hold a full download path's queue with a PI
+ controller
 
 Once a server's download stream has filled the path, as BBR judges it,
 three round trips in a row without a quarter more reader rate, its
@@ -244,5 +245,5 @@ index c94550a1..67121060 100644
  	})
  	return
 -- 
-2.52.0.windows.1
+2.47.3
 

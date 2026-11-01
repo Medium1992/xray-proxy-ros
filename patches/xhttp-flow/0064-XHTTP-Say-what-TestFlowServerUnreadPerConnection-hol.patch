@@ -1,8 +1,8 @@
-From 08b67eaaf33e7c79d0a04474312e0b2c03f058a7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 23:08:51 +0000
-Subject: [PATCH] XHTTP: Say what TestFlowServerUnreadPerConnection holds the
- governor to
+Subject: [PATCH 064/105] XHTTP: Say what TestFlowServerUnreadPerConnection
+ holds the governor to
 
 Its comment still described the governor as capping streams but not their sum. The governor now holds the connection to Go's 1 MiB, and the test fails if it holds more than 64 KiB over that; the comment says so.
 ---
@@ -25,5 +25,5 @@ index b4090bac..dc97314d 100644
  	results := map[bool]int64{}
  	for _, governed := range []bool{false, true} {
 -- 
-2.52.0.windows.1
+2.47.3
 

@@ -1,8 +1,8 @@
-From 4394b1d0953973a7b85df8de782a97a216fc2caf Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 23:08:43 +0000
-Subject: [PATCH] XHTTP: Say what the flow governor shows for uploads and what
- bounds its caps
+Subject: [PATCH 062/105] XHTTP: Say what the flow governor shows for uploads
+ and what bounds its caps
 
 The overview still described the uplink as shown a small initial window and both caps as twice what a reader took per round trip. A governed server shows Go's own 1 MiB since uploads start at the stock window, and a cap that starts at twice may follow the path model or pi.
 ---
@@ -32,5 +32,5 @@ index ed295b79..2306ac7d 100644
  // the only side of the exchange whose buffers are local. Neither peer needs to
  // know: each only ever sees a window no larger than the other side granted.
 -- 
-2.52.0.windows.1
+2.47.3
 

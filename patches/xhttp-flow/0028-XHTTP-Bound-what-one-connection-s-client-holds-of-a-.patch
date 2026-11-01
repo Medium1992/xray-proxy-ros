@@ -1,7 +1,7 @@
-From 428504b73dc78c21b92b66f5b4a192867451eb5c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 21:42:05 +0300
-Subject: [PATCH 28/28] XHTTP: Bound what one connection's client holds of a
+Subject: [PATCH 028/105] XHTTP: Bound what one connection's client holds of a
  governed server's data
 
 A stream's cap follows its own reader, but many streams that start at once on
@@ -69,10 +69,10 @@ index e3f144c4..b9cc1265 100644
  		if _, err := build(s); err == nil || !strings.Contains(err.Error(), "h2Flow") {
  			t.Errorf("%s: expected an h2Flow error, got %v", s, err)
 diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
-index be8c9cf6..2592ee51 100644
+index e9d97061..86d4d6e7 100644
 --- a/infra/conf/transport_method.go
 +++ b/infra/conf/transport_method.go
-@@ -301,11 +301,14 @@ type SplitHTTPConfig struct {
+@@ -300,11 +300,14 @@ type SplitHTTPConfig struct {
  
  // H2FlowConfig tunes HTTP/2 flow control on XHTTP connections over TCP.
  // "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
@@ -88,7 +88,7 @@ index be8c9cf6..2592ee51 100644
  }
  
  // HTTP/2 windows below the protocol's initial window would stall a stream;
-@@ -322,6 +325,7 @@ func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
+@@ -321,6 +324,7 @@ func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
  	config := &splithttp.H2FlowConfig{
  		MaxStreamReceiveWindow:     c.MaxStreamReceiveWindow,
  		MaxConnectionReceiveWindow: c.MaxConnectionReceiveWindow,
@@ -96,7 +96,7 @@ index be8c9cf6..2592ee51 100644
  	}
  	if c.Enabled != nil {
  		config.Mode = 2
-@@ -340,6 +344,9 @@ func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
+@@ -339,6 +343,9 @@ func (c *H2FlowConfig) Build() (*splithttp.H2FlowConfig, error) {
  			return nil, errors.New(`"h2Flow": "`, w.name, `" must be between `, h2FlowMinWindow, " and ", h2FlowMaxWindow)
  		}
  	}
@@ -107,7 +107,7 @@ index be8c9cf6..2592ee51 100644
  }
  
 diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
-index 24e02150..667faac9 100644
+index 8d711c36..17da192e 100644
 --- a/transport/internet/splithttp/config.pb.go
 +++ b/transport/internet/splithttp/config.pb.go
 @@ -83,8 +83,12 @@ type H2FlowConfig struct {
@@ -139,7 +139,7 @@ index 24e02150..667faac9 100644
  type XmuxConfig struct {
  	state            protoimpl.MessageState `protogen:"open.v1"`
  	MaxConcurrency   *RangeConfig           `protobuf:"bytes,1,opt,name=maxConcurrency,proto3" json:"maxConcurrency,omitempty"`
-@@ -521,11 +532,12 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+@@ -513,11 +524,12 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	")transport/internet/splithttp/config.proto\x12!xray.transport.internet.splithttp\x1a\x1ftransport/internet/config.proto\"1\n" +
  	"\vRangeConfig\x12\x12\n" +
  	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
@@ -155,7 +155,7 @@ index 24e02150..667faac9 100644
  	"XmuxConfig\x12V\n" +
  	"\x0emaxConcurrency\x18\x01 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0emaxConcurrency\x12V\n" +
 diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
-index 7b0ded79..dc8ce919 100644
+index 47faa2da..44a871fe 100644
 --- a/transport/internet/splithttp/config.proto
 +++ b/transport/internet/splithttp/config.proto
 @@ -21,6 +21,10 @@ message H2FlowConfig {
@@ -400,11 +400,11 @@ index 49782b64..8adcc3aa 100644
  // to keep Go's defaults.
  func (c *Config) h2ReceiveConfig(server bool) *http.HTTP2Config {
 diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
-index b575596c..7e124afc 100644
+index d1ddff57..6f56cb16 100644
 --- a/transport/internet/splithttp/hub.go
 +++ b/transport/internet/splithttp/hub.go
-@@ -568,7 +568,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
- 			HTTP2:             l.config.h2ReceiveConfig(true),
+@@ -578,7 +578,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 			HTTP2:             http2Config,
  		}
  		if l.config.h2FlowOn() {
 -			fl := &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
@@ -413,5 +413,5 @@ index b575596c..7e124afc 100644
  				fl.connWindow = int32(min(h2.MaxReceiveBufferPerConnection, h2MaxWindow))
  			} else {
 -- 
-2.52.0.windows.1
+2.47.3
 

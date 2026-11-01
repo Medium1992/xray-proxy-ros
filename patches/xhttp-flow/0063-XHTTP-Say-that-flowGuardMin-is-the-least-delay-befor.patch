@@ -1,8 +1,8 @@
-From 2be055b2810d1ce8222a8a9d40d5617565e83c82 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: fUS1ONd <koskriv2006@gmail.com>
 Date: Thu, 22 Oct 2026 23:08:43 +0000
-Subject: [PATCH] XHTTP: Say that flowGuardMin is the least delay before the
- guard, not the most
+Subject: [PATCH 063/105] XHTTP: Say that flowGuardMin is the least delay
+ before the guard, not the most
 
 The guard waits max(4 RTT, flowGuardMin), so a stream sits out of window at least that long before it steps in.
 ---
@@ -23,5 +23,5 @@ index 2306ac7d..341dd6d8 100644
  var flowGuardMin = 200 * time.Millisecond
  
 -- 
-2.52.0.windows.1
+2.47.3
 

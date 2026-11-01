@@ -1,7 +1,7 @@
-From 1f5b32f4733a22b0539a6531df3bb26ca71e9877 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 03:43:14 +0300
-Subject: [PATCH 86/86] XHTTP: Reach more of the flow governor from the model
+Subject: [PATCH 086/105] XHTTP: Reach more of the flow governor from the model
  and the fuzzers
 
 Half the protocol model runs send GOAWAY from step 100 to 500: a client
@@ -19,7 +19,7 @@ kernel that reports a queue.
  create mode 100644 transport/internet/splithttp/h2flow_fuzzclient_test.go
 
 diff --git a/transport/internet/splithttp/h2flow_fuzz_test.go b/transport/internet/splithttp/h2flow_fuzz_test.go
-index aade0d919..72ba15120 100644
+index aade0d91..72ba1512 100644
 --- a/transport/internet/splithttp/h2flow_fuzz_test.go
 +++ b/transport/internet/splithttp/h2flow_fuzz_test.go
 @@ -5,6 +5,7 @@ import (
@@ -54,7 +54,7 @@ index aade0d919..72ba15120 100644
  			for in := fromClient; len(in) > 0; {
 diff --git a/transport/internet/splithttp/h2flow_fuzzclient_test.go b/transport/internet/splithttp/h2flow_fuzzclient_test.go
 new file mode 100644
-index 000000000..54b8d7aab
+index 00000000..54b8d7aa
 --- /dev/null
 +++ b/transport/internet/splithttp/h2flow_fuzzclient_test.go
 @@ -0,0 +1,199 @@
@@ -258,7 +258,7 @@ index 000000000..54b8d7aab
 +	}
 +}
 diff --git a/transport/internet/splithttp/h2flow_model_test.go b/transport/internet/splithttp/h2flow_model_test.go
-index 11f695f06..421d47649 100644
+index 11f695f0..421d4764 100644
 --- a/transport/internet/splithttp/h2flow_model_test.go
 +++ b/transport/internet/splithttp/h2flow_model_test.go
 @@ -86,6 +86,7 @@ type flowModel struct {
@@ -292,5 +292,5 @@ index 11f695f06..421d47649 100644
  	m.start(false)
  	for n := 0; n < 3000 && !m.failed; n++ {
 -- 
-2.52.0.windows.1
+2.47.3
 

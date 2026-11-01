@@ -1,7 +1,7 @@
-From f6bc870986e85b5adb6eac756cff1f6b6a10094e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 23:26:36 +0300
-Subject: [PATCH 10/12] XHTTP: Format a flow governor test for gofumpt
+Subject: [PATCH 010/105] XHTTP: Format a flow governor test for gofumpt
 
 ---
  transport/internet/splithttp/h2flow_client_test.go | 3 ++-
@@ -22,5 +22,5 @@ index 250e1e6d..a77effb7 100644
  	_, addr := startFlowServer(t, sc.up, sc.down, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
  		buf := make([]byte, 32<<10)
 -- 
-2.52.0.windows.1
+2.47.3
 

@@ -1,8 +1,8 @@
-From d2e130f22987b555de731918e3979510ce5cd36e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 01:50:26 +0300
-Subject: [PATCH 18/19] XHTTP: Harden the HTTP/2 flow governor against hostile
- and unusual peers
+Subject: [PATCH 018/105] XHTTP: Harden the HTTP/2 flow governor against
+ hostile and unusual peers
 
 - Pass malformed control frames on unchanged: SETTINGS or PING off stream 0,
   SETTINGS with any invalid value, and every frame inside a HEADERS or
@@ -666,5 +666,5 @@ index a54a9048..ec60e0f3 100644
  	return c.appendPing(out)
  }
 -- 
-2.52.0.windows.1
+2.47.3
 

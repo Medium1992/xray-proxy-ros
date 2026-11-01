@@ -1,7 +1,7 @@
-From 8cd1bc395cd520361613c0c7df0184829597b529 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 11:26:48 +0300
-Subject: [PATCH] XHTTP: Count what the flow governor's client holds by
+Subject: [PATCH 030/105] XHTTP: Count what the flow governor's client holds by
  connection as well as by stream
 
 The send window counted the streams the server had not finished, so a
@@ -23,10 +23,10 @@ connection credit in small steps.
  7 files changed, 148 insertions(+), 45 deletions(-)
 
 diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
-index 753ec7c3..6aa8f51a 100644
+index 06f6e90c..013bf572 100644
 --- a/infra/conf/transport_method.go
 +++ b/infra/conf/transport_method.go
-@@ -303,7 +303,7 @@ type SplitHTTPConfig struct {
+@@ -302,7 +302,7 @@ type SplitHTTPConfig struct {
  // "enabled" overrides XRAY_XHTTP_FLOW for this inbound or outbound; the
  // receive windows are what this side grants for data it receives.
  // "maxConnectionSendWindow" is what a governed server lets one connection's
@@ -36,7 +36,7 @@ index 753ec7c3..6aa8f51a 100644
  	Enabled                    *bool `json:"enabled"`
  	MaxStreamReceiveWindow     int32 `json:"maxStreamReceiveWindow"`
 diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
-index a0e0e9be..80db30af 100644
+index e587c744..6f611523 100644
 --- a/transport/internet/splithttp/config.pb.go
 +++ b/transport/internet/splithttp/config.pb.go
 @@ -84,8 +84,8 @@ type H2FlowConfig struct {
@@ -51,7 +51,7 @@ index a0e0e9be..80db30af 100644
  	unknownFields           protoimpl.UnknownFields
  	sizeCache               protoimpl.SizeCache
 diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
-index 52dd771d..a26a544e 100644
+index f2b96840..9f550ba8 100644
 --- a/transport/internet/splithttp/config.proto
 +++ b/transport/internet/splithttp/config.proto
 @@ -22,8 +22,8 @@ message H2FlowConfig {
@@ -374,5 +374,5 @@ index d5dc8d89..9849c354 100644
  }
  
 -- 
-2.52.0.windows.1
+2.47.3
 

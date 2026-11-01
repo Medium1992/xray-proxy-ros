@@ -1,8 +1,8 @@
-From a93306864bc7eda2a144c36355bc4ea46c529174 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 15:23:40 +0300
-Subject: [PATCH] XHTTP: Cover flow governor credit in both ramp states, time
- SETTINGS frames the clock can tell
+Subject: [PATCH 045/105] XHTTP: Cover flow governor credit in both ramp
+ states, time SETTINGS frames the clock can tell
 
 Each credit test runs with the stream speeding up and no longer; connection credit comes before the stream's and after, alone for a request whose body has ended, and follows a cap that opens. The SETTINGS cost test doubles its number of frames until two hundred streams take two milliseconds instead of skipping where they read as zero.
 ---
@@ -11,7 +11,7 @@ Each credit test runs with the stream speeding up and no longer; connection cred
  2 files changed, 211 insertions(+), 75 deletions(-)
 
 diff --git a/transport/internet/splithttp/h2flow_credit_test.go b/transport/internet/splithttp/h2flow_credit_test.go
-index 4a38fbb10..e417c9e43 100644
+index 4a38fbb1..e417c9e4 100644
 --- a/transport/internet/splithttp/h2flow_credit_test.go
 +++ b/transport/internet/splithttp/h2flow_credit_test.go
 @@ -29,44 +29,173 @@ func windowUpdates(t *testing.T, b []byte, count map[uint32]int, sum map[uint32]
@@ -291,7 +291,7 @@ index 4a38fbb10..e417c9e43 100644
  	}
  }
 diff --git a/transport/internet/splithttp/h2flow_sendwindow_test.go b/transport/internet/splithttp/h2flow_sendwindow_test.go
-index d58f135bc..e3b8b343a 100644
+index d58f135b..e3b8b343 100644
 --- a/transport/internet/splithttp/h2flow_sendwindow_test.go
 +++ b/transport/internet/splithttp/h2flow_sendwindow_test.go
 @@ -583,26 +583,40 @@ func feedFrames(tb testing.TB, h *flowHarness, frame []byte, n int) {
@@ -354,5 +354,5 @@ index d58f135bc..e3b8b343a 100644
  // allocated nothing would show only there.
  func TestFlowSendWindowConnectionCreditAllocs(t *testing.T) {
 -- 
-2.52.0.windows.1
+2.47.3
 

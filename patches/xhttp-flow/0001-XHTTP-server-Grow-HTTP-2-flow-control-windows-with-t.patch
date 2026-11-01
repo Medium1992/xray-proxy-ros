@@ -1,8 +1,8 @@
-From 7e62c3cf8dfa4a5633b0032a389f016b2c5dcaab Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 15:58:24 +0300
-Subject: [PATCH 1/6] XHTTP server: Grow HTTP/2 flow control windows with the
- reader
+Subject: [PATCH 001/105] XHTTP server: Grow HTTP/2 flow control windows with
+ the reader
 
 Go's HTTP/2 grants fixed windows: 1 MiB per stream on the server and 4 MiB
 per stream on Go clients. A reader that stops consuming leaves that much
@@ -2210,17 +2210,17 @@ index 00000000..2755c339
 +	}
 +}
 diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
-index be39f86b..2d97d7af 100644
+index 5ec3173d..d48587e6 100644
 --- a/transport/internet/splithttp/hub.go
 +++ b/transport/internet/splithttp/hub.go
-@@ -577,6 +577,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
- 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+@@ -575,6 +575,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
  			Protocols:         protocols,
+ 			HTTP2:             http2Config,
  		}
 +		l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
  		go func() {
  			if err := l.server.Serve(l.listener); err != nil {
  				errors.LogErrorInner(ctx, err, "failed to serve HTTP for XHTTP")
 -- 
-2.52.0.windows.1
+2.47.3
 

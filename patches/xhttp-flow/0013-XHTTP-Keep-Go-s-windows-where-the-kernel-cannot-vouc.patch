@@ -1,8 +1,8 @@
-From 5be2c15909acaf478387e4901011ae9e9df3ffb0 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 02:52:00 +0300
-Subject: [PATCH] XHTTP: Keep Go's windows where the kernel cannot vouch for
- the round trip
+Subject: [PATCH 013/105] XHTTP: Keep Go's windows where the kernel cannot
+ vouch for the round trip
 
 The queue hold measures the queue against the round trip of the empty
 path. Behind a TCP proxy, or where the kernel has no TCP statistics, only
@@ -107,5 +107,5 @@ index 28ebd060..29ae4103 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

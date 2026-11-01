@@ -1,8 +1,8 @@
-From d5bd67c1b76ce590525751ca646bc187ef43096e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 13:18:08 +0300
-Subject: [PATCH 37/38] XHTTP: Let a flow governor stream hold a frame whatever
- the stack is shown, drop the queue
+Subject: [PATCH 037/105] XHTTP: Let a flow governor stream hold a frame
+ whatever the stack is shown, drop the queue
 
 The queue of streams the send window kept credit from missed room the server
 freed, walked itself for every client frame where the room was under a
@@ -455,5 +455,5 @@ index f3fe0c00..d8231cee 100644
  }
  
 -- 
-2.52.0.windows.1
+2.47.3
 

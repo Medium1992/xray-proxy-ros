@@ -1,8 +1,8 @@
-From 3b2e30d7e2bd4fd1c64ddabe8524234a59d1131b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jolymmiles <75259437+Jolymmiles@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 10:05:09 +0300
-Subject: [PATCH] XHTTP: Send the flow governor's first PING after the client
- preface
+Subject: [PATCH 023/105] XHTTP: Send the flow governor's first PING after the
+ client preface
 
 On a TLS inbound the server writes its SETTINGS before the client preface;
 the governor then sent its first PING at once, which a silent prober could
@@ -115,5 +115,5 @@ index acb42d9c..6d5ec8e5 100644
  // TestFlowListenerGovernsTLSHTTP2 with the client preface sent first, to
  // separate whether the governor rewrites the SETTINGS from when they leave.
 -- 
-2.52.0.windows.1
+2.47.3
 

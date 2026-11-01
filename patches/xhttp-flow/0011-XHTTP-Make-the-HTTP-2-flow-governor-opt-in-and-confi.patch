@@ -1,7 +1,7 @@
-From 5905737ca10d107eeef93227e2b0de7693820baa Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <122653016+Medium1992@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 02:21:41 +0300
-Subject: [PATCH 11/12] XHTTP: Make the HTTP/2 flow governor opt-in and
+Subject: [PATCH 011/105] XHTTP: Make the HTTP/2 flow governor opt-in and
  configurable
 
 The governor is now off unless XRAY_XHTTP_FLOW=on, and each inbound or
@@ -35,8 +35,8 @@ Clients without this change ignore "h2Flow".
  .../internet/splithttp/h2flow_transport.go    |  62 +++++
  .../splithttp/h2flow_transport_legacy.go      |  15 ++
  .../splithttp/h2flow_transport_wrap.go        |  18 ++
- transport/internet/splithttp/hub.go           |   3 +-
- 11 files changed, 572 insertions(+), 38 deletions(-)
+ transport/internet/splithttp/hub.go           |   8 +-
+ 11 files changed, 575 insertions(+), 40 deletions(-)
  create mode 100644 infra/conf/transport_h2flow_test.go
  create mode 100644 transport/internet/splithttp/h2flow_config_test.go
  create mode 100644 transport/internet/splithttp/h2flow_transport.go
@@ -108,10 +108,10 @@ index 00000000..e3f144c4
 +	}
 +}
 diff --git a/infra/conf/transport_method.go b/infra/conf/transport_method.go
-index eadc0519..ca5e8dfa 100644
+index 826d074f..e9d97061 100644
 --- a/infra/conf/transport_method.go
 +++ b/infra/conf/transport_method.go
-@@ -285,12 +285,57 @@ type SplitHTTPConfig struct {
+@@ -290,6 +290,7 @@ type SplitHTTPConfig struct {
  	ScMinPostsIntervalMs Int32Range        `json:"scMinPostsIntervalMs"`
  	ScMaxBufferedPosts   int64             `json:"scMaxBufferedPosts"`
  	ScStreamUpServerSecs Int32Range        `json:"scStreamUpServerSecs"`
@@ -119,6 +119,7 @@ index eadc0519..ca5e8dfa 100644
  	ServerMaxHeaderBytes int32             `json:"serverMaxHeaderBytes"`
  	Xmux                 XmuxConfig        `json:"xmux"`
  	DownloadSettings     *StreamConfig     `json:"downloadSettings"`
+@@ -297,6 +298,50 @@ type SplitHTTPConfig struct {
  	Extra                json.RawMessage   `json:"extra"`
  }
  
@@ -169,7 +170,7 @@ index eadc0519..ca5e8dfa 100644
  type XmuxConfig struct {
  	MaxConcurrency   Int32Range `json:"maxConcurrency"`
  	MaxConnections   Int32Range `json:"maxConnections"`
-@@ -500,11 +545,15 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
+@@ -507,11 +552,15 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
  		},
  	}
  
@@ -187,7 +188,7 @@ index eadc0519..ca5e8dfa 100644
  			return nil, errors.New(`Failed to build "downloadSettings".`).Base(err)
  		}
 diff --git a/transport/internet/splithttp/config.pb.go b/transport/internet/splithttp/config.pb.go
-index c7dfe4ce..c733af36 100644
+index 9ab55b98..8d711c36 100644
 --- a/transport/internet/splithttp/config.pb.go
 +++ b/transport/internet/splithttp/config.pb.go
 @@ -74,6 +74,70 @@ func (x *RangeConfig) GetTo() int32 {
@@ -288,10 +289,10 @@ index c7dfe4ce..c733af36 100644
  }
  
  func (x *XmuxConfig) GetMaxConcurrency() *RangeConfig {
-@@ -189,13 +253,14 @@ type Config struct {
- 	ServerMaxHeaderBytes int32                  `protobuf:"varint,27,opt,name=serverMaxHeaderBytes,proto3" json:"serverMaxHeaderBytes,omitempty"`
+@@ -190,13 +254,14 @@ type Config struct {
  	SessionIDTable       string                 `protobuf:"bytes,28,opt,name=sessionIDTable,proto3" json:"sessionIDTable,omitempty"`
  	SessionIDLength      *RangeConfig           `protobuf:"bytes,29,opt,name=sessionIDLength,proto3" json:"sessionIDLength,omitempty"`
+ 	H2Params             []byte                 `protobuf:"bytes,30,opt,name=h2Params,proto3" json:"h2Params,omitempty"`
 +	H2Flow               *H2FlowConfig          `protobuf:"bytes,32,opt,name=h2Flow,proto3" json:"h2Flow,omitempty"`
  	unknownFields        protoimpl.UnknownFields
  	sizeCache            protoimpl.SizeCache
@@ -304,7 +305,7 @@ index c7dfe4ce..c733af36 100644
  	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
  	ms.StoreMessageInfo(mi)
  }
-@@ -207,7 +272,7 @@ func (x *Config) String() string {
+@@ -208,7 +273,7 @@ func (x *Config) String() string {
  func (*Config) ProtoMessage() {}
  
  func (x *Config) ProtoReflect() protoreflect.Message {
@@ -313,7 +314,7 @@ index c7dfe4ce..c733af36 100644
  	if x != nil {
  		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
  		if ms.LoadMessageInfo() == nil {
-@@ -220,7 +285,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
+@@ -221,7 +286,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
  
  // Deprecated: Use Config.ProtoReflect.Descriptor instead.
  func (*Config) Descriptor() ([]byte, []int) {
@@ -322,7 +323,7 @@ index c7dfe4ce..c733af36 100644
  }
  
  func (x *Config) GetHost() string {
-@@ -426,6 +491,13 @@ func (x *Config) GetSessionIDLength() *RangeConfig {
+@@ -434,6 +499,13 @@ func (x *Config) GetH2Params() []byte {
  	return nil
  }
  
@@ -336,7 +337,7 @@ index c7dfe4ce..c733af36 100644
  var File_transport_internet_splithttp_config_proto protoreflect.FileDescriptor
  
  const file_transport_internet_splithttp_config_proto_rawDesc = "" +
-@@ -433,7 +505,11 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+@@ -441,7 +513,11 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	")transport/internet/splithttp/config.proto\x12!xray.transport.internet.splithttp\x1a\x1ftransport/internet/config.proto\"1\n" +
  	"\vRangeConfig\x12\x12\n" +
  	"\x04from\x18\x01 \x01(\x05R\x04from\x12\x0e\n" +
@@ -349,26 +350,26 @@ index c7dfe4ce..c733af36 100644
  	"\n" +
  	"XmuxConfig\x12V\n" +
  	"\x0emaxConcurrency\x18\x01 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0emaxConcurrency\x12V\n" +
-@@ -441,7 +517,7 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
+@@ -449,7 +525,7 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	"\x0ecMaxReuseTimes\x18\x03 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0ecMaxReuseTimes\x12Z\n" +
  	"\x10hMaxRequestTimes\x18\x04 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxRequestTimes\x12Z\n" +
  	"\x10hMaxReusableSecs\x18\x05 \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x10hMaxReusableSecs\x12*\n" +
--	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xcc\f\n" +
-+	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\x95\r\n" +
+-	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xe8\f\n" +
++	"\x10hKeepAlivePeriod\x18\x06 \x01(\x03R\x10hKeepAlivePeriod\"\xb1\r\n" +
  	"\x06Config\x12\x12\n" +
  	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
  	"\x04path\x18\x02 \x01(\tR\x04path\x12\x12\n" +
-@@ -472,7 +548,8 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
- 	"\x0fuplinkChunkSize\x18\x1a \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fuplinkChunkSize\x122\n" +
+@@ -481,7 +557,8 @@ const file_transport_internet_splithttp_config_proto_rawDesc = "" +
  	"\x14serverMaxHeaderBytes\x18\x1b \x01(\x05R\x14serverMaxHeaderBytes\x12&\n" +
  	"\x0esessionIDTable\x18\x1c \x01(\tR\x0esessionIDTable\x12X\n" +
--	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x1a:\n" +
-+	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12G\n" +
+ 	"\x0fsessionIDLength\x18\x1d \x01(\v2..xray.transport.internet.splithttp.RangeConfigR\x0fsessionIDLength\x12\x1a\n" +
+-	"\bh2Params\x18\x1e \x01(\fR\bh2Params\x1a:\n" +
++	"\bh2Params\x18\x1e \x01(\fR\bh2Params\x12G\n" +
 +	"\x06h2Flow\x18  \x01(\v2/.xray.transport.internet.splithttp.H2FlowConfigR\x06h2Flow\x1a:\n" +
  	"\fHeadersEntry\x12\x10\n" +
  	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
  	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x85\x01\n" +
-@@ -490,13 +567,14 @@ func file_transport_internet_splithttp_config_proto_rawDescGZIP() []byte {
+@@ -499,13 +576,14 @@ func file_transport_internet_splithttp_config_proto_rawDescGZIP() []byte {
  	return file_transport_internet_splithttp_config_proto_rawDescData
  }
  
@@ -388,7 +389,7 @@ index c7dfe4ce..c733af36 100644
  }
  var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
  	0,  // 0: xray.transport.internet.splithttp.XmuxConfig.maxConcurrency:type_name -> xray.transport.internet.splithttp.RangeConfig
-@@ -504,20 +582,21 @@ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
+@@ -513,20 +591,21 @@ var file_transport_internet_splithttp_config_proto_depIdxs = []int32{
  	0,  // 2: xray.transport.internet.splithttp.XmuxConfig.cMaxReuseTimes:type_name -> xray.transport.internet.splithttp.RangeConfig
  	0,  // 3: xray.transport.internet.splithttp.XmuxConfig.hMaxRequestTimes:type_name -> xray.transport.internet.splithttp.RangeConfig
  	0,  // 4: xray.transport.internet.splithttp.XmuxConfig.hMaxReusableSecs:type_name -> xray.transport.internet.splithttp.RangeConfig
@@ -418,7 +419,7 @@ index c7dfe4ce..c733af36 100644
  }
  
  func init() { file_transport_internet_splithttp_config_proto_init() }
-@@ -531,7 +610,7 @@ func file_transport_internet_splithttp_config_proto_init() {
+@@ -540,7 +619,7 @@ func file_transport_internet_splithttp_config_proto_init() {
  			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
  			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_internet_splithttp_config_proto_rawDesc), len(file_transport_internet_splithttp_config_proto_rawDesc)),
  			NumEnums:      0,
@@ -428,7 +429,7 @@ index c7dfe4ce..c733af36 100644
  			NumServices:   0,
  		},
 diff --git a/transport/internet/splithttp/config.proto b/transport/internet/splithttp/config.proto
-index efe6de03..2f4d24ab 100644
+index dac5f0f7..47faa2da 100644
 --- a/transport/internet/splithttp/config.proto
 +++ b/transport/internet/splithttp/config.proto
 @@ -13,6 +13,16 @@ message RangeConfig {
@@ -448,10 +449,10 @@ index efe6de03..2f4d24ab 100644
  message XmuxConfig {
    RangeConfig maxConcurrency = 1;
    RangeConfig maxConnections = 2;
-@@ -52,4 +62,5 @@ message Config {
-   int32 serverMaxHeaderBytes = 27;
+@@ -53,4 +63,5 @@ message Config {
    string sessionIDTable = 28;
    RangeConfig sessionIDLength = 29;
+   bytes h2Params = 30;
 +  H2FlowConfig h2Flow = 32;
  }
 diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
@@ -871,14 +872,26 @@ index 00000000..b0e375fa
 +	t1.TLSClientConfig = nil
 +}
 diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
-index 62aa7afe..f7a93014 100644
+index a06684d7..340eb2d0 100644
 --- a/transport/internet/splithttp/hub.go
 +++ b/transport/internet/splithttp/hub.go
-@@ -562,8 +562,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
- 			ReadHeaderTimeout: time.Second * 4,
- 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+@@ -556,9 +556,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 
+ 		handler.localAddr = l.listener.Addr()
+ 
+-		var http2Config *http.HTTP2Config
++		http2Config := l.config.h2ReceiveConfig(true)
+ 		if len(l.config.H2Params) > 0 {
+-			http2Config = new(http.HTTP2Config)
++			if http2Config == nil {
++				http2Config = new(http.HTTP2Config)
++			}
+ 			if err := json.Unmarshal(l.config.H2Params, http2Config); err != nil {
+ 				return nil, errors.New("failed to parse HTTP2Config").Base(err)
+ 			}
+@@ -575,7 +577,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
  			Protocols:         protocols,
-+			HTTP2:             l.config.h2ReceiveConfig(true),
+ 			HTTP2:             http2Config,
  		}
 -		if flowEnabled {
 +		if l.config.h2FlowOn() {
@@ -886,5 +899,5 @@ index 62aa7afe..f7a93014 100644
  		}
  		go func() {
 -- 
-2.52.0.windows.1
+2.47.3
 

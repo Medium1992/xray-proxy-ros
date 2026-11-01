@@ -1,7 +1,7 @@
-From 7ffc37b11432fdf1fb7784783204f26bf5a7fd0d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Medium1992 <Medium1992@users.noreply.github.com>
 Date: Tue, 27 Oct 2026 04:38:23 +0300
-Subject: [PATCH 96/97] XHTTP: Judge a first cut with nothing in flight later
+Subject: [PATCH 096/105] XHTTP: Judge a first cut with nothing in flight later
 
 The first cut of a measurement is judged from what was in flight in the
 round before it. A peer that acknowledges all it was sent before it
@@ -17,7 +17,7 @@ it.
  2 files changed, 59 insertions(+)
 
 diff --git a/transport/internet/splithttp/h2flow_effect.go b/transport/internet/splithttp/h2flow_effect.go
-index 34f423e23..5d544cbfb 100644
+index 34f423e2..5d544cbf 100644
 --- a/transport/internet/splithttp/h2flow_effect.go
 +++ b/transport/internet/splithttp/h2flow_effect.go
 @@ -116,6 +116,14 @@ func (e *flowEffect) note(now time.Time, rtt, minRTT, set time.Duration, inFligh
@@ -36,7 +36,7 @@ index 34f423e23..5d544cbfb 100644
  		e.gain = min(max((1-e.queue/e.qTop)/cut, 0), 1)
  		e.start(x, c)
 diff --git a/transport/internet/splithttp/h2flow_effect_test.go b/transport/internet/splithttp/h2flow_effect_test.go
-index a7e6fafe8..4a8ac7a3f 100644
+index a7e6fafe..4a8ac7a3 100644
 --- a/transport/internet/splithttp/h2flow_effect_test.go
 +++ b/transport/internet/splithttp/h2flow_effect_test.go
 @@ -320,3 +320,54 @@ func TestFlowEffectDoesNotAttributePreCutFlightDrop(t *testing.T) {
@@ -95,5 +95,5 @@ index a7e6fafe8..4a8ac7a3f 100644
 +	}
 +}
 -- 
-2.52.0.windows.1
+2.47.3
 

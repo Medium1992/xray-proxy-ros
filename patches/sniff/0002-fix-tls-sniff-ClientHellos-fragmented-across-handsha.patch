@@ -1,0 +1,786 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 00:05:41 +0300
+Subject: [PATCH 2/3] fix(tls): sniff ClientHellos fragmented across handshake
+ records
+
+From Jolymmiles/Xray-core (d3fcd37b, with 5e7bb42e and cc8ae360 in the
+same file): a ClientHello carried in several TLS records, as RFC 8446,
+section 5.1 allows and as DPI-bypass tools split it, was not sniffed, so
+its flow lost its server name for domain routing and destOverride. The
+sniffer now reads the handshake across records and waits for the rest.
+
+The sniffer taken as it is there, with its tests and the Chrome, Firefox
+and curl ClientHellos they read. Against the sniffer before, the record
+tests fail: "with 100-byte records: SniffTLS() = (<nil>, not client
+hello), want chrome.sniff.test".
+
+Co-authored-by: TaiLer <tailer@localhost>
+Co-authored-by: Jolymmiles <75259437+Jolymmiles@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/protocol/tls/sniff.go                  | 140 +++++++++++++++---
+ common/protocol/tls/sniff_fuzz_test.go        |  90 +++++++++++
+ common/protocol/tls/sniff_performance_test.go | 115 ++++++++++++++
+ common/protocol/tls/sniff_records_test.go     | 102 +++++++++++++
+ common/protocol/tls/testdata/LICENSE-MIT      |   7 +
+ common/protocol/tls/testdata/PROVENANCE.md    |  17 +++
+ .../protocol/tls/testdata/tls-chrome153.bin   | Bin 0 -> 1957 bytes
+ .../tls/testdata/tls-curl8.18-openssl3.5.bin  | Bin 0 -> 1575 bytes
+ .../tls/testdata/tls-firefox153esr.bin        | Bin 0 -> 1901 bytes
+ 9 files changed, 447 insertions(+), 24 deletions(-)
+ create mode 100644 common/protocol/tls/sniff_fuzz_test.go
+ create mode 100644 common/protocol/tls/sniff_performance_test.go
+ create mode 100644 common/protocol/tls/sniff_records_test.go
+ create mode 100644 common/protocol/tls/testdata/LICENSE-MIT
+ create mode 100644 common/protocol/tls/testdata/PROVENANCE.md
+ create mode 100644 common/protocol/tls/testdata/tls-chrome153.bin
+ create mode 100644 common/protocol/tls/testdata/tls-curl8.18-openssl3.5.bin
+ create mode 100644 common/protocol/tls/testdata/tls-firefox153esr.bin
+
+diff --git a/common/protocol/tls/sniff.go b/common/protocol/tls/sniff.go
+index 77c0abe2..4c55d2be 100644
+--- a/common/protocol/tls/sniff.go
++++ b/common/protocol/tls/sniff.go
+@@ -3,6 +3,7 @@ package tls
+ import (
+ 	"encoding/binary"
+ 	"errors"
++	"strings"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/protocol"
+@@ -20,6 +21,14 @@ func (h *SniffHeader) Domain() string {
+ 	return h.domain
+ }
+ 
++func (h *SniffHeader) DomainNormalized() bool {
++	return true
++}
++
++func (h *SniffHeader) NormalizedProtocolDomain() (string, string) {
++	return "tls", h.domain
++}
++
+ var (
+ 	errNotTLS         = errors.New("not TLS header")
+ 	errNotClientHello = errors.New("not client hello")
+@@ -32,96 +41,112 @@ func IsValidTLSVersion(major, minor byte) bool {
+ // ReadClientHello returns server name (if any) from TLS client hello message.
+ // https://github.com/golang/go/blob/master/src/crypto/tls/handshake_messages.go#L300
+ func ReadClientHello(data []byte, h *SniffHeader) error {
++	domain, err := readClientHelloServerName(data)
++	if err == nil {
++		h.domain = domain
++	}
++	return err
++}
++
++func readClientHelloServerName(data []byte) (string, error) {
+ 	if len(data) < 42 {
+-		return common.ErrNoClue
++		return "", common.ErrNoClue
+ 	}
+ 	sessionIDLen := int(data[38])
+ 	if sessionIDLen > 32 || len(data) < 39+sessionIDLen {
+-		return common.ErrNoClue
++		return "", common.ErrNoClue
+ 	}
+ 	data = data[39+sessionIDLen:]
+ 	if len(data) < 2 {
+-		return common.ErrNoClue
++		return "", common.ErrNoClue
+ 	}
+ 	// cipherSuiteLen is the number of bytes of cipher suite numbers. Since
+ 	// they are uint16s, the number must be even.
+ 	cipherSuiteLen := int(data[0])<<8 | int(data[1])
+ 	if cipherSuiteLen%2 == 1 || len(data) < 2+cipherSuiteLen {
+-		return errNotClientHello
++		return "", errNotClientHello
+ 	}
+ 	data = data[2+cipherSuiteLen:]
+ 	if len(data) < 1 {
+-		return common.ErrNoClue
++		return "", common.ErrNoClue
+ 	}
+ 	compressionMethodsLen := int(data[0])
+ 	if len(data) < 1+compressionMethodsLen {
+-		return common.ErrNoClue
++		return "", common.ErrNoClue
+ 	}
+ 	data = data[1+compressionMethodsLen:]
+ 
+ 	if len(data) < 2 {
+-		return errNotClientHello
++		return "", errNotClientHello
+ 	}
+ 
+ 	extensionsLength := int(data[0])<<8 | int(data[1])
+ 	data = data[2:]
+ 	if extensionsLength != len(data) {
+-		return errNotClientHello
++		return "", errNotClientHello
+ 	}
+ 
+ 	for len(data) != 0 {
+ 		if len(data) < 4 {
+-			return errNotClientHello
++			return "", errNotClientHello
+ 		}
+ 		extension := uint16(data[0])<<8 | uint16(data[1])
+ 		length := int(data[2])<<8 | int(data[3])
+ 		data = data[4:]
+ 		if len(data) < length {
+-			return errNotClientHello
++			return "", errNotClientHello
+ 		}
+ 
+ 		if extension == 0x00 { /* extensionServerName */
+ 			d := data[:length]
+ 			if len(d) < 2 {
+-				return errNotClientHello
++				return "", errNotClientHello
+ 			}
+ 			namesLen := int(d[0])<<8 | int(d[1])
+ 			d = d[2:]
+ 			if len(d) != namesLen {
+-				return errNotClientHello
++				return "", errNotClientHello
+ 			}
+ 			for len(d) > 0 {
+ 				if len(d) < 3 {
+-					return errNotClientHello
++					return "", errNotClientHello
+ 				}
+ 				nameType := d[0]
+ 				nameLen := int(d[1])<<8 | int(d[2])
+ 				d = d[3:]
+ 				if len(d) < nameLen {
+-					return errNotClientHello
++					return "", errNotClientHello
+ 				}
+ 				if nameType == 0 {
+ 					// RFC 6066 requires a non-empty HostName.
+ 					if nameLen == 0 {
+-						return errNotClientHello
++						return "", errNotClientHello
+ 					}
+ 					// QUIC separated across packets
+ 					// May cause the serverName to be incomplete
++					normalized := true
+ 					b := byte(0)
+ 					for _, b = range d[:nameLen] {
+ 						if b <= ' ' {
+-							return protocol.ErrProtoNeedMoreData
++							return "", protocol.ErrProtoNeedMoreData
++						}
++						if b-'A' <= 'Z'-'A' || b >= 0x80 {
++							normalized = false
+ 						}
+ 					}
+ 					// An SNI value may not include a
+ 					// trailing dot. See
+ 					// https://tools.ietf.org/html/rfc6066#section-3.
+ 					if b == '.' {
+-						return errNotClientHello
++						return "", errNotClientHello
++					}
++					var serverName string
++					if normalized {
++						serverName = string(d[:nameLen])
++					} else {
++						serverName = normalizeServerName(d[:nameLen])
+ 					}
+-					serverName := string(d[:nameLen])
+-					h.domain = serverName
+-					return nil
++					return serverName, nil
+ 				}
+ 				d = d[nameLen:]
+ 			}
+@@ -129,7 +154,24 @@ func ReadClientHello(data []byte, h *SniffHeader) error {
+ 		data = data[length:]
+ 	}
+ 
+-	return errNotTLS
++	return "", errNotTLS
++}
++
++func normalizeServerName(value []byte) string {
++	for _, character := range value {
++		if character >= 0x80 {
++			return strings.ToLower(string(value))
++		}
++	}
++	var normalized strings.Builder
++	normalized.Grow(len(value))
++	for _, character := range value {
++		if character >= 'A' && character <= 'Z' {
++			character += 'a' - 'A'
++		}
++		normalized.WriteByte(character)
++	}
++	return normalized.String()
+ }
+ 
+ func SniffTLS(b []byte) (*SniffHeader, error) {
+@@ -148,10 +190,60 @@ func SniffTLS(b []byte) (*SniffHeader, error) {
+ 		return nil, common.ErrNoClue
+ 	}
+ 
+-	h := &SniffHeader{}
+-	err := ReadClientHello(b[5:5+headerLen], h)
++	hello := b[5 : 5+headerLen]
++	if length, ok := HandshakeMessageLength(hello); !ok || length > len(hello) {
++		var err error
++		if hello, err = reassembleClientHello(b); err != nil {
++			return nil, err
++		}
++	}
++	domain, err := readClientHelloServerName(hello)
+ 	if err == nil {
+-		return h, nil
++		return &SniffHeader{domain: domain}, nil
+ 	}
+ 	return nil, err
+ }
++
++// MaxClientHelloLength bounds the ClientHello the TLS and QUIC sniffers
++// reassemble. The dispatcher caches less than this of a connection.
++const MaxClientHelloLength = 32 * 1024
++
++// HandshakeMessageLength returns the length, header included, of the
++// handshake message at the start of b, once its 4-byte header is there.
++func HandshakeMessageLength(b []byte) (int, bool) {
++	if len(b) < 4 {
++		return 0, false
++	}
++	return 4 + (int(b[1])<<16 | int(b[2])<<8 | int(b[3])), true
++}
++
++// reassembleClientHello returns the ClientHello carried by the handshake
++// records at the start of b when it does not fit the first one: a client may
++// fragment it across records (RFC 8446, Section 5.1), as Xray's fragment mask
++// does.
++func reassembleClientHello(b []byte) ([]byte, error) {
++	var message []byte
++	for {
++		if len(b) < 5 {
++			return nil, protocol.ErrProtoNeedMoreData
++		}
++		if b[0] != 0x16 /* TLS Handshake */ || !IsValidTLSVersion(b[1], b[2]) {
++			// Another record interrupted the ClientHello.
++			return nil, errNotClientHello
++		}
++		recordLen := int(binary.BigEndian.Uint16(b[3:5]))
++		if 5+recordLen > len(b) {
++			return nil, protocol.ErrProtoNeedMoreData
++		}
++		message = append(message, b[5:5+recordLen]...)
++		b = b[5+recordLen:]
++		if length, ok := HandshakeMessageLength(message); ok {
++			if message[0] != 0x01 /* client_hello */ || length > MaxClientHelloLength {
++				return nil, errNotClientHello
++			}
++			if len(message) >= length {
++				return message[:length], nil
++			}
++		}
++	}
++}
+diff --git a/common/protocol/tls/sniff_fuzz_test.go b/common/protocol/tls/sniff_fuzz_test.go
+new file mode 100644
+index 00000000..d6b5c8d5
+--- /dev/null
++++ b/common/protocol/tls/sniff_fuzz_test.go
+@@ -0,0 +1,90 @@
++package tls_test
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++
++	. "github.com/xtls/xray-core/common/protocol/tls"
++)
++
++// tlsCorpusSeeds returns the captured first records of the corpus.
++func tlsCorpusSeeds(f *testing.F) [][]byte {
++	f.Helper()
++	paths, err := filepath.Glob(filepath.Join("testdata", "*.bin"))
++	if err != nil || len(paths) == 0 {
++		f.Fatalf("no TLS corpus: %v", err)
++	}
++	var seeds [][]byte
++	for _, path := range paths {
++		record, err := os.ReadFile(path)
++		if err != nil {
++			f.Fatal(err)
++		}
++		seeds = append(seeds, record)
++	}
++	return seeds
++}
++
++// nameFromInput reports whether name, as ReadClientHello reports it, comes
++// from data: it is the bytes of data, or their lower-case form. A host_name
++// of zero bytes, which RFC 6066 does not allow, comes out as an empty name,
++// which the dispatcher does not route by. A name with bytes outside ASCII,
++// which RFC 6066 does not allow either, is lower-cased as UTF-8, invalid
++// sequences becoming U+FFFD, so only ASCII names are checked against data.
++func nameFromInput(name string, data []byte) bool {
++	for i := range len(name) {
++		if name[i] >= 0x80 {
++			return true
++		}
++	}
++	return name == "" || bytes.Contains(data, []byte(name)) || bytes.Contains(bytes.ToLower(data), []byte(name))
++}
++
++// ReadClientHello parses a handshake message a client chose, from TLS records
++// or QUIC CRYPTO frames. Whatever it holds, it must not panic, and a server
++// name it reports must come from the message.
++func FuzzReadClientHello(f *testing.F) {
++	for _, record := range tlsCorpusSeeds(f) {
++		f.Add(record[5:])
++	}
++	f.Fuzz(func(t *testing.T, hello []byte) {
++		var header SniffHeader
++		if err := ReadClientHello(hello, &header); err == nil && !nameFromInput(header.Domain(), hello) {
++			t.Fatalf("server name %q is not in the ClientHello", header.Domain())
++		}
++	})
++}
++
++// recordPayloads returns the handshake bytes TLS records carry, without
++// their 5-byte headers, as SniffTLS reassembles a ClientHello across records.
++func recordPayloads(records []byte) []byte {
++	var payload []byte
++	for len(records) >= 5 {
++		n := min(int(records[3])<<8|int(records[4]), len(records)-5)
++		payload = append(payload, records[5:5+n]...)
++		records = records[5+n:]
++	}
++	return payload
++}
++
++// SniffTLS reads TLS records the dispatcher borrows and forwards afterwards.
++// Whatever they hold, it must not panic or modify them, and a server name it
++// reports must come from the handshake bytes they carry.
++func FuzzSniffTLS(f *testing.F) {
++	for _, record := range tlsCorpusSeeds(f) {
++		f.Add(record)
++		f.Add(record[:len(record)/2])
++	}
++	f.Fuzz(func(t *testing.T, records []byte) {
++		sent := bytes.Clone(records)
++		header, err := SniffTLS(records)
++		if !bytes.Equal(records, sent) {
++			t.Fatal("SniffTLS modified its input")
++		}
++		if err == nil && !nameFromInput(header.Domain(), recordPayloads(records)) {
++			t.Fatalf("server name %q is not in the records", header.Domain())
++		}
++	})
++}
+diff --git a/common/protocol/tls/sniff_performance_test.go b/common/protocol/tls/sniff_performance_test.go
+new file mode 100644
+index 00000000..81b61d63
+--- /dev/null
++++ b/common/protocol/tls/sniff_performance_test.go
+@@ -0,0 +1,115 @@
++package tls
++
++import (
++	"encoding/binary"
++	"strings"
++	"testing"
++)
++
++var (
++	sniffTLSBenchmarkSink       *SniffHeader
++	sniffTLSDomainBenchmarkSink string
++)
++
++func invalidClientHelloRecord() []byte {
++	record := make([]byte, 47)
++	record[0], record[1], record[2] = 0x16, 0x03, 0x01
++	binary.BigEndian.PutUint16(record[3:5], 42)
++	return record
++}
++
++func benchmarkClientHello(serverName string) []byte {
++	nameLength := len(serverName)
++	serverNameListLength := 1 + 2 + nameLength
++	serverNameExtensionLength := 2 + serverNameListLength
++	extensionsLength := 4 + serverNameExtensionLength
++	handshakeLength := 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensionsLength
++	record := make([]byte, 5+handshakeLength)
++	record[0], record[1], record[2] = 0x16, 0x03, 0x01
++	binary.BigEndian.PutUint16(record[3:5], uint16(handshakeLength))
++	handshake := record[5:]
++	handshake[0] = 0x01
++	handshake[1] = byte((handshakeLength - 4) >> 16)
++	handshake[2] = byte((handshakeLength - 4) >> 8)
++	handshake[3] = byte(handshakeLength - 4)
++	handshake[4], handshake[5] = 0x03, 0x03
++	offset := 4 + 2 + 32
++	handshake[offset] = 0
++	offset++
++	binary.BigEndian.PutUint16(handshake[offset:offset+2], 2)
++	offset += 2
++	handshake[offset], handshake[offset+1] = 0x13, 0x01
++	offset += 2
++	handshake[offset], handshake[offset+1] = 1, 0
++	offset += 2
++	binary.BigEndian.PutUint16(handshake[offset:offset+2], uint16(extensionsLength))
++	offset += 2
++	binary.BigEndian.PutUint16(handshake[offset:offset+2], 0)
++	binary.BigEndian.PutUint16(handshake[offset+2:offset+4], uint16(serverNameExtensionLength))
++	offset += 4
++	binary.BigEndian.PutUint16(handshake[offset:offset+2], uint16(serverNameListLength))
++	offset += 2
++	handshake[offset] = 0
++	binary.BigEndian.PutUint16(handshake[offset+1:offset+3], uint16(nameLength))
++	copy(handshake[offset+3:], serverName)
++	return record
++}
++
++func TestBenchmarkClientHello(t *testing.T) {
++	header, err := SniffTLS(benchmarkClientHello("example.com"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if header.Domain() != "example.com" {
++		t.Fatalf("domain = %q", header.Domain())
++	}
++}
++
++func BenchmarkSniffTLSServerName(b *testing.B) {
++	payload := benchmarkClientHello("example.com")
++	b.ReportAllocs()
++	b.SetBytes(int64(len(payload)))
++	for b.Loop() {
++		header, err := SniffTLS(payload)
++		if err != nil {
++			b.Fatal(err)
++		}
++		sniffTLSBenchmarkSink = header
++	}
++}
++
++func BenchmarkSniffTLSInvalidClientHello(b *testing.B) {
++	payload := invalidClientHelloRecord()
++	b.ReportAllocs()
++	for b.Loop() {
++		if _, err := SniffTLS(payload); err == nil {
++			b.Fatal("SniffTLS unexpectedly accepted malformed ClientHello")
++		}
++	}
++}
++
++func TestSniffTLSInvalidClientHelloAllocationBudget(t *testing.T) {
++	payload := invalidClientHelloRecord()
++	allocations := testing.AllocsPerRun(1000, func() {
++		if _, err := SniffTLS(payload); err == nil {
++			t.Fatal("SniffTLS unexpectedly accepted malformed ClientHello")
++		}
++	})
++	if allocations != 0 {
++		t.Fatalf("invalid ClientHello allocations = %.0f, want 0", allocations)
++	}
++}
++
++func BenchmarkSniffTLSUppercaseServerNameAndNormalize(b *testing.B) {
++	payload := benchmarkClientHello("WEB.WHATSAPP.COM")
++	b.ReportAllocs()
++	b.SetBytes(int64(len(payload)))
++	for b.Loop() {
++		header, err := SniffTLS(payload)
++		if err != nil {
++			b.Fatal(err)
++		}
++		sniffTLSBenchmarkSink = header
++		sniffTLSDomainBenchmarkSink = strings.ToLower(header.Domain())
++	}
++}
+diff --git a/common/protocol/tls/sniff_records_test.go b/common/protocol/tls/sniff_records_test.go
+new file mode 100644
+index 00000000..559e7ff9
+--- /dev/null
++++ b/common/protocol/tls/sniff_records_test.go
+@@ -0,0 +1,102 @@
++package tls_test
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"path/filepath"
++	"slices"
++	"testing"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/protocol"
++	. "github.com/xtls/xray-core/common/protocol/tls"
++)
++
++// readTLSCorpus returns a captured first record; see testdata/PROVENANCE.md.
++func readTLSCorpus(t *testing.T, name string) []byte {
++	t.Helper()
++	record, err := os.ReadFile(filepath.Join("testdata", name))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return record
++}
++
++// fragmentRecords carries the handshake data of a single TLS record in
++// records of at most n bytes, as RFC 8446, Section 5.1 allows.
++func fragmentRecords(record []byte, n int) []byte {
++	var records []byte
++	for fragment := range slices.Chunk(record[5:], n) {
++		records = append(records, 0x16, 0x03, 0x01, byte(len(fragment)>>8), byte(len(fragment)))
++		records = append(records, fragment...)
++	}
++	return records
++}
++
++// ClientHellos captured from Chrome, Firefox and curl yield their server
++// names.
++func TestSniffTLSClientCorpus(t *testing.T) {
++	tests := []struct {
++		file, domain string
++	}{
++		{"tls-chrome153.bin", "chrome.sniff.test"},
++		{"tls-firefox153esr.bin", "firefox.sniff.test"},
++		{"tls-curl8.18-openssl3.5.bin", "curl.sniff.test"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.file, func(t *testing.T) {
++			header, err := SniffTLS(readTLSCorpus(t, tt.file))
++			if err != nil || header.Domain() != tt.domain {
++				t.Fatalf("SniffTLS() = (%v, %v), want %q", header, err, tt.domain)
++			}
++		})
++	}
++}
++
++// A ClientHello can be fragmented across handshake records. Hysteria 2.13.0
++// reassembles it, and Xray's own fragment mask splits ClientHellos this way.
++func TestSniffTLSClientHelloAcrossRecords(t *testing.T) {
++	chrome := readTLSCorpus(t, "tls-chrome153.bin")
++	for _, size := range []int{1, 3, 100, 333, 1500} {
++		records := fragmentRecords(chrome, size)
++		received := bytes.Clone(records)
++		header, err := SniffTLS(records)
++		if err != nil || header.Domain() != "chrome.sniff.test" {
++			t.Errorf("with %d-byte records: SniffTLS() = (%v, %v), want chrome.sniff.test", size, header, err)
++		}
++		if !bytes.Equal(records, received) {
++			t.Errorf("with %d-byte records: SniffTLS modified its input", size)
++		}
++	}
++}
++
++// Until the last fragment arrives, the sniffer asks for more data; it neither
++// reports a name nor rejects the connection.
++func TestSniffTLSWaitsForRemainingRecords(t *testing.T) {
++	records := fragmentRecords(readTLSCorpus(t, "tls-chrome153.bin"), 100)
++	for _, cut := range []int{105, 210, 300, len(records) - 1} {
++		header, err := SniffTLS(records[:cut])
++		if !errors.Is(err, protocol.ErrProtoNeedMoreData) && !errors.Is(err, common.ErrNoClue) {
++			t.Errorf("with %d of %d bytes: SniffTLS() = (%v, %v), want more data", cut, len(records), header, err)
++		}
++	}
++}
++
++// A ClientHello ends with the record that completes it: a record of another
++// type may follow it, but one that interrupts it rejects the stream.
++func TestSniffTLSClientHelloEndsAtItsLastRecord(t *testing.T) {
++	chrome := readTLSCorpus(t, "tls-chrome153.bin")
++	changeCipherSpec := []byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
++
++	header, err := SniffTLS(append(bytes.Clone(chrome), changeCipherSpec...))
++	if err != nil || header.Domain() != "chrome.sniff.test" {
++		t.Errorf("ClientHello followed by another record: SniffTLS() = (%v, %v), want chrome.sniff.test", header, err)
++	}
++
++	interrupted := append(fragmentRecords(chrome, 100)[:105], changeCipherSpec...)
++	header, err = SniffTLS(interrupted)
++	if err == nil || errors.Is(err, protocol.ErrProtoNeedMoreData) || errors.Is(err, common.ErrNoClue) {
++		t.Errorf("ClientHello interrupted by another record: SniffTLS() = (%v, %v), want a rejection", header, err)
++	}
++}
+diff --git a/common/protocol/tls/testdata/LICENSE-MIT b/common/protocol/tls/testdata/LICENSE-MIT
+new file mode 100644
+index 00000000..208e8f29
+--- /dev/null
++++ b/common/protocol/tls/testdata/LICENSE-MIT
+@@ -0,0 +1,7 @@
++Copyright 2023 Toby
++
++Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+diff --git a/common/protocol/tls/testdata/PROVENANCE.md b/common/protocol/tls/testdata/PROVENANCE.md
+new file mode 100644
+index 00000000..44e44bc0
+--- /dev/null
++++ b/common/protocol/tls/testdata/PROVENANCE.md
+@@ -0,0 +1,17 @@
++# TLS sniffer test corpus
++
++The `tls-*.bin` files are the first TLS records of real clients, captured by
++the Hysteria project. They are copied unchanged from
++[`apernet/hysteria` tag `app/v2.13.0`](https://github.com/apernet/hysteria/tree/app/v2.13.0/extras/sniff/testdata),
++where commit `4849cda3` ("feat(sniff): rework sniffing to handle multi-packet
++QUIC ClientHellos", #1693) added them. Their git blob hashes match that tag.
++Hysteria is distributed under the MIT License; its copyright and permission
++notice is kept in [`LICENSE-MIT`](LICENSE-MIT).
++
++Each file holds one handshake record carrying a whole ClientHello.
++
++| File | Client | Server name |
++| --- | --- | --- |
++| `tls-chrome153.bin` | Chrome 153 | `chrome.sniff.test` |
++| `tls-firefox153esr.bin` | Firefox 153 ESR | `firefox.sniff.test` |
++| `tls-curl8.18-openssl3.5.bin` | curl 8.18 with OpenSSL 3.5 | `curl.sniff.test` |
+diff --git a/common/protocol/tls/testdata/tls-chrome153.bin b/common/protocol/tls/testdata/tls-chrome153.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..b501174691b37c543be7e5e8a62a96e1b64f80d1
+GIT binary patch
+literal 1957
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/common/protocol/tls/testdata/tls-curl8.18-openssl3.5.bin b/common/protocol/tls/testdata/tls-curl8.18-openssl3.5.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c2ef61e7209509482710275b49b20d813a48f0f
+GIT binary patch
+literal 1575
+zcmV+?2H5!)0|5pi0RRRb0|Quu(mw-|bw2!S%g7Lp0t&sK<P<ktzOs^DV?Tivp8g;t
+z@z*vO5~oEwiUQ+7-e`F?Z>?Dczzgb5rD;O}S#9+IJQD&F0}}zjEWj`TpUkPusLZOs
+zE5I)Rp1>r)C;)4~BfuvBXTS=;6aYEE3BVHoGXR|coB%xlJODKSF984rng0O*0RR91
+z02BZc000kTb#iPjb8cy7W-fGPb94X;00aX70RjLD01^NY5$pgR02crr02lxn0RRC3
+z01yBU01N_XG6-mNbZ{>*E-?TW0000N0000n0000D05$+L2?YrT2?PWK1p@{H2nPrV
+z2pR|*2pk9r2nq-b2m}ZP2nGZJ1px*D0|NsA0|EpB1p)>F04o3m1Oo&E0{|@m0s#R4
+zGX&}c=n?D$z$iI$lCY2sB|{u3GMq40aI<yI=!?H1tHJ;ms?-nST5(0;qllF{h$*%)
+z!V!1CHu?jg0*0qw^R^ivRmBP^+3?FOx<fb|q4suX1T)JTFt5ZT4P$hrT%#QisjXZV
+zd$Rk8d2&0P$if&y6w)^<Hgr^F;2aZ>PG6NiDPj&$_&GQli69AvrnZTQa=q**JQ{};
+z*PCyMd`S)*a<?W9Z|7t(uv_OwjOLRq%^7aV)pX#O$V<E){OE!>HY<{rzUi>DD21%e
+zmvdkNNYF>BJRz!QkUF$O64Ya{XQw&)*UtK4Kh`D%{55CI7A+c4M>^Dz&stLuB?X$W
+zyAS7(ko?R!V0dPH97kbta!6#v1w#G9!I$y{fnk4cl_sp`p9DLFJlenNV-{xOmgh3L
+z8nMcnJ9X&=qUOYT#i>ZcQG<9&GVengTIDRT7!<CO5*?5$7zD#;C&>w8nu&L#Ll-L$
+zy29!lT0Tbyt&(U5@nzglsjEhWA{9|)TYm{e$(M?3msS(0sJ`IgWCKeyW{VM<h%v)P
+zo5%tb%61B=0gO5GJSJ0#hG!`|3R0x`pp?>$ad&DfV1#@bdte7DYR8ktlT@VqT*~BY
+zg@~8$A+H;WywPf54ojtbnj8aiF9w!EpGvh=9C+uOY^w7O%KN@8Gce@Ze0Yp&yY-7c
+zhA!J<Afwy}w2F3VQH=oDkZ<EGfeOBOE6O0#ZY(fnm<zOtObV*vG~uu@6-jH+aHND=
+zwT<i-?(DVg1P=>5pCk7bk#)|WsSzKma~&b8ntG8&^qx@@pmyOo!fQx|higj4z|u+`
+zYiWSY%&)M#k`udq`>c1b*{d|1VqHoF@H&vtS;%A{r_6T}zIeXV_93VsNrkJZ5O=Tu
+zIz6Na2h19qbXZv(>&jz#qm=`U0y9C{vbpc;Pm>ak7z2Q@BS4B}WbW|>GWVcQSk3R8
+zv@(#zF5)Z30T<8(M>2=RSmcuBmLuwCDG_iAXtcSbdB|CMpg>Wf<#MpBSS&}oUvuoT
+zgL)=;yej2+41>5&$c%)Wd^PEyVv|S5Ye0Y(nW=JNqRjfIN|(&5#9g%uk#(6J?4Wkd
+zLLTz+sgEgeiP%E>3qB^v6Z~+AZemD6A$D^I%39~2?sO0$_|EwFSCw~NGbp-&AaZu5
+zR``1(rn0b}0~%vTWycn!#kh6&Faxw2HaJ1BY=WN8=e>Jja%3O`)C9h@kxJtl65J7U
+zEmcuhh)6gp7tKs?Gq<J$kYF*iFCVr)rD!J}12ysYyUPV20=H1q7m>-AZQlw(anKnG
+zfn=pNu~e%lg9j6o(RH%o5?xv_+=x52Go6asx7Q&Epjwe}Y?c^6fwC|PU7*RwqAFB@
+zNn%0Gwu4!4l!s_@Om{LF^BSV9`Oe=f4y{sS>9}bc(=peqiS{T3PfEimV?cK)zz}(O
+zGRXqUS3Hy>%Nr@Oy5lufra-X^GRhXS?U>5W=d1v^j0eGa2|S~f!IbqdaVw{~kl0Lc
+zY-G1ZdyEDvctBB~Rw&f?dYll<mW8bD(FQ~tCaw}Sc_%}*GSewQw^d(#b+IDXJ_Mg1
+zP!KE13D{NG9T`{t{I&C*yQ<HI1bN@4)7l#1M*tlFAR-kXze;Z<yJx9WCql=zJh3q8
+Z6zfddmUQ7Pvp1#H3;-Jd1q1*A00X~yi>v?u
+
+literal 0
+HcmV?d00001
+
+diff --git a/common/protocol/tls/testdata/tls-firefox153esr.bin b/common/protocol/tls/testdata/tls-firefox153esr.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e66ff9620469a065ea2bfe771fb117b2bc5f99b
+GIT binary patch
+literal 1901
+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
+
+literal 0
+HcmV?d00001
+
+-- 
+2.47.3
+

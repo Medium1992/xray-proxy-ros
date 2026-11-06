@@ -69,6 +69,12 @@ ARG XHTTP_MUX=required
 # required — патчи обязаны лечь; off — без них.
 ARG REALITY_X25519=required
 
+# Снифферы из форка mux-ka (patches/sniff): STUN для правила
+# "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime), DHT и
+# UDP-трекеры для "bittorrent", ClientHello в нескольких TLS-записях.
+# required — патчи обязаны лечь; off — без них.
+ARG SNIFF=required
+
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
 # ошибкой, а не тихой подменой.
@@ -203,6 +209,22 @@ RUN set -eu; \
       && grep -q 'AllowX25519' infra/conf/transport_security.go \
       || { echo "REALITY allowX25519 hooks are missing after patching" >&2; exit 1; }; \
     echo "REALITY allowX25519: included"
+
+COPY patches/sniff /patches/sniff
+RUN set -eu; \
+    case "$SNIFF" in \
+      off) echo "Sniffers: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "SNIFF must be required or off, got '$SNIFF'" >&2; exit 1 ;; \
+    esac; \
+    for p in /patches/sniff/*.patch; do \
+      git apply "$p" \
+        || { echo "Sniffer patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'stun.SniffSTUN' app/dispatcher/sniffer.go \
+      && grep -q 'bittorrent.SniffDHT' app/dispatcher/sniffer.go \
+      || { echo "Sniffer hooks are missing after patching" >&2; exit 1; }; \
+    echo "Sniffers: included"
 
 # С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
 # работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается

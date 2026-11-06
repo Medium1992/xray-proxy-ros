@@ -71,7 +71,8 @@ ARG REALITY_X25519=required
 
 # Снифферы из форка mux-ka (patches/sniff): STUN для правила
 # "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime), DHT и
-# UDP-трекеры для "bittorrent", ClientHello в нескольких TLS-записях.
+# UDP-трекеры, HTTP-запросы к трекерам, LSD и рукопожатие в uTP для
+# "bittorrent", ClientHello в нескольких TLS-записях.
 # required — патчи обязаны лечь; off — без них.
 ARG SNIFF=required
 

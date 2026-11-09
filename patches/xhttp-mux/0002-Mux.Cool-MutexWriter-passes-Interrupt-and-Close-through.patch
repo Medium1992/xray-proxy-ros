@@ -1,0 +1,90 @@
+Mux.Cool: MutexWriter passes Interrupt and Close through
+
+Upstream v26.11.9 (5745dea2) wraps the link writer of every mux worker in
+MutexWriter, which embeds only buf.Writer. The workers end their link with
+common.Interrupt(link.Writer), which became a no-op: a closed worker left its
+downlink open, and a write stuck on a peer that stopped reading, with the
+KeepAlive of patch 0001 behind it, never returned. Needs v26.11.9 or later.
+---
+diff --git a/common/mux/writer.go b/common/mux/writer.go
+index ac5ec6c4..3afa2da3 100644
+--- a/common/mux/writer.go
++++ b/common/mux/writer.go
+@@ -22,6 +22,17 @@ func (w *MutexWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+ 	return w.Writer.WriteMultiBuffer(mb)
+ }
+ 
++// Interrupt and Close reach the writer inside without the lock: a worker
++// ends its link through them, and a write stuck on a peer that stopped
++// reading holds the lock until the link ends.
++func (w *MutexWriter) Interrupt() {
++	common.Interrupt(w.Writer)
++}
++
++func (w *MutexWriter) Close() error {
++	return common.Close(w.Writer)
++}
++
+ type Writer struct {
+ 	dest         net.Destination
+ 	writer       buf.Writer
+diff --git a/common/mux/writer_mutex_test.go b/common/mux/writer_mutex_test.go
+new file mode 100644
+index 00000000..41ac01d2
+--- /dev/null
++++ b/common/mux/writer_mutex_test.go
+@@ -0,0 +1,54 @@
++package mux_test
++
++import (
++	"io"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/mux"
++	"github.com/xtls/xray-core/transport/pipe"
++)
++
++// A worker ends its link with common.Interrupt and common.Close on the
++// MutexWriter around it: both must reach the writer inside, or the link
++// stays open after the worker is gone.
++func TestMutexWriterPassesInterruptAndClose(t *testing.T) {
++	for name, end := range map[string]func(any) error{
++		"interrupt": func(w any) error { return common.Interrupt(w) },
++		"close":     func(w any) error { return common.Close(w) },
++	} {
++		r, w := pipe.New()
++		common.Must(end(&mux.MutexWriter{Writer: w}))
++		if _, err := r.ReadMultiBufferTimeout(time.Second); err != io.EOF && err != io.ErrClosedPipe {
++			t.Errorf("%s: read after it got %v, want the pipe ended", name, err)
++		}
++	}
++}
++
++// A write stuck on a peer that stopped reading holds the lock: an interrupt
++// must not wait for it.
++func TestMutexWriterInterruptsStuckWrite(t *testing.T) {
++	_, w := pipe.New(pipe.WithSizeLimit(0))
++	mw := &mux.MutexWriter{Writer: w}
++	byte1 := func() buf.MultiBuffer {
++		b := buf.New()
++		b.Extend(1)
++		return buf.MultiBuffer{b}
++	}
++	// The pipe is full past its limit: the next write waits for a reader.
++	common.Must(mw.WriteMultiBuffer(byte1()))
++	done := make(chan error, 1)
++	go func() { done <- mw.WriteMultiBuffer(byte1()) }()
++	time.Sleep(50 * time.Millisecond)
++	common.Interrupt(mw)
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("stuck write returned no error after an interrupt")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("interrupt did not reach a write stuck under the lock")
++	}
++}

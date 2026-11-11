@@ -55,6 +55,8 @@ ARG H2_SCRATCH_KB=32
 # стрим. required — патчи обязаны лечь, иначе сборка падает; off — ядро без
 # регулятора. В собранном ядре регулятор выключен, пока его не включит
 # переменная окружения XRAY_XHTTP_FLOW=on или "h2Flow" в extra ссылки.
+# Там же рукопожатие TLS/REALITY клиента XHTTP ограничено 10 с: заглохшее после
+# ClientHello больше не держит все запросы, вставшие за этим дозвоном.
 ARG XHTTP_FLOW=required
 
 # Mux.Cool поверх XHTTP и серверный KeepAlive для простаивающего downlink
@@ -117,6 +119,7 @@ RUN set -eu; \
     done; \
     grep -q 'flowListener{' transport/internet/splithttp/hub.go \
       && grep -q 'newFlowClientConn(conn)' transport/internet/splithttp/dialer.go \
+      && grep -q 'context.WithTimeout(ctxInner, 10\*time.Second)' transport/internet/splithttp/dialer.go \
       || { echo "XHTTP flow governor hooks are missing after patching" >&2; exit 1; }; \
     echo "XHTTP flow governor: included"
 

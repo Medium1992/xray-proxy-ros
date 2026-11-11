@@ -229,6 +229,7 @@ RUN set -eu; \
     grep -q 'stun.SniffSTUN' app/dispatcher/sniffer.go \
       && grep -q 'bittorrent.SniffDHT' app/dispatcher/sniffer.go \
       && grep -q 'discord.SniffIPDiscovery' app/dispatcher/sniffer.go \
+      && grep -q 'sniffHTTPOrTracker' app/dispatcher/sniffer.go \
       || { echo "Sniffer hooks are missing after patching" >&2; exit 1; }; \
     echo "Sniffers: included"
 

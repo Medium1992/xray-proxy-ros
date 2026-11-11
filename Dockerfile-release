@@ -70,9 +70,10 @@ ARG XHTTP_MUX=required
 ARG REALITY_X25519=required
 
 # Снифферы из форка mux-ka (patches/sniff): STUN для правила
-# "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime), DHT и
-# UDP-трекеры, HTTP-запросы к трекерам, LSD и рукопожатие в uTP для
-# "bittorrent", ClientHello в нескольких TLS-записях.
+# "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime),
+# IP discovery голоса Discord для "discordrtc", DHT и UDP-трекеры,
+# HTTP-запросы к трекерам, LSD и рукопожатие в uTP для "bittorrent",
+# ClientHello в нескольких TLS-записях.
 # required — патчи обязаны лечь; off — без них.
 ARG SNIFF=required
 
@@ -224,6 +225,7 @@ RUN set -eu; \
     done; \
     grep -q 'stun.SniffSTUN' app/dispatcher/sniffer.go \
       && grep -q 'bittorrent.SniffDHT' app/dispatcher/sniffer.go \
+      && grep -q 'discord.SniffIPDiscovery' app/dispatcher/sniffer.go \
       || { echo "Sniffer hooks are missing after patching" >&2; exit 1; }; \
     echo "Sniffers: included"
 

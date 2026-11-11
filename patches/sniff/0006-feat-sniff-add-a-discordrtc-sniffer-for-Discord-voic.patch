@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:28:56 +0300
+Subject: [PATCH] feat(sniff): add a discordrtc sniffer for Discord voice
+
+A routing rule protocol ["discordrtc"] now matches the voice flows of the
+Discord app: calls, streams and screen sharing. Its first datagram to a
+voice server is IP discovery, and the RTP of the call follows on the same
+pair of ports, so the rule takes the whole call. There is no domain to
+override. Discord in a browser speaks WebRTC, which "stun" takes.
+
+The request is a datagram of exactly 74 bytes: type 1, length 70, the
+SSRC, then a 64-byte address that is empty in a request, and the port.
+The sniffer checks all but the SSRC and the port, which vary, as zapret's
+discord_ip_discovery does. It opens like a STUN binding request, but its
+length is no multiple of 4 and the SSRC stands where STUN has its cookie,
+so it gets a name of its own rather than "stun". Over UDP it is the whole
+first datagram, read apart from those that follow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/dispatcher/discord_route_process_test.go | 79 ++++++++++++++++++++
+ app/dispatcher/sniffer.go                    |  9 +++
+ app/dispatcher/sniffer_discord_test.go       | 63 ++++++++++++++++
+ common/protocol/discord/discord.go           | 53 +++++++++++++
+ common/protocol/discord/discord_test.go      | 59 +++++++++++++++
+ 5 files changed, 263 insertions(+)
+ create mode 100644 app/dispatcher/discord_route_process_test.go
+ create mode 100644 app/dispatcher/sniffer_discord_test.go
+ create mode 100644 common/protocol/discord/discord.go
+ create mode 100644 common/protocol/discord/discord_test.go
+
+diff --git a/app/dispatcher/discord_route_process_test.go b/app/dispatcher/discord_route_process_test.go
+new file mode 100644
+index 00000000..6a20ef4e
+--- /dev/null
++++ b/app/dispatcher/discord_route_process_test.go
+@@ -0,0 +1,79 @@
++//go:build integration
++
++package dispatcher
++
++import (
++	"bytes"
++	"fmt"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// TestDiscordRTCRouteProcessE2E is TestBitTorrentBlockProcessE2E for a routing
++// rule protocol ["discordrtc"] -> block, on a real Xray process: the IP
++// discovery request of Discord voice never reaches the destination, while
++// DNS, a plain datagram, STUN and a plain TCP exchange through the same proxy
++// are answered.
++func TestDiscordRTCRouteProcessE2E(t *testing.T) {
++	workDir := t.TempDir()
++	xrayBin := btBuildXray(t, workDir)
++
++	udpEcho := btNewUDPResponder(t)
++	t.Cleanup(func() { _ = udpEcho.conn.Close() })
++	tcpEcho := btNewTCPResponder(t)
++	t.Cleanup(func() { _ = tcpEcho.listener.Close() })
++
++	socksPort := btFreeTCPPort(t)
++	config := fmt.Sprintf(`{
++		"log": {"loglevel": "warning"},
++		"inbounds": [{
++			"listen": "127.0.0.1",
++			"port": %d,
++			"protocol": "socks",
++			"settings": {"udp": true},
++			"sniffing": {"enabled": true}
++		}],
++		"outbounds": [
++			{"tag": "direct", "protocol": "freedom"},
++			{"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "none"}}}
++		],
++		"routing": {"rules": [
++			{"type": "field", "protocol": ["discordrtc"], "outboundTag": "block"}
++		]}
++	}`, socksPort)
++	process := btStartXray(t, xrayBin, config, filepath.Join(workDir, "config.json"))
++	btWaitSOCKS(t, process, socksPort)
++
++	t.Run("dns query through proxy is answered", func(t *testing.T) {
++		response := btRoundTripUDP(t, socksPort, udpEcho.addr, btDNSQuery(0xBEEF), 5*time.Second)
++		if len(response) < 3 || response[2]&0x80 == 0 {
++			t.Fatalf("unexpected DNS response: % x", response)
++		}
++	})
++
++	t.Run("plain udp datagram through proxy is echoed", func(t *testing.T) {
++		payload := []byte("plain-udp-control")
++		if response := btRoundTripUDP(t, socksPort, udpEcho.addr, payload, 5*time.Second); !bytes.Equal(response, payload) {
++			t.Fatalf("echo mismatch: got %q", response)
++		}
++	})
++
++	t.Run("plain tcp exchange through proxy is echoed", func(t *testing.T) {
++		payload := []byte("plain-tcp-control")
++		if response := btRoundTripTCP(t, socksPort, tcpEcho.addr.Port, payload, 5*time.Second); !bytes.Equal(response, payload) {
++			t.Fatalf("echo mismatch: got %q", response)
++		}
++	})
++
++	t.Run("stun binding through proxy is echoed", func(t *testing.T) {
++		payload := stunBinding()
++		if response := btRoundTripUDP(t, socksPort, udpEcho.addr, payload, 5*time.Second); !bytes.Equal(response, payload) {
++			t.Fatalf("echo mismatch: got % x", response)
++		}
++	})
++
++	t.Run("discord ip discovery over udp is blocked", func(t *testing.T) {
++		btAssertBlockedUDP(t, socksPort, udpEcho, discordIPDiscovery(), "Discord IP discovery")
++	})
++}
+diff --git a/app/dispatcher/sniffer.go b/app/dispatcher/sniffer.go
+index d21e042b..ec4b8c31 100644
+--- a/app/dispatcher/sniffer.go
++++ b/app/dispatcher/sniffer.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/protocol/bittorrent"
++	"github.com/xtls/xray-core/common/protocol/discord"
+ 	"github.com/xtls/xray-core/common/protocol/http"
+ 	"github.com/xtls/xray-core/common/protocol/quic"
+ 	"github.com/xtls/xray-core/common/protocol/stun"
+@@ -63,6 +64,14 @@ func NewSniffer(ctx context.Context) *Sniffer {
+ 				},
+ 				network: net.Network_UDP,
+ 			},
++			{
++				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return discord.SniffIPDiscovery(b) },
++				// The request is the first datagram of a voice flow.
++				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
++					return discord.SniffIPDiscovery(datagrams[0])
++				},
++				network: net.Network_UDP,
++			},
+ 		},
+ 	}
+ 	if sniffer, err := newFakeDNSSniffer(ctx); err == nil {
+diff --git a/app/dispatcher/sniffer_discord_test.go b/app/dispatcher/sniffer_discord_test.go
+new file mode 100644
+index 00000000..fa39b074
+--- /dev/null
++++ b/app/dispatcher/sniffer_discord_test.go
+@@ -0,0 +1,63 @@
++package dispatcher
++
++import (
++	"encoding/binary"
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++)
++
++// discordIPDiscovery is the IP discovery request a Discord client sends a
++// voice server first.
++func discordIPDiscovery() []byte {
++	b := []byte{0x00, 0x01, 0x00, 0x46, 0x00, 0x01, 0xe2, 0x40}
++	b = append(b, make([]byte, 64)...)
++	return binary.BigEndian.AppendUint16(b, 0)
++}
++
++// A voice flow opens with IP discovery; RTP follows on the same ports.
++func TestSniffDiscordRTCFlow(t *testing.T) {
++	rtp := []byte{0x90, 0x78, 0x00, 0x01, 0x00, 0x00, 0x03, 0xc0, 0x00, 0x01, 0xe2, 0x40, 0xbe, 0xde, 0x00, 0x01}
++	result, err := sniffDatagrams(t, net.Network_UDP, discordIPDiscovery(), rtp)
++	if err != nil || result.Protocol() != "discordrtc" || result.Domain() != "" {
++		t.Fatalf("sniff() = %v, %v; want discordrtc without a domain", result, err)
++	}
++}
++
++// Over UDP the sniffer reads the first datagram on its own: the request split
++// or followed by more bytes in the same datagram is none.
++func TestSniffDiscordRTCReadsTheFirstDatagram(t *testing.T) {
++	trailing := append(discordIPDiscovery(), 0, 0)
++	if result, err := sniffDatagrams(t, net.Network_UDP, trailing); err == nil && result.Protocol() == "discordrtc" {
++		t.Fatal("a datagram longer than the request taken for discordrtc")
++	}
++	split := discordIPDiscovery()
++	if result, err := sniffDatagrams(t, net.Network_UDP, split[:8], split[8:]); err == nil && result.Protocol() == "discordrtc" {
++		t.Fatal("a request split across datagrams taken for discordrtc")
++	}
++}
++
++// Discord voice runs over UDP only.
++func TestSniffDiscordRTCNotOverTCP(t *testing.T) {
++	if result, err := sniffDatagrams(t, net.Network_TCP, discordIPDiscovery()); err == nil && result.Protocol() == "discordrtc" {
++		t.Fatal("a TCP stream taken for discordrtc")
++	}
++}
++
++// A caller may hand the datagrams of an empty cache: the sniffer reads the
++// payload then.
++func TestSniffDiscordRTCWithoutDatagrams(t *testing.T) {
++	s := newSniffer(snifferContext())
++	result, err := s.SniffDatagrams(snifferContext(), discordIPDiscovery(), [][]byte{}, net.Network_UDP)
++	if err != nil || result.Protocol() != "discordrtc" {
++		t.Fatalf("SniffDatagrams() = %v, %v; want discordrtc", result, err)
++	}
++}
++
++// STUN, which Discord in a browser speaks, stays stun.
++func TestSniffDiscordRTCLeavesSTUN(t *testing.T) {
++	result, err := sniffDatagrams(t, net.Network_UDP, stunBinding())
++	if err != nil || result.Protocol() != "stun" {
++		t.Fatalf("a STUN binding sniffed as %v, %v; want stun", result, err)
++	}
++}
+diff --git a/common/protocol/discord/discord.go b/common/protocol/discord/discord.go
+new file mode 100644
+index 00000000..dc534a9c
+--- /dev/null
++++ b/common/protocol/discord/discord.go
+@@ -0,0 +1,53 @@
++// Package discord sniffs the IP discovery request of Discord voice: the
++// first datagram a Discord client sends to a voice server, before the RTP of
++// a call, a stream or screen sharing follows on the same pair of ports, so a
++// rule on it routes the whole call. Discord in a browser speaks WebRTC
++// instead, which the STUN sniffer takes.
++package discord
++
++import (
++	"errors"
++)
++
++type SniffHeader struct{}
++
++func (h *SniffHeader) Protocol() string {
++	return "discordrtc"
++}
++
++func (h *SniffHeader) Domain() string {
++	return ""
++}
++
++// The IP discovery packet of Discord voice:
++//
++//	0-1      type: 1 for a request, 2 for the response
++//	2-3      length of what follows the SSRC and this field: 70
++//	4-7      SSRC
++//	8-71     address, a null-terminated string, empty in a request
++//	72-73    port
++//
++// It shares its first two bytes with a STUN binding request, but its length
++// of 70 is no multiple of 4 and the SSRC stands where STUN has its cookie, so
++// the STUN sniffer leaves it.
++const (
++	packetLen  = 74
++	addressEnd = 72
++)
++
++var errNotDiscord = errors.New("not discord")
++
++// SniffIPDiscovery reads a datagram that is one IP discovery request: its
++// type, length and empty address. The SSRC and the port vary from one call to
++// the next.
++func SniffIPDiscovery(d []byte) (*SniffHeader, error) {
++	if len(d) != packetLen || d[0] != 0 || d[1] != 1 || d[2] != 0 || d[3] != 70 {
++		return nil, errNotDiscord
++	}
++	for _, c := range d[8:addressEnd] {
++		if c != 0 {
++			return nil, errNotDiscord
++		}
++	}
++	return &SniffHeader{}, nil
++}
+diff --git a/common/protocol/discord/discord_test.go b/common/protocol/discord/discord_test.go
+new file mode 100644
+index 00000000..4b40d130
+--- /dev/null
++++ b/common/protocol/discord/discord_test.go
+@@ -0,0 +1,59 @@
++package discord_test
++
++import (
++	"encoding/binary"
++	"testing"
++
++	"github.com/xtls/xray-core/common/protocol/discord"
++	"github.com/xtls/xray-core/common/protocol/stun"
++)
++
++// request is an IP discovery request with its SSRC and port.
++func request(ssrc uint32, port uint16) []byte {
++	b := []byte{0x00, 0x01, 0x00, 0x46}
++	b = binary.BigEndian.AppendUint32(b, ssrc)
++	b = append(b, make([]byte, 64)...)
++	return binary.BigEndian.AppendUint16(b, port)
++}
++
++func TestSniffIPDiscovery(t *testing.T) {
++	for _, b := range [][]byte{request(0x0001e240, 0), request(0xffffffff, 50003), request(0, 0)} {
++		header, err := discord.SniffIPDiscovery(b)
++		if err != nil || header.Protocol() != "discordrtc" || header.Domain() != "" {
++			t.Fatalf("SniffIPDiscovery(% x) = %v, %v; want discordrtc without a domain", b, header, err)
++		}
++	}
++}
++
++func TestSniffIPDiscoveryRejects(t *testing.T) {
++	response := request(0x0001e240, 50003)
++	response[1] = 2
++	copy(response[8:], "203.0.113.7")
++	address := request(0x0001e240, 0)
++	address[8] = '1'
++	lastAddressByte := request(0x0001e240, 0)
++	lastAddressByte[71] = 1
++	length := request(0x0001e240, 0)
++	length[3] = 0x48
++	for name, b := range map[string][]byte{
++		"response":                response,
++		"request with an address": address,
++		"last address byte set":   lastAddressByte,
++		"other length":            length,
++		"zeros":                   make([]byte, 74),
++		"one byte short":          request(1, 0)[:73],
++		"one byte long":           append(request(1, 0), 0),
++		"empty":                   nil,
++	} {
++		if header, err := discord.SniffIPDiscovery(b); err == nil {
++			t.Errorf("%s: SniffIPDiscovery() = %v; want an error", name, header)
++		}
++	}
++}
++
++// The request opens like a STUN binding request but is none.
++func TestIPDiscoveryIsNoSTUN(t *testing.T) {
++	if header, err := stun.SniffSTUNDatagram(request(0x2112a442, 0)); err == nil {
++		t.Fatalf("SniffSTUNDatagram() = %v; want an error", header)
++	}
++}

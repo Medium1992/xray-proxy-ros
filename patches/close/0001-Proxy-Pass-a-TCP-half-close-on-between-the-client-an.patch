@@ -1,0 +1,360 @@
+From 824e0ae4f2433554a974a425d7397a75ad4989ee Mon Sep 17 00:00:00 2001
+From: medium <medium@debian.debian>
+Date: Thu, 12 Nov 2026 02:53:19 +0300
+Subject: [PATCH] Proxy: Pass a TCP half-close on between the client and
+ freedom
+
+A target that closed after its answer reached the client only once the
+inbound's uplinkOnly timer (1 s by default) ran out on the idle upload,
+and a client's FIN never reached the target, so a target that answers on
+EOF never answered. Freedom now ends what it sends to the target when
+the client is done, and SOCKS, HTTP CONNECT and dokodemo-door end what
+they send to the client when the answer is done. Only plain TCP and Unix
+sockets are half-closed: TLS and transports are left as they were.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ proxy/dokodemo/dokodemo.go          |   3 +-
+ proxy/freedom/freedom.go            |   4 +
+ proxy/http/server.go                |   2 +-
+ proxy/proxy.go                      |  35 +++++
+ proxy/socks/server.go               |   2 +-
+ testing/scenarios/halfclose_test.go | 221 ++++++++++++++++++++++++++++
+ 6 files changed, 264 insertions(+), 3 deletions(-)
+ create mode 100644 testing/scenarios/halfclose_test.go
+
+diff --git a/proxy/dokodemo/dokodemo.go b/proxy/dokodemo/dokodemo.go
+index 39c790c7..40e00470 100644
+--- a/proxy/dokodemo/dokodemo.go
++++ b/proxy/dokodemo/dokodemo.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/proxy"
+ 	"github.com/xtls/xray-core/transport"
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+@@ -159,7 +160,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
+ 
+ 	var writer buf.Writer
+ 	if network == net.Network_TCP {
+-		writer = buf.NewWriter(conn)
++		writer = proxy.NewHalfClosingWriter(conn)
+ 	} else {
+ 		// if we are in TPROXY mode, use linux's udp forging functionality
+ 		if !destinationOverridden {
+diff --git a/proxy/freedom/freedom.go b/proxy/freedom/freedom.go
+index 6215647a..18bf4bf0 100644
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -446,6 +446,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+ 			return errors.New("failed to process request").Base(err)
+ 		}
++		if destination.Network == net.Network_TCP {
++			// The client is done sending: tell the target, which may answer only now.
++			proxy.CloseWriteRAW(conn)
++		}
+ 
+ 		return nil
+ 	}
+diff --git a/proxy/http/server.go b/proxy/http/server.go
+index 349ba7dd..f0dc198d 100644
+--- a/proxy/http/server.go
++++ b/proxy/http/server.go
+@@ -191,7 +191,7 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
+ 	if err := dispatcher.DispatchLink(
+ 		ctx, dest, &transport.Link{
+ 			Reader: reader,
+-			Writer: buf.NewWriter(conn),
++			Writer: proxy.NewHalfClosingWriter(conn),
+ 		},
+ 	); err != nil {
+ 		return errors.New("failed to dispatch request").Base(err)
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index 6008437e..cb11a85c 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -825,3 +825,38 @@ func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
+ 	_, ok3 := iConn.(*internet.UnixConnWrapper)
+ 	return ok1 || ok2 || ok3
+ }
++
++// CloseWriteRAW ends what conn sends with a FIN when conn is a plain TCP or
++// Unix socket, and does nothing on any other conn: there a FIN is no end of
++// stream the peer reads, and closing a TLS writer would send close_notify.
++func CloseWriteRAW(conn net.Conn) error {
++	iConn := stat.TryUnwrapStatsConn(conn)
++	if pc, ok := iConn.(*proxyproto.Conn); ok {
++		iConn = pc.Raw()
++	}
++	switch c := iConn.(type) {
++	case *net.TCPConn:
++		return c.CloseWrite()
++	case *net.UnixConn:
++		return c.CloseWrite()
++	case *internet.UnixConnWrapper:
++		return c.CloseWrite()
++	}
++	return nil
++}
++
++// NewHalfClosingWriter is buf.NewWriter(conn) whose Close passes the end of
++// the stream on as conn's FIN (see CloseWriteRAW), as closing a pipe writer
++// ends its reader's stream. The peer reads its EOF while it may still send.
++func NewHalfClosingWriter(conn net.Conn) buf.Writer {
++	return &halfClosingWriter{Writer: buf.NewWriter(conn), conn: conn}
++}
++
++type halfClosingWriter struct {
++	buf.Writer
++	conn net.Conn
++}
++
++func (w *halfClosingWriter) Close() error {
++	return CloseWriteRAW(w.conn)
++}
+diff --git a/proxy/socks/server.go b/proxy/socks/server.go
+index d68e5c43..f383c4c5 100644
+--- a/proxy/socks/server.go
++++ b/proxy/socks/server.go
+@@ -157,7 +157,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
+ 		if err := dispatcher.DispatchLink(
+ 			ctx, dest, &transport.Link{
+ 				Reader: reader,
+-				Writer: buf.NewWriter(conn),
++				Writer: proxy.NewHalfClosingWriter(conn),
+ 			},
+ 		); err != nil {
+ 			return errors.New("failed to dispatch request").Base(err)
+diff --git a/testing/scenarios/halfclose_test.go b/testing/scenarios/halfclose_test.go
+new file mode 100644
+index 00000000..004e21a9
+--- /dev/null
++++ b/testing/scenarios/halfclose_test.go
+@@ -0,0 +1,221 @@
++package scenarios
++
++import (
++	"bufio"
++	"fmt"
++	"io"
++	gonet "net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/http"
++	"github.com/xtls/xray-core/proxy/socks"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	xproxy "golang.org/x/net/proxy"
++)
++
++// halfCloseTarget answers a request in one of two ways:
++//
++//   - "close": it replies and closes, ending a close-delimited answer;
++//   - "after-eof": it reads until the client's FIN, then replies and closes.
++type halfCloseTarget struct {
++	ln   gonet.Listener
++	mode string
++}
++
++func startHalfCloseTarget(t *testing.T, mode string) *halfCloseTarget {
++	t.Helper()
++	ln, err := gonet.Listen("tcp4", "127.0.0.1:0")
++	common.Must(err)
++	target := &halfCloseTarget{ln: ln, mode: mode}
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go target.serve(conn)
++		}
++	}()
++	t.Cleanup(func() { ln.Close() })
++	return target
++}
++
++func (s *halfCloseTarget) serve(conn gonet.Conn) {
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(10 * time.Second))
++	switch s.mode {
++	case "close":
++		buf := make([]byte, 64)
++		conn.Read(buf)
++		conn.Write([]byte("reply"))
++	case "after-eof":
++		io.Copy(io.Discard, conn)
++		conn.Write([]byte("reply after eof"))
++	}
++}
++
++func (s *halfCloseTarget) port() net.Port {
++	return net.Port(s.ln.Addr().(*gonet.TCPAddr).Port)
++}
++
++// halfCloseProxy runs one Xray with a SOCKS, an HTTP and a dokodemo-door
++// inbound, all to freedom.
++func halfCloseProxy(t *testing.T, dokodemoTarget net.Port) (socksPort, httpPort, dokodemoPort net.Port) {
++	t.Helper()
++	socksPort, httpPort, dokodemoPort = tcp.PickPort(), tcp.PickPort(), tcp.PickPort()
++	receiver := func(port net.Port) *serial.TypedMessage {
++		return serial.ToTypedMessage(&proxyman.ReceiverConfig{
++			PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(port)}},
++			Listen:   net.NewIPOrDomain(net.LocalHostIP),
++		})
++	}
++	config := &core.Config{
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: receiver(socksPort),
++				ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{
++					AuthType: socks.AuthType_NO_AUTH,
++					Address:  net.NewIPOrDomain(net.LocalHostIP),
++				}),
++			},
++			{
++				ReceiverSettings: receiver(httpPort),
++				ProxySettings:    serial.ToTypedMessage(&http.ServerConfig{}),
++			},
++			{
++				ReceiverSettings: receiver(dokodemoPort),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(net.LocalHostIP),
++					RewritePort:     uint32(dokodemoTarget),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&freedom.Config{
++					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++				}),
++			},
++		},
++	}
++	servers, err := InitializeServerConfigs(config)
++	common.Must(err)
++	t.Cleanup(func() { CloseAllServers(servers) })
++	return
++}
++
++type halfCloseDialer func(target net.Port) (*gonet.TCPConn, error)
++
++func halfCloseDialers(socksPort, httpPort, dokodemoPort net.Port) map[string]halfCloseDialer {
++	return map[string]halfCloseDialer{
++		"socks": func(target net.Port) (*gonet.TCPConn, error) {
++			dialer, err := xproxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), nil, xproxy.Direct)
++			if err != nil {
++				return nil, err
++			}
++			conn, err := dialer.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", target))
++			if err != nil {
++				return nil, err
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++		"http connect": func(target net.Port) (*gonet.TCPConn, error) {
++			conn, err := gonet.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
++			if err != nil {
++				return nil, err
++			}
++			fmt.Fprintf(conn, "CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", target, target)
++			// Read the status line and headers byte by byte, so nothing of the
++			// tunneled stream is left in a buffer.
++			var header strings.Builder
++			b := make([]byte, 1)
++			for !strings.HasSuffix(header.String(), "\r\n\r\n") {
++				if _, err := conn.Read(b); err != nil {
++					conn.Close()
++					return nil, err
++				}
++				header.WriteByte(b[0])
++			}
++			status, _ := bufio.NewReader(strings.NewReader(header.String())).ReadString('\n')
++			if !strings.Contains(status, " 200 ") {
++				conn.Close()
++				return nil, fmt.Errorf("CONNECT: %q", status)
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++		"dokodemo": func(net.Port) (*gonet.TCPConn, error) {
++			conn, err := gonet.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dokodemoPort))
++			if err != nil {
++				return nil, err
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++	}
++}
++
++// When the target closes after its answer, the client reads the end of the
++// answer as the target sent it, not once the inbound's uplinkOnly timer
++// (1 s by default) has run out on the client's idle upload.
++func TestHalfCloseTargetEndReachesTheClient(t *testing.T) {
++	target := startHalfCloseTarget(t, "close")
++	socksPort, httpPort, dokodemoPort := halfCloseProxy(t, target.port())
++	for name, dial := range halfCloseDialers(socksPort, httpPort, dokodemoPort) {
++		t.Run(name, func(t *testing.T) {
++			conn, err := dial(target.port())
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(5 * time.Second))
++			start := time.Now()
++			if _, err := conn.Write([]byte("request")); err != nil {
++				t.Fatal(err)
++			}
++			got, err := io.ReadAll(conn)
++			elapsed := time.Since(start)
++			if err != nil || string(got) != "reply" {
++				t.Fatalf("read %q, %v; want the reply and EOF", got, err)
++			}
++			if elapsed > 500*time.Millisecond {
++				t.Fatalf("EOF arrived after %v; the target closed at once", elapsed.Round(time.Millisecond))
++			}
++		})
++	}
++}
++
++// A client that half-closes after its request reaches a target that answers
++// only on EOF: the FIN is passed on, and the answer comes back.
++func TestHalfCloseClientEndReachesTheTarget(t *testing.T) {
++	target := startHalfCloseTarget(t, "after-eof")
++	socksPort, httpPort, dokodemoPort := halfCloseProxy(t, target.port())
++	for name, dial := range halfCloseDialers(socksPort, httpPort, dokodemoPort) {
++		t.Run(name, func(t *testing.T) {
++			conn, err := dial(target.port())
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(5 * time.Second))
++			if _, err := conn.Write([]byte("request")); err != nil {
++				t.Fatal(err)
++			}
++			if err := conn.CloseWrite(); err != nil {
++				t.Fatal(err)
++			}
++			got, err := io.ReadAll(conn)
++			if err != nil || string(got) != "reply after eof" {
++				t.Fatalf("read %q, %v; want the target's answer to the client's FIN", got, err)
++			}
++		})
++	}
++}
+-- 
+2.47.3
+

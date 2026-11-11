@@ -68,6 +68,9 @@ ARG XHTTP_MUX=required
 # Client Hello только с X25519, без X25519MLKEM768. Такой Client Hello влезает в
 # один TCP-сегмент, гибридный никогда, и путь, который режет второй сегмент,
 # иначе отрезает всех клиентов. По умолчанию выключено, как у апстрима.
+# Там же: соединение fallback, которое цель оборвала (RST), закрывается и на
+# стороне клиента, а не только наполовину; молчащий клиент больше не держит
+# горутины сервера (XTLS/REALITY@8530a57, в main REALITY его нет).
 # required — патчи обязаны лечь; off — без них.
 ARG REALITY_X25519=required
 
@@ -78,6 +81,12 @@ ARG REALITY_X25519=required
 # ClientHello в нескольких TLS-записях.
 # required — патчи обязаны лечь; off — без них.
 ARG SNIFF=required
+
+# Half-close TCP (patches/close): freedom передаёт цели FIN клиента, а SOCKS,
+# HTTP CONNECT и dokodemo-door передают приложению конец ответа сразу, а не
+# через uplinkOnly (1 с). Только для голых TCP- и Unix-сокетов.
+# required — патч обязан лечь; off — без него.
+ARG HALF_CLOSE=required
 
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
@@ -211,6 +220,7 @@ RUN set -eu; \
     done; \
     go mod edit -replace github.com/xtls/reality=./third_party/reality; \
     grep -q 'AllowX25519 bool' third_party/reality/common.go \
+      && grep -q 'underlying.Close()' third_party/reality/tls.go \
       && grep -q 'AllowX25519' infra/conf/transport_security.go \
       || { echo "REALITY allowX25519 hooks are missing after patching" >&2; exit 1; }; \
     echo "REALITY allowX25519: included"
@@ -232,6 +242,22 @@ RUN set -eu; \
       && grep -q 'sniffHTTPOrTracker' app/dispatcher/sniffer.go \
       || { echo "Sniffer hooks are missing after patching" >&2; exit 1; }; \
     echo "Sniffers: included"
+
+COPY patches/close /patches/close
+RUN set -eu; \
+    case "$HALF_CLOSE" in \
+      off) echo "TCP half-close: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "HALF_CLOSE must be required or off, got '$HALF_CLOSE'" >&2; exit 1 ;; \
+    esac; \
+    for p in /patches/close/*.patch; do \
+      git apply "$p" \
+        || { echo "Half-close patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'proxy.CloseWriteRAW(conn)' proxy/freedom/freedom.go \
+      && grep -q 'proxy.NewHalfClosingWriter(conn)' proxy/socks/server.go \
+      || { echo "Half-close hooks are missing after patching" >&2; exit 1; }; \
+    echo "TCP half-close: included"
 
 # С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
 # работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается

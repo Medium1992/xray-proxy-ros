@@ -1,0 +1,69 @@
+From 0e1f647cec1811bcc7016c3dfee0e77323934bdf Mon Sep 17 00:00:00 2001
+From: medium <medium@debian.debian>
+Date: Thu, 12 Nov 2026 09:48:05 +0300
+Subject: [PATCH] fix(bittorrent): take an announce by its parameters whatever
+ its path
+
+The review fixes required the path to name an announce, and RuTracker's
+announce path is /ann: its announces went out as HTTP again. An announce
+is told by whole info_hash and peer_id parameters on any path; a scrape,
+which carries only info_hash, still needs a path that names it, now also
+scrape.php. The URLs that only mention the names stay HTTP.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/protocol/bittorrent/bittorrent.go      | 13 +++++++------
+ common/protocol/bittorrent/signatures_test.go |  6 ++++++
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/common/protocol/bittorrent/bittorrent.go b/common/protocol/bittorrent/bittorrent.go
+index fe229a11..eba24f79 100644
+--- a/common/protocol/bittorrent/bittorrent.go
++++ b/common/protocol/bittorrent/bittorrent.go
+@@ -136,11 +136,12 @@ func sniffUTPHandshake(b []byte) (*SniffHeader, error) {
+ 	return &SniffHeader{}, nil
+ }
+ 
+-// SniffHTTPTracker takes an HTTP tracker request (BEP 3, BEP 48): a GET of
+-// an announce with info_hash and peer_id parameters, or of a scrape with
+-// info_hash. The path's last segment names the request, as announce or
+-// announce.php does, and the parameters are whole names in the query. It
+-// runs before the HTTP sniffer, which would otherwise take the flow as HTTP.
++// SniffHTTPTracker takes an HTTP tracker request (BEP 3, BEP 48): a GET
++// with info_hash and peer_id parameters, an announce whatever its path
++// (RuTracker's is /ann), or a GET of a scrape, whose last path segment starts
++// with scrape, with info_hash. The parameters are whole names in the query.
++// It runs before the HTTP sniffer, which would otherwise take the flow as
++// HTTP.
+ func SniffHTTPTracker(b []byte) (*SniffHeader, error) {
+ 	const get = "GET /"
+ 	if len(b) < len(get) {
+@@ -172,7 +173,7 @@ func SniffHTTPTracker(b []byte) (*SniffHeader, error) {
+ 		}
+ 	}
+ 	switch {
+-	case bytes.HasPrefix(request, []byte("announce")) && infoHash && peerID,
++	case infoHash && peerID,
+ 		bytes.HasPrefix(request, []byte("scrape")) && infoHash:
+ 		return &SniffHeader{}, nil
+ 	}
+diff --git a/common/protocol/bittorrent/signatures_test.go b/common/protocol/bittorrent/signatures_test.go
+index 3c91c71c..e4728dba 100644
+--- a/common/protocol/bittorrent/signatures_test.go
++++ b/common/protocol/bittorrent/signatures_test.go
+@@ -15,6 +15,12 @@ func TestSniffHTTPTracker(t *testing.T) {
+ 		"Transmission announce": "GET /announce.php?passkey=abc&info_hash=%9a%81%3b%ef&peer_id=-TR4060-ab12cd34ef56&port=51413&uploaded=0&downloaded=0&left=1&numwant=80&key=1a2b3c&compact=1&supportcrypto=1&event=started HTTP/1.1\r\nHost: t.example.org\r\n\r\n",
+ 		"scrape":                "GET /scrape?info_hash=%9a%81%3b%ef HTTP/1.1\r\nHost: tracker.example.com\r\n\r\n",
+ 		"request line only":     "GET /announce?info_hash=x&peer_id=y",
++		// Announce paths of real trackers that do not say announce.
++		"RuTracker":           "GET /ann?pk=0123456789abcdef&info_hash=%9a%81%3b%ef&peer_id=-qB4630-k8hj0wgej6ch&port=6881&uploaded=0&downloaded=0&left=0&event=started&compact=1 HTTP/1.1\r\nHost: bt4.t-ru.org\r\n\r\n",
++		"passkey in the path": "GET /0123456789abcdef/announce?info_hash=%9a%81&peer_id=-TR4060-ab12cd34ef56 HTTP/1.1\r\nHost: t.example.org\r\n\r\n",
++		"TorrentPier":         "GET /bt/announce.php?uk=abc&info_hash=%9a%81&peer_id=-qB4630-k8hj0wgej6ch HTTP/1.1\r\nHost: bt.example.org\r\n\r\n",
++		"root path":           "GET /?info_hash=%9a%81&peer_id=-qB4630-k8hj0wgej6ch&port=6881 HTTP/1.1\r\nHost: t.example.org\r\n\r\n",
++		"scrape.php":          "GET /scrape.php?info_hash=%9a%81 HTTP/1.1\r\nHost: t.example.org\r\n\r\n",
+ 	} {
+ 		if _, err := SniffHTTPTracker([]byte(request)); err != nil {
+ 			t.Errorf("%s: %v", name, err)
+-- 
+2.47.3
+

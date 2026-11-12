@@ -88,6 +88,13 @@ ARG SNIFF=required
 # required — патч обязан лечь; off — без него.
 ARG HALF_CLOSE=required
 
+# Запасное TCP-подключение (patches/connect): если SYN не получил ответа за
+# 250 мс, рядом начинается одно запасное подключение, как в Chrome и Firefox;
+# берётся первое установленное. Потерянный SYN стоит 0,25 с вместо 1 с.
+# Рукопожатие TLS/REALITY по-прежнему одно на соединение.
+# required — патч обязан лечь; off — без него.
+ARG BACKUP_CONNECT=required
+
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
 # ошибкой, а не тихой подменой.
@@ -258,6 +265,22 @@ RUN set -eu; \
       && grep -q 'proxy.NewHalfClosingWriter(conn)' proxy/socks/server.go \
       || { echo "Half-close hooks are missing after patching" >&2; exit 1; }; \
     echo "TCP half-close: included"
+
+COPY patches/connect /patches/connect
+RUN set -eu; \
+    case "$BACKUP_CONNECT" in \
+      off) echo "Backup connect: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "BACKUP_CONNECT must be required or off, got '$BACKUP_CONNECT'" >&2; exit 1 ;; \
+    esac; \
+    for p in /patches/connect/*.patch; do \
+      git apply "$p" \
+        || { echo "Backup connect patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'return systemDial(ctx, src, dest, sockopt)' transport/internet/dialer.go \
+      && grep -q 'func connectWithBackup' transport/internet/dial_backup.go \
+      || { echo "Backup connect hooks are missing after patching" >&2; exit 1; }; \
+    echo "Backup connect: included"
 
 # С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
 # работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается

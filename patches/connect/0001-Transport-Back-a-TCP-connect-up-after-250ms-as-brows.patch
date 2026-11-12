@@ -1,0 +1,317 @@
+From 8fee242ca0e5cb30f5a1c52fc75b8a07a84e0067 Mon Sep 17 00:00:00 2001
+From: Medium1992 <Medium1992@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:59:26 +0300
+Subject: [PATCH] Transport: Back a TCP connect up after 250ms, as browsers do
+
+A connect whose SYN was lost waited for the kernel to send it again after
+1s. DialSystem now starts one backup connect beside a TCP connect that
+has not answered after 250ms, as Chrome's and Firefox's connection pools
+do, and uses the first connection made; the other attempt is cancelled
+and a connection it makes anyway is closed. A refused connect is an
+answer and starts no backup. Only the connect is backed up: a TLS or
+REALITY handshake on top of it still has its one connection, so a
+handshake that hangs sends no second ClientHello.
+
+On a stand that drops the first 200ms of SYNs to the target, a connect
+through freedom took 1.007s and now 0.252s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ transport/internet/dial_backup.go      |  74 +++++++++++
+ transport/internet/dial_backup_test.go | 169 +++++++++++++++++++++++++
+ transport/internet/dialer.go           |  15 ++-
+ 3 files changed, 256 insertions(+), 2 deletions(-)
+ create mode 100644 transport/internet/dial_backup.go
+ create mode 100644 transport/internet/dial_backup_test.go
+
+diff --git a/transport/internet/dial_backup.go b/transport/internet/dial_backup.go
+new file mode 100644
+index 00000000..32469c96
+--- /dev/null
++++ b/transport/internet/dial_backup.go
+@@ -0,0 +1,74 @@
++package internet
++
++import (
++	"context"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++)
++
++// backupConnectDelay is how long a TCP connect may go unanswered before a
++// backup connect starts beside it, as Chrome's and Firefox's do (250ms): a
++// lost SYN is otherwise sent again only after the kernel's 1s timeout.
++const backupConnectDelay = 250 * time.Millisecond
++
++type connectResult struct {
++	conn net.Conn
++	err  error
++}
++
++// connectWithBackup runs connect, and once more beside it if the first has
++// not answered after backupConnectDelay. The first connection made is
++// returned; the other attempt is cancelled, and a connection it makes anyway
++// is closed. An error is an answer: it is returned once no attempt is left.
++// Only the connect is backed up, never a TLS or REALITY handshake on top of
++// it, so a handshake that hangs still has one connection, as in browsers.
++func connectWithBackup(ctx context.Context, connect func(context.Context) (net.Conn, error)) (net.Conn, error) {
++	ctx, cancel := context.WithCancel(ctx)
++	results := make(chan connectResult, 2)
++	start := func() {
++		go func() {
++			conn, err := connect(ctx)
++			results <- connectResult{conn, err}
++		}()
++	}
++
++	start()
++	inFlight := 1
++	timer := time.NewTimer(backupConnectDelay)
++	defer timer.Stop()
++	var lastErr error
++	for {
++		select {
++		case r := <-results:
++			inFlight--
++			if r.err == nil {
++				cancel()
++				go closeLateConnects(results, inFlight)
++				return r.conn, nil
++			}
++			lastErr = r.err
++			if inFlight == 0 {
++				cancel()
++				return nil, lastErr
++			}
++		case <-timer.C:
++			start()
++			inFlight++
++		case <-ctx.Done():
++			cancel()
++			go closeLateConnects(results, inFlight)
++			return nil, ctx.Err()
++		}
++	}
++}
++
++// closeLateConnects waits for the n attempts still in flight and closes any
++// connection they make.
++func closeLateConnects(results <-chan connectResult, n int) {
++	for range n {
++		if r := <-results; r.conn != nil {
++			r.conn.Close()
++		}
++	}
++}
+diff --git a/transport/internet/dial_backup_test.go b/transport/internet/dial_backup_test.go
+new file mode 100644
+index 00000000..b36880b3
+--- /dev/null
++++ b/transport/internet/dial_backup_test.go
+@@ -0,0 +1,169 @@
++package internet_test
++
++import (
++	"context"
++	"errors"
++	gonet "net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++	. "github.com/xtls/xray-core/transport/internet"
++)
++
++// scriptedDialer answers each Dial with the next of its steps.
++type scriptedDialer struct {
++	mu    sync.Mutex
++	steps []func(ctx context.Context) (net.Conn, error)
++	calls atomic.Int32
++}
++
++func (d *scriptedDialer) Dial(ctx context.Context, _ net.Address, _ net.Destination, _ *SocketConfig) (net.Conn, error) {
++	n := int(d.calls.Add(1)) - 1
++	d.mu.Lock()
++	step := d.steps[min(n, len(d.steps)-1)]
++	d.mu.Unlock()
++	return step(ctx)
++}
++
++func (d *scriptedDialer) DestIpAddress() net.IP { return nil }
++
++func useDialer(t *testing.T, d SystemDialer) {
++	t.Helper()
++	UseAlternativeSystemDialer(d)
++	t.Cleanup(func() { UseAlternativeSystemDialer(nil) })
++}
++
++// recordConn is a net.Conn that records Close.
++type recordConn struct {
++	gonet.Conn
++	closed atomic.Bool
++}
++
++func (c *recordConn) Close() error {
++	c.closed.Store(true)
++	return nil
++}
++
++func hangUntilCancelled(cancelled chan<- struct{}) func(ctx context.Context) (net.Conn, error) {
++	return func(ctx context.Context) (net.Conn, error) {
++		<-ctx.Done()
++		if cancelled != nil {
++			close(cancelled)
++		}
++		return nil, ctx.Err()
++	}
++}
++
++func answer(conn net.Conn, after time.Duration) func(ctx context.Context) (net.Conn, error) {
++	return func(ctx context.Context) (net.Conn, error) {
++		time.Sleep(after)
++		return conn, nil
++	}
++}
++
++var tcpDest = net.TCPDestination(net.LocalHostIP, 443)
++
++// A TCP connect whose SYN goes unanswered gets one backup connect after
++// 250ms, as Chrome and Firefox start one; the first connection made is used
++// and the other attempt is cancelled.
++func TestDialSystemStartsABackupForAStuckConnect(t *testing.T) {
++	won := &recordConn{}
++	cancelled := make(chan struct{})
++	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){hangUntilCancelled(cancelled), answer(won, 0)}}
++	useDialer(t, d)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	start := time.Now()
++	conn, err := DialSystem(ctx, tcpDest, nil)
++	if err != nil || conn != won {
++		t.Fatalf("DialSystem = %v, %v; want the backup's conn", conn, err)
++	}
++	if elapsed := time.Since(start); elapsed < 200*time.Millisecond || elapsed > time.Second {
++		t.Fatalf("answered after %v; the backup starts after 250ms", elapsed)
++	}
++	select {
++	case <-cancelled:
++	case <-time.After(time.Second):
++		t.Fatal("the stuck connect was not cancelled")
++	}
++	if n := d.calls.Load(); n != 2 {
++		t.Fatalf("%d connects, want 2", n)
++	}
++}
++
++// A connect that completes in time starts no backup, and a slow one starts
++// only one.
++func TestDialSystemStartsAtMostOneBackup(t *testing.T) {
++	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){answer(&recordConn{}, 50*time.Millisecond)}}
++	useDialer(t, d)
++	if _, err := DialSystem(context.Background(), tcpDest, nil); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(400 * time.Millisecond)
++	if n := d.calls.Load(); n != 1 {
++		t.Fatalf("a connect in time: %d connects, want 1", n)
++	}
++
++	d = &scriptedDialer{steps: []func(context.Context) (net.Conn, error){hangUntilCancelled(nil)}}
++	useDialer(t, d)
++	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
++	defer cancel()
++	if _, err := DialSystem(ctx, tcpDest, nil); err == nil {
++		t.Fatal("a connect nobody answers succeeded")
++	}
++	if n := d.calls.Load(); n != 2 {
++		t.Fatalf("connects nobody answers: %d, want 2", n)
++	}
++}
++
++// A refused connect is an answer: it is returned at once and starts no
++// backup.
++func TestDialSystemReturnsARefusalWithoutABackup(t *testing.T) {
++	refused := errors.New("connection refused")
++	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){func(context.Context) (net.Conn, error) { return nil, refused }}}
++	useDialer(t, d)
++	if _, err := DialSystem(context.Background(), tcpDest, nil); err != refused {
++		t.Fatalf("err = %v, want the refusal", err)
++	}
++	time.Sleep(400 * time.Millisecond)
++	if n := d.calls.Load(); n != 1 {
++		t.Fatalf("%d connects, want 1", n)
++	}
++}
++
++// A connection the first attempt makes after the backup won is closed.
++func TestDialSystemClosesALateConnect(t *testing.T) {
++	late := &recordConn{}
++	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){answer(late, 600*time.Millisecond), answer(&recordConn{}, 0)}}
++	useDialer(t, d)
++	conn, err := DialSystem(context.Background(), tcpDest, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if conn == late {
++		t.Fatal("the slow first connect was used; no backup started")
++	}
++	deadline := time.Now().Add(2 * time.Second)
++	for !late.closed.Load() {
++		if time.Now().After(deadline) {
++			t.Fatal("the late connection was not closed")
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++// UDP has no connect to back up.
++func TestDialSystemStartsNoBackupForUDP(t *testing.T) {
++	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){answer(&recordConn{}, 400*time.Millisecond)}}
++	useDialer(t, d)
++	if _, err := DialSystem(context.Background(), net.UDPDestination(net.LocalHostIP, 53), nil); err != nil {
++		t.Fatal(err)
++	}
++	if n := d.calls.Load(); n != 1 {
++		t.Fatalf("%d dials, want 1", n)
++	}
++}
+diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
+index 6d7b905d..d35eac52 100644
+--- a/transport/internet/dialer.go
++++ b/transport/internet/dialer.go
+@@ -240,7 +240,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 		}
+ 	}
+ 	if sockopt == nil {
+-		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
++		return systemDial(ctx, src, dest, sockopt)
+ 	}
+ 
+ 	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
+@@ -278,7 +278,18 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
+ 	}
+ 
+-	return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
++	return systemDial(ctx, src, dest, sockopt)
++}
++
++// systemDial dials with the effective system dialer, backing a TCP connect up
++// as connectWithBackup does.
++func systemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
++	if dest.Network != net.Network_TCP {
++		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
++	}
++	return connectWithBackup(ctx, func(ctx context.Context) (net.Conn, error) {
++		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
++	})
+ }
+ 
+ func InitSystemDialer(dc dns.Client, om outbound.Manager) {
+-- 
+2.47.3
+

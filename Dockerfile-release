@@ -56,7 +56,10 @@ ARG H2_SCRATCH_KB=32
 # регулятора. В собранном ядре регулятор выключен, пока его не включит
 # переменная окружения XRAY_XHTTP_FLOW=on или "h2Flow" в extra ссылки.
 # Там же рукопожатие TLS/REALITY клиента XHTTP ограничено 10 с: заглохшее после
-# ClientHello больше не держит все запросы, вставшие за этим дозвоном.
+# ClientHello больше не держит все запросы, вставшие за этим дозвоном. И рядом с
+# повисшим рукопожатием начинается новый дозвон: через удвоенное время прошлого
+# рукопожатия (250 мс…3 с, до первого — 1 с), не больше 4 попыток; после
+# неудачного дозвона к серверу следующий идёт одной попыткой.
 ARG XHTTP_FLOW=required
 
 # Mux.Cool поверх XHTTP и серверный KeepAlive для простаивающего downlink
@@ -129,6 +132,7 @@ RUN set -eu; \
     grep -q 'flowListener{' transport/internet/splithttp/hub.go \
       && grep -q 'newFlowClientConn(conn)' transport/internet/splithttp/dialer.go \
       && grep -q 'context.WithTimeout(ctxInner, 10\*time.Second)' transport/internet/splithttp/dialer.go \
+      && grep -q 'hedgedDialer{dial: dialOnce' transport/internet/splithttp/dialer.go \
       || { echo "XHTTP flow governor hooks are missing after patching" >&2; exit 1; }; \
     echo "XHTTP flow governor: included"
 

@@ -1,0 +1,318 @@
+diff --git a/third_party/utls/key_schedule.go b/third_party/utls/key_schedule.go
+index e423484..3a7e55d 100644
+--- a/third_party/utls/key_schedule.go
++++ b/third_party/utls/key_schedule.go
+@@ -57,6 +57,12 @@ type keySharePrivateKeys struct {
+ 	mlkem crypto.Decapsulator
+ 
+ 	mlkemEcdhe *ecdh.PrivateKey // [uTLS] seperate ecdhe key for pq keyshare in line with Chrome, instead of reusing ecdhe key like stdlib
++
++	// [uTLS] ecdheFallback keeps the private keys of the classical key shares
++	// after the first one, by group. A spec may send several (Firefox sends
++	// X25519 and P-256); ecdhe holds only the first, and a server may select
++	// any of them.
++	ecdheFallback map[CurveID]*ecdh.PrivateKey
+ }
+ 
+ // A keyExchange implements a TLS 1.3 KEM.
+@@ -197,6 +203,12 @@ func (ke *ecdhKeyExchange) clientSharedSecretChooseEcdhe(priv *keySharePrivateKe
+ 		}
+ 		ecdhe = priv.mlkemEcdhe
+ 	}
++	if !useSeperateEcdhe && (ecdhe == nil || ecdhe.Curve() != ke.curve) {
++		if key, ok := priv.ecdheFallback[ke.id]; ok {
++			// The server selected a classical key share sent after the first.
++			ecdhe = key
++		}
++	}
+ 	if ecdhe == nil {
+ 		return nil, errors.New("tls: missing ECDHE private key")
+ 	}
+diff --git a/third_party/utls/u_common.go b/third_party/utls/u_common.go
+index 7901583..2b363c2 100644
+--- a/third_party/utls/u_common.go
++++ b/third_party/utls/u_common.go
+@@ -603,7 +603,7 @@ var (
+ 	HelloRandomizedNoALPN = ClientHelloID{helloRandomizedNoALPN, helloAutoVers, nil, nil}
+ 
+ 	// The rest will will parrot given browser.
+-	HelloFirefox_Auto = HelloFirefox_148
++	HelloFirefox_Auto = HelloFirefox_156
+ 	HelloFirefox_55   = ClientHelloID{helloFirefox, "55", nil, nil}
+ 	HelloFirefox_56   = ClientHelloID{helloFirefox, "56", nil, nil}
+ 	HelloFirefox_63   = ClientHelloID{helloFirefox, "63", nil, nil}
+@@ -613,6 +613,7 @@ var (
+ 	HelloFirefox_105  = ClientHelloID{helloFirefox, "105", nil, nil}
+ 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
+ 	HelloFirefox_148  = ClientHelloID{helloFirefox, "148", nil, nil}
++	HelloFirefox_156  = ClientHelloID{helloFirefox, "156", nil, nil}
+ 
+ 	HelloChrome_Auto        = HelloChrome_155
+ 	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}
+diff --git a/third_party/utls/u_parrots.go b/third_party/utls/u_parrots.go
+index fe17382..1fc9b58 100644
+--- a/third_party/utls/u_parrots.go
++++ b/third_party/utls/u_parrots.go
+@@ -1667,6 +1667,133 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+ 				},
+ 			},
+ 		}, nil
++	// Firefox 156: no ECDSA CBC suites and FFDHE groups, session_ticket and
++	// psk_key_exchange_modes added. Matches Firefox 160 captures.
++	case HelloFirefox_156:
++		return ClientHelloSpec{
++			TLSVersMin: VersionTLS12,
++			TLSVersMax: VersionTLS13,
++			CipherSuites: []uint16{
++				TLS_AES_128_GCM_SHA256,
++				TLS_CHACHA20_POLY1305_SHA256,
++				TLS_AES_256_GCM_SHA384,
++				TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++				TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++				TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
++				TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
++				TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++				TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++				TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++				TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
++				TLS_RSA_WITH_AES_128_GCM_SHA256,
++				TLS_RSA_WITH_AES_256_GCM_SHA384,
++				TLS_RSA_WITH_AES_128_CBC_SHA,
++				TLS_RSA_WITH_AES_256_CBC_SHA,
++			},
++			CompressionMethods: []uint8{
++				0x0, // no compression
++			},
++			Extensions: []TLSExtension{
++				&SNIExtension{},
++				&ExtendedMasterSecretExtension{},
++				&RenegotiationInfoExtension{
++					Renegotiation: RenegotiateOnceAsClient,
++				},
++				&SupportedCurvesExtension{
++					Curves: []CurveID{
++						X25519MLKEM768,
++						X25519,
++						CurveP256,
++						CurveP384,
++						CurveP521,
++					},
++				},
++				&SupportedPointsExtension{
++					SupportedPoints: []uint8{
++						0x0, // uncompressed
++					},
++				},
++				&SessionTicketExtension{},
++				&ALPNExtension{
++					AlpnProtocols: []string{
++						"h2",
++						"http/1.1",
++					},
++				},
++				&StatusRequestExtension{},
++				&FakeDelegatedCredentialsExtension{
++					SupportedSignatureAlgorithms: []SignatureScheme{
++						ECDSAWithP256AndSHA256,
++						ECDSAWithP384AndSHA384,
++						ECDSAWithP521AndSHA512,
++						ECDSAWithSHA1,
++					},
++				},
++				&SCTExtension{},
++				&KeyShareExtension{
++					KeyShares: append(
++						ReuseHybridAndClassicalKeyShares(
++							KeyShare{
++								Group: X25519MLKEM768,
++							},
++							KeyShare{
++								Group: X25519,
++							},
++						),
++						KeyShare{
++							Group: CurveP256,
++						},
++					),
++				},
++				&SupportedVersionsExtension{
++					Versions: []uint16{
++						VersionTLS13,
++						VersionTLS12,
++					},
++				},
++				&SignatureAlgorithmsExtension{
++					SupportedSignatureAlgorithms: []SignatureScheme{
++						ECDSAWithP256AndSHA256,
++						ECDSAWithP384AndSHA384,
++						ECDSAWithP521AndSHA512,
++						PSSWithSHA256,
++						PSSWithSHA384,
++						PSSWithSHA512,
++						PKCS1WithSHA256,
++						PKCS1WithSHA384,
++						PKCS1WithSHA512,
++						ECDSAWithSHA1,
++						PKCS1WithSHA1,
++					},
++				},
++				&PSKKeyExchangeModesExtension{
++					Modes: []uint8{
++						PskModeDHE,
++					},
++				},
++				&FakeRecordSizeLimitExtension{
++					Limit: 0x4001,
++				},
++				&UtlsCompressCertExtension{[]CertCompressionAlgo{
++					CertCompressionZlib,
++					CertCompressionBrotli,
++					CertCompressionZstd,
++				}},
++				&GREASEEncryptedClientHelloExtension{
++					CandidateCipherSuites: []HPKESymmetricCipherSuite{
++						{
++							KdfId:  dicttls.HKDF_SHA256,
++							AeadId: dicttls.AEAD_AES_128_GCM,
++						},
++						{
++							KdfId:  dicttls.HKDF_SHA256,
++							AeadId: dicttls.AEAD_CHACHA20_POLY1305,
++						},
++					},
++					CandidatePayloadLens: []uint16{224}, // +16: 240
++				},
++			},
++		}, nil
+ 	case HelloIOS_11_1:
+ 		return ClientHelloSpec{
+ 			TLSVersMax: VersionTLS12,
+@@ -3020,35 +3147,29 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+ //
+ // This feature was first introduced by Chrome 106.
+ func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
+-	// unshufCheck checks if the exts[idx] is a GREASE/padding/pre_shared_key extension,
+-	// and returns true on success. For these extensions are considered positionally invariant.
+-	var skipShuf = func(idx int, exts []TLSExtension) bool {
+-		switch exts[idx].(type) {
++	// GREASE, padding and pre_shared_key keep their places; the rest are
++	// permuted uniformly among themselves, as BoringSSL does. Skipping the
++	// swaps that touch a fixed extension instead would leave the extensions
++	// next to them in place twice as often as the others.
++	var movable []int
++	for i, ext := range exts {
++		switch ext.(type) {
+ 		case *UtlsGREASEExtension, *UtlsPaddingExtension, PreSharedKeyExtension:
+-			return true
+ 		default:
+-			return false
++			movable = append(movable, i)
+ 		}
+ 	}
++	swap := func(i, j int) {
++		exts[movable[i]], exts[movable[j]] = exts[movable[j]], exts[movable[i]]
++	}
+ 
+-	// Shuffle other extensions
+ 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+ 	if err != nil {
+ 		// warning: random could be deterministic
+-		rand.Shuffle(len(exts), func(i, j int) {
+-			if skipShuf(i, exts) || skipShuf(j, exts) {
+-				return // do not shuffle some of the extensions
+-			}
+-			exts[i], exts[j] = exts[j], exts[i]
+-		})
++		rand.Shuffle(len(movable), swap)
+ 		fmt.Println("Warning: failed to use a cryptographically secure random number generator. The shuffle can be deterministic.")
+ 	} else {
+-		rand.New(rand.NewSource(randInt64.Int64())).Shuffle(len(exts), func(i, j int) {
+-			if skipShuf(i, exts) || skipShuf(j, exts) {
+-				return // do not shuffle some of the extensions
+-			}
+-			exts[i], exts[j] = exts[j], exts[i]
+-		})
++		rand.New(rand.NewSource(randInt64.Int64())).Shuffle(len(movable), swap)
+ 	}
+ 
+ 	return exts
+@@ -3297,6 +3418,8 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
+ 							// only do this once for the first non-grease curve
+ 							uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = reusedKey
+ 							preferredCurveIsSet = true
++						} else {
++							uconn.HandshakeState.State13.KeyShareKeys.addEcdheFallback(curveID, reusedKey)
+ 						}
+ 						continue
+ 					}
+@@ -3312,6 +3435,9 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
+ 						// only do this once for the first non-grease curve
+ 						uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
+ 						preferredCurveIsSet = true
++					} else {
++						// keep it: the server may select this key share
++						uconn.HandshakeState.State13.KeyShareKeys.addEcdheFallback(curveID, ecdheKey)
+ 					}
+ 				}
+ 			}
+diff --git a/third_party/utls/u_public.go b/third_party/utls/u_public.go
+index f19cf91..3ea419a 100644
+--- a/third_party/utls/u_public.go
++++ b/third_party/utls/u_public.go
+@@ -925,9 +925,26 @@ func (kpk *kemPrivateKey) ToPublic() *KemPrivateKey {
+ 
+ type KeySharePrivateKeys struct {
+ 	// CurveID    CurveID
+-	Ecdhe      *ecdh.PrivateKey
+-	Mlkem      crypto.Decapsulator
+-	MlkemEcdhe *ecdh.PrivateKey
++	Ecdhe         *ecdh.PrivateKey
++	Mlkem         crypto.Decapsulator
++	MlkemEcdhe    *ecdh.PrivateKey
++	EcdheFallback map[CurveID]*ecdh.PrivateKey // [uTLS] keys of the classical key shares after the first, by group
++}
++
++// [uTLS] addEcdheFallback keeps the private key of a classical key share
++// sent after the first one. The first key share of a group wins, as a server
++// answers the first share it finds for the group it selects.
++func (ksp *KeySharePrivateKeys) addEcdheFallback(curveID CurveID, key *ecdh.PrivateKey) {
++	if ksp.Ecdhe != nil && ksp.Ecdhe.Curve() == key.Curve() {
++		return
++	}
++	if _, ok := ksp.EcdheFallback[curveID]; ok {
++		return
++	}
++	if ksp.EcdheFallback == nil {
++		ksp.EcdheFallback = make(map[CurveID]*ecdh.PrivateKey)
++	}
++	ksp.EcdheFallback[curveID] = key
+ }
+ 
+ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
+@@ -936,9 +953,10 @@ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
+ 	}
+ 	return &keySharePrivateKeys{
+ 		// curveID:    ksp.CurveID,
+-		ecdhe:      ksp.Ecdhe,
+-		mlkem:      ksp.Mlkem,
+-		mlkemEcdhe: ksp.MlkemEcdhe,
++		ecdhe:         ksp.Ecdhe,
++		mlkem:         ksp.Mlkem,
++		mlkemEcdhe:    ksp.MlkemEcdhe,
++		ecdheFallback: ksp.EcdheFallback,
+ 	}
+ }
+ 
+@@ -948,8 +966,9 @@ func (ksp *keySharePrivateKeys) ToPublic() *KeySharePrivateKeys {
+ 	}
+ 	return &KeySharePrivateKeys{
+ 		// CurveID:    ksp.curveID,
+-		Ecdhe:      ksp.ecdhe,
+-		Mlkem:      ksp.mlkem,
+-		MlkemEcdhe: ksp.mlkemEcdhe,
++		Ecdhe:         ksp.ecdhe,
++		Mlkem:         ksp.mlkem,
++		MlkemEcdhe:    ksp.mlkemEcdhe,
++		EcdheFallback: ksp.ecdheFallback,
+ 	}
+ }

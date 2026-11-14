@@ -74,6 +74,14 @@ ARG XHTTP_MUX=required
 # required — патчи обязаны лечь; off — без них.
 ARG REALITY_X25519=required
 
+# uTLS (patches/utls): "firefox" — отпечаток Firefox 156 вместо 148 (тот слал
+# шифры ECDSA CBC и группы FFDHE, от которых Firefox отказался, и не слал
+# session_ticket и psk_key_exchange_modes); расширения Chrome перемешиваются
+# равномерно (раньше ALPN был первым в 11% хелло вместо 5,9%); Firefox
+# доводит рукопожатие, если сервер выбрал P-256 (refraction-networking/utls#402).
+# required — патч обязан лечь; off — без него.
+ARG UTLS=required
+
 # Снифферы из форка mux-ka (patches/sniff): STUN для правила
 # "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime),
 # IP discovery голоса Discord для "discordrtc", DHT и UDP-трекеры,
@@ -231,6 +239,26 @@ RUN set -eu; \
       && grep -q 'AllowX25519' infra/conf/transport_security.go \
       || { echo "REALITY allowX25519 hooks are missing after patching" >&2; exit 1; }; \
     echo "REALITY allowX25519: included"
+
+COPY patches/utls /patches/utls
+RUN set -eu; \
+    case "$UTLS" in \
+      off) echo "uTLS: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "UTLS must be required or off, got '$UTLS'" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p third_party; \
+    cp -r "$(go list -m -f '{{.Dir}}' github.com/refraction-networking/utls)" third_party/utls; \
+    chmod -R u+w third_party/utls; \
+    for p in /patches/utls/*.patch; do \
+      git apply "$p" \
+        || { echo "uTLS patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    go mod edit -replace github.com/refraction-networking/utls=./third_party/utls; \
+    grep -q 'HelloFirefox_Auto = HelloFirefox_156' third_party/utls/u_common.go \
+      && grep -q 'rand.Shuffle(len(movable), swap)' third_party/utls/u_parrots.go \
+      || { echo "uTLS hooks are missing after patching" >&2; exit 1; }; \
+    echo "uTLS: included"
 
 COPY patches/sniff /patches/sniff
 RUN set -eu; \

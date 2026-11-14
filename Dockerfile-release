@@ -314,7 +314,8 @@ RUN set -eu; \
       git apply "$p" \
         || { echo "Backup connect patch $(basename "$p") no longer applies" >&2; exit 1; }; \
     done; \
-    grep -q 'return systemDial(ctx, src, dest, sockopt)' transport/internet/dialer.go \
+    grep -q 'return systemDial(ctx, src, dest, sockopt, outboundName)' transport/internet/dialer.go \
+      && grep -q 'outboundName == "freedom"' transport/internet/dialer.go \
       && grep -q 'func connectWithBackup' transport/internet/dial_backup.go \
       || { echo "Backup connect hooks are missing after patching" >&2; exit 1; }; \
     echo "Backup connect: included"

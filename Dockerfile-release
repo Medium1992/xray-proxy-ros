@@ -92,7 +92,10 @@ ARG SNIFF=required
 
 # Half-close TCP (patches/close): freedom передаёт цели FIN клиента, а SOCKS,
 # HTTP CONNECT и dokodemo-door передают приложению конец ответа сразу, а не
-# через uplinkOnly (1 с). Только для голых TCP- и Unix-сокетов.
+# через uplinkOnly (1 с). Только для голых TCP- и Unix-сокетов. Там же: при
+# ошибке рукопожатия TLS/REALITY (например, вместо TLS пришла HTTP-заглушка)
+# соединение закрывается, а не ждёт сборщика мусора; httpupgrade с "unsafe"
+# больше не висит вечно на сервере, который молчит.
 # required — патч обязан лечь; off — без него.
 ARG HALF_CLOSE=required
 
@@ -291,6 +294,7 @@ RUN set -eu; \
     done; \
     grep -q 'proxy.CloseWriteRAW(conn)' proxy/freedom/freedom.go \
       && grep -q 'proxy.NewHalfClosingWriter(conn)' proxy/socks/server.go \
+      && grep -q 'uConn.Close()' transport/internet/reality/reality.go \
       || { echo "Half-close hooks are missing after patching" >&2; exit 1; }; \
     echo "TCP half-close: included"
 

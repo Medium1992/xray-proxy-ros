@@ -9,6 +9,9 @@
 # same changes; a file that differs outside the expected list fails the
 # check. This is how a stale third_party/reality copy in the fork was found.
 #
+# The build does not need the fork: patches/ is complete on its own. This
+# check is only useful while the fork exists.
+#
 # Expected differences:
 #   core/core.go, features/policy/policy.go   version suffix and buffer size,
 #                                              set by Dockerfile-release args

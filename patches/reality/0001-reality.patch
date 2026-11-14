@@ -1,0 +1,494 @@
+patches/reality as one diff on XTLS/Xray-core v26.11.9 (676eaf66)
+after the series before it in Dockerfile-release. Written by regen-patches.sh.
+
+diff --git a/infra/conf/transport_security.go b/infra/conf/transport_security.go
+index 00e5387a..5671284d 100644
+--- a/infra/conf/transport_security.go
++++ b/infra/conf/transport_security.go
+@@ -36,6 +36,7 @@ type REALITYConfig struct {
+ 	MinClientVer string          `json:"minClientVer"`
+ 	MaxClientVer string          `json:"maxClientVer"`
+ 	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
++	AllowX25519  bool            `json:"allowX25519"`
+ 	ShortIds     []string        `json:"shortIds"`
+ 	Mldsa65Seed  string          `json:"mldsa65Seed"`
+ 
+@@ -150,6 +151,7 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
+ 		config.Xver = c.Xver
+ 		config.ServerNames = c.ServerNames
+ 		config.MaxTimeDiff = c.MaxTimeDiff
++		config.AllowX25519 = c.AllowX25519
+ 
+ 		if c.Mldsa65Seed != "" {
+ 			if c.Mldsa65Seed == c.PrivateKey {
+diff --git a/testing/scenarios/reality_x25519_test.go b/testing/scenarios/reality_x25519_test.go
+new file mode 100644
+index 00000000..d81f08ec
+--- /dev/null
++++ b/testing/scenarios/reality_x25519_test.go
+@@ -0,0 +1,211 @@
++package scenarios
++
++import (
++	gotls "crypto/tls"
++	"encoding/base64"
++	"encoding/hex"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/log"
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/common/uuid"
++	core "github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/proxy/vless/inbound"
++	"github.com/xtls/xray-core/proxy/vless/outbound"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/reality"
++	transtcp "github.com/xtls/xray-core/transport/internet/tcp"
++)
++
++// TestVlessRealityAllowX25519 connects through REALITY with a fingerprint
++// whose only key share is X25519 (edge) and with one that also sends
++// X25519MLKEM768 (chrome): the X25519-only Client Hello is let in only with
++// allowX25519, the hybrid one always.
++func TestVlessRealityAllowX25519(t *testing.T) {
++	for _, c := range []struct {
++		fingerprint string
++		allow       bool
++		pass        bool
++	}{
++		{"edge", false, false},
++		{"edge", true, true},
++		{"chrome", false, true},
++		{"chrome", true, true},
++	} {
++		err := realityX25519Conn(t, c.fingerprint, c.allow)
++		if (err == nil) != c.pass {
++			t.Errorf("fingerprint %s, allowX25519 %v: err %v, want pass %v", c.fingerprint, c.allow, err, c.pass)
++		}
++	}
++}
++
++// realityTarget serves TLS 1.3 for localhost, as REALITY's target.
++func realityTarget(t *testing.T) net.Destination {
++	t.Helper()
++	ct, _ := cert.MustGenerate(nil, cert.DNSNames("localhost"))
++	certPEM, keyPEM := ct.ToPEM()
++	pair, err := gotls.X509KeyPair(certPEM, keyPEM)
++	common.Must(err)
++	ln, err := gotls.Listen("tcp", "127.0.0.1:0", &gotls.Config{
++		MinVersion:   gotls.VersionTLS13,
++		Certificates: []gotls.Certificate{pair},
++	})
++	common.Must(err)
++	t.Cleanup(func() { ln.Close() })
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(10 * time.Second))
++				conn.(*gotls.Conn).Handshake()
++				buf := make([]byte, 1024)
++				for {
++					if _, err := conn.Read(buf); err != nil {
++						return
++					}
++				}
++			}()
++		}
++	}()
++	return net.DestinationFromAddr(ln.Addr())
++}
++
++func realityX25519Conn(t *testing.T, fingerprint string, allow bool) error {
++	tcpServer := tcp.Server{
++		MsgProcessor: xor,
++	}
++	dest, err := tcpServer.Start()
++	common.Must(err)
++	defer tcpServer.Close()
++	target := realityTarget(t)
++
++	userID := protocol.NewID(uuid.New())
++	serverPort := tcp.PickPort()
++	privateKey, _ := base64.RawURLEncoding.DecodeString("aGSYystUbf59_9_6LKRxD27rmSW_-2_nyd9YG_Gwbks")
++	publicKey, _ := base64.RawURLEncoding.DecodeString("E59WjnvZcQMu7tR7_BgyhycuEdBS-CtKxfImRCdAvFM")
++	shortID := make([]byte, 8)
++	hex.Decode(shortID, []byte("0123456789abcdef"))
++	serverConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&log.Config{
++				ErrorLogType: log.LogType_None,
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++					StreamSettings: &internet.StreamConfig{
++						ProtocolName: "tcp",
++						SecurityType: serial.GetMessageType(&reality.Config{}),
++						SecuritySettings: []*serial.TypedMessage{
++							serial.ToTypedMessage(&reality.Config{
++								Dest:        target.NetAddr(),
++								ServerNames: []string{"localhost"},
++								PrivateKey:  privateKey,
++								ShortIds:    [][]byte{shortID},
++								Type:        "tcp",
++								AllowX25519: allow,
++							}),
++						},
++					},
++				}),
++				ProxySettings: serial.ToTypedMessage(&inbound.Config{
++					Users: []*protocol.User{
++						{
++							Account: serial.ToTypedMessage(&vless.Account{
++								Id: userID.String(),
++							}),
++						},
++					},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&freedom.Config{
++					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++				}),
++			},
++		},
++	}
++
++	clientPort := tcp.PickPort()
++	clientConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&log.Config{
++				ErrorLogType: log.LogType_None,
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(dest.Address),
++					RewritePort:     uint32(dest.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&outbound.Config{
++					Vnext: &protocol.ServerEndpoint{
++						Address: net.NewIPOrDomain(net.LocalHostIP),
++						Port:    uint32(serverPort),
++						User: &protocol.User{
++							Account: serial.ToTypedMessage(&vless.Account{
++								Id: userID.String(),
++							}),
++						},
++					},
++				}),
++				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
++					StreamSettings: &internet.StreamConfig{
++						ProtocolName: "tcp",
++						TransportSettings: []*internet.TransportConfig{
++							{
++								ProtocolName: "tcp",
++								Settings:     serial.ToTypedMessage(&transtcp.Config{}),
++							},
++						},
++						SecurityType: serial.GetMessageType(&reality.Config{}),
++						SecuritySettings: []*serial.TypedMessage{
++							serial.ToTypedMessage(&reality.Config{
++								Fingerprint: fingerprint,
++								ServerName:  "localhost",
++								PublicKey:   publicKey,
++								ShortId:     shortID,
++								SpiderX:     "/",
++							}),
++						},
++					},
++				}),
++			},
++		},
++	}
++
++	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
++	common.Must(err)
++	defer CloseAllServers(servers)
++
++	return testTCPConn(clientPort, 64*1024, 5*time.Second)()
++}
+diff --git a/third_party/reality/common.go b/third_party/reality/common.go
+index 3600ce42..10ebc12b 100644
+--- a/third_party/reality/common.go
++++ b/third_party/reality/common.go
+@@ -600,6 +600,10 @@ type Config struct {
+ 	MaxTimeDiff  time.Duration
+ 	ShortIds     map[[8]byte]bool
+ 
++	// AllowX25519 accepts a Client Hello whose only usable key share is
++	// X25519, as before X25519MLKEM768 became required.
++	AllowX25519 bool
++
+ 	Mldsa65Key *mldsa.PrivateKey
+ 
+ 	LimitFallbackUpload   LimitFallback
+@@ -1056,6 +1060,7 @@ func (c *Config) Clone() *Config {
+ 		MaxClientVer:          c.MaxClientVer,
+ 		MaxTimeDiff:           c.MaxTimeDiff,
+ 		ShortIds:              c.ShortIds,
++		AllowX25519:           c.AllowX25519,
+ 		Mldsa65Key:            c.Mldsa65Key,
+ 		LimitFallbackUpload:   c.LimitFallbackUpload,
+ 		LimitFallbackDownload: c.LimitFallbackDownload,
+diff --git a/third_party/reality/fallback_close_test.go b/third_party/reality/fallback_close_test.go
+new file mode 100644
+index 00000000..773f6099
+--- /dev/null
++++ b/third_party/reality/fallback_close_test.go
+@@ -0,0 +1,124 @@
++package reality
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// fallbackServer runs Server on one accepted connection and returns the
++// client side of it together with the channel Server's error arrives on.
++func fallbackServer(t *testing.T, target net.Listener) (net.Conn, <-chan error) {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { ln.Close() })
++	config := &Config{
++		DialContext: new(net.Dialer).DialContext,
++		Type:        "tcp",
++		Dest:        target.Addr().String(),
++		ServerNames: map[string]bool{"example.com": true},
++	}
++	done := make(chan error, 1)
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			done <- err
++			return
++		}
++		_, err = Server(context.Background(), conn, config)
++		done <- err
++	}()
++	client, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	return client, done
++}
++
++// serveTarget accepts one connection, reads the request, answers with reply
++// and then ends the connection with a reset or a FIN.
++func serveTarget(t *testing.T, reply string, reset bool) net.Listener {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { ln.Close() })
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			return
++		}
++		buf := make([]byte, 1024)
++		conn.Read(buf)
++		conn.Write([]byte(reply))
++		if reset {
++			conn.(*net.TCPConn).SetLinger(0)
++		}
++		conn.Close()
++	}()
++	return ln
++}
++
++const fallbackReply = "HTTP/1.1 400 Bad Request\r\n\r\n"
++
++// A client that stays silent after the target reset the fallback connection
++// must not hold Server: the client side is closed instead of half-closed.
++func TestFallbackTargetResetClosesClient(t *testing.T) {
++	client, done := fallbackServer(t, serveTarget(t, fallbackReply, true))
++	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("Server() = nil error for a fallback connection")
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("Server() still runs 3s after the target reset, held by a silent client")
++	}
++	client.SetReadDeadline(time.Now().Add(3 * time.Second))
++	if _, err := io.ReadAll(client); err != nil && !isConnReset(err) {
++		t.Fatalf("client read after the target reset: %v", err)
++	}
++}
++
++// A target that ends with a FIN is still passed on as a half-close: the client
++// reads the reply and EOF, and Server ends once the client closes too.
++func TestFallbackTargetFINHalfClosesClient(t *testing.T) {
++	client, done := fallbackServer(t, serveTarget(t, fallbackReply, false))
++	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")); err != nil {
++		t.Fatal(err)
++	}
++	client.SetReadDeadline(time.Now().Add(3 * time.Second))
++	got, err := io.ReadAll(client)
++	if err != nil {
++		t.Fatalf("client read: %v", err)
++	}
++	if string(got) != fallbackReply {
++		t.Fatalf("client read %q, want %q", got, fallbackReply)
++	}
++	select {
++	case err := <-done:
++		t.Fatalf("Server() = %v before the client closed; the target's FIN must stay a half-close", err)
++	case <-time.After(300 * time.Millisecond):
++	}
++	client.Close()
++	select {
++	case <-done:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Server() still runs 3s after the client closed")
++	}
++}
++
++func isConnReset(err error) bool {
++	return errors.Is(err, syscall.ECONNRESET)
++}
+diff --git a/third_party/reality/tls.go b/third_party/reality/tls.go
+index 51decd7e..59a48b6a 100644
+--- a/third_party/reality/tls.go
++++ b/third_party/reality/tls.go
+@@ -231,7 +231,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
+ 					break // ensure order
+ 				}
+ 			}
+-			if peerPub2 == nil {
++			if peerPub2 == nil && !(config.AllowX25519 && peerPub != nil) {
+ 				break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
+ 			}
+ 			if peerPub == nil {
+@@ -454,11 +454,15 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
+ 				}()
+ 			}
+ 			conn.Write(s2cSaved)
+-			io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
++			_, err := io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))
+ 			// Here is bidirectional direct forwarding:
+ 			// client ---underlying--- server ---target--- dest
+-			// Call `underlying.CloseWrite()` once `io.Copy()` returned
+-			underlying.CloseWrite()
++			// Call `underlying.CloseWrite()` or `underlying.Close()` once `io.Copy()` returned
++			if err == nil {
++				underlying.CloseWrite()
++			} else {
++				underlying.Close()
++			}
+ 		}
+ 		waitGroup.Done()
+ 	}()
+diff --git a/transport/internet/reality/config.go b/transport/internet/reality/config.go
+index 4e1b625d..c2fbbdf2 100644
+--- a/transport/internet/reality/config.go
++++ b/transport/internet/reality/config.go
+@@ -27,6 +27,7 @@ func (c *Config) GetREALITYConfig() *reality.Config {
+ 		MinClientVer: c.MinClientVer,
+ 		MaxClientVer: c.MaxClientVer,
+ 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
++		AllowX25519:  c.AllowX25519,
+ 
+ 		NextProtos:             nil, // should be nil
+ 		SessionTicketsDisabled: true,
+diff --git a/transport/internet/reality/config.pb.go b/transport/internet/reality/config.pb.go
+index 5fb60523..e4d26266 100644
+--- a/transport/internet/reality/config.pb.go
++++ b/transport/internet/reality/config.pb.go
+@@ -36,6 +36,7 @@ type Config struct {
+ 	Mldsa65Seed           []byte                 `protobuf:"bytes,11,opt,name=mldsa65_seed,json=mldsa65Seed,proto3" json:"mldsa65_seed,omitempty"`
+ 	LimitFallbackUpload   *LimitFallback         `protobuf:"bytes,12,opt,name=limit_fallback_upload,json=limitFallbackUpload,proto3" json:"limit_fallback_upload,omitempty"`
+ 	LimitFallbackDownload *LimitFallback         `protobuf:"bytes,13,opt,name=limit_fallback_download,json=limitFallbackDownload,proto3" json:"limit_fallback_download,omitempty"`
++	AllowX25519           bool                   `protobuf:"varint,50,opt,name=allow_x25519,json=allowX25519,proto3" json:"allow_x25519,omitempty"`
+ 	Fingerprint           string                 `protobuf:"bytes,21,opt,name=Fingerprint,proto3" json:"Fingerprint,omitempty"`
+ 	ServerName            string                 `protobuf:"bytes,22,opt,name=server_name,json=serverName,proto3" json:"server_name,omitempty"`
+ 	PublicKey             []byte                 `protobuf:"bytes,23,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+@@ -169,6 +170,13 @@ func (x *Config) GetLimitFallbackDownload() *LimitFallback {
+ 	return nil
+ }
+ 
++func (x *Config) GetAllowX25519() bool {
++	if x != nil {
++		return x.AllowX25519
++	}
++	return false
++}
++
+ func (x *Config) GetFingerprint() string {
+ 	if x != nil {
+ 		return x.Fingerprint
+@@ -289,7 +297,7 @@ var File_transport_internet_reality_config_proto protoreflect.FileDescriptor
+ 
+ const file_transport_internet_reality_config_proto_rawDesc = "" +
+ 	"\n" +
+-	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\x98\x06\n" +
++	"'transport/internet/reality/config.proto\x12\x1fxray.transport.internet.reality\"\xbb\x06\n" +
+ 	"\x06Config\x12\x12\n" +
+ 	"\x04show\x18\x01 \x01(\bR\x04show\x12\x12\n" +
+ 	"\x04dest\x18\x02 \x01(\tR\x04dest\x12\x12\n" +
+@@ -305,7 +313,8 @@ const file_transport_internet_reality_config_proto_rawDesc = "" +
+ 	" \x03(\fR\bshortIds\x12!\n" +
+ 	"\fmldsa65_seed\x18\v \x01(\fR\vmldsa65Seed\x12b\n" +
+ 	"\x15limit_fallback_upload\x18\f \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x13limitFallbackUpload\x12f\n" +
+-	"\x17limit_fallback_download\x18\r \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x15limitFallbackDownload\x12 \n" +
++	"\x17limit_fallback_download\x18\r \x01(\v2..xray.transport.internet.reality.LimitFallbackR\x15limitFallbackDownload\x12!\n" +
++	"\fallow_x25519\x182 \x01(\bR\vallowX25519\x12 \n" +
+ 	"\vFingerprint\x18\x15 \x01(\tR\vFingerprint\x12\x1f\n" +
+ 	"\vserver_name\x18\x16 \x01(\tR\n" +
+ 	"serverName\x12\x1d\n" +
+diff --git a/transport/internet/reality/config.proto b/transport/internet/reality/config.proto
+index 7da43629..04568155 100644
+--- a/transport/internet/reality/config.proto
++++ b/transport/internet/reality/config.proto
+@@ -21,6 +21,7 @@ message Config {
+   bytes mldsa65_seed = 11;
+   LimitFallback limit_fallback_upload = 12;
+   LimitFallback limit_fallback_download = 13;
++  bool allow_x25519 = 50;
+ 
+   string Fingerprint = 21;
+   string server_name = 22;

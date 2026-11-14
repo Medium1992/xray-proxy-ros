@@ -1,0 +1,578 @@
+patches/close as one diff on XTLS/Xray-core v26.11.9 (676eaf66)
+after the series before it in Dockerfile-release. Written by regen-patches.sh.
+
+diff --git a/proxy/dokodemo/dokodemo.go b/proxy/dokodemo/dokodemo.go
+index 39c790c7..40e00470 100644
+--- a/proxy/dokodemo/dokodemo.go
++++ b/proxy/dokodemo/dokodemo.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/proxy"
+ 	"github.com/xtls/xray-core/transport"
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+@@ -159,7 +160,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
+ 
+ 	var writer buf.Writer
+ 	if network == net.Network_TCP {
+-		writer = buf.NewWriter(conn)
++		writer = proxy.NewHalfClosingWriter(conn)
+ 	} else {
+ 		// if we are in TPROXY mode, use linux's udp forging functionality
+ 		if !destinationOverridden {
+diff --git a/proxy/freedom/freedom.go b/proxy/freedom/freedom.go
+index 6215647a..18bf4bf0 100644
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -446,6 +446,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+ 			return errors.New("failed to process request").Base(err)
+ 		}
++		if destination.Network == net.Network_TCP {
++			// The client is done sending: tell the target, which may answer only now.
++			proxy.CloseWriteRAW(conn)
++		}
+ 
+ 		return nil
+ 	}
+diff --git a/proxy/http/server.go b/proxy/http/server.go
+index 349ba7dd..f0dc198d 100644
+--- a/proxy/http/server.go
++++ b/proxy/http/server.go
+@@ -191,7 +191,7 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
+ 	if err := dispatcher.DispatchLink(
+ 		ctx, dest, &transport.Link{
+ 			Reader: reader,
+-			Writer: buf.NewWriter(conn),
++			Writer: proxy.NewHalfClosingWriter(conn),
+ 		},
+ 	); err != nil {
+ 		return errors.New("failed to dispatch request").Base(err)
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index 6008437e..cb11a85c 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -825,3 +825,38 @@ func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
+ 	_, ok3 := iConn.(*internet.UnixConnWrapper)
+ 	return ok1 || ok2 || ok3
+ }
++
++// CloseWriteRAW ends what conn sends with a FIN when conn is a plain TCP or
++// Unix socket, and does nothing on any other conn: there a FIN is no end of
++// stream the peer reads, and closing a TLS writer would send close_notify.
++func CloseWriteRAW(conn net.Conn) error {
++	iConn := stat.TryUnwrapStatsConn(conn)
++	if pc, ok := iConn.(*proxyproto.Conn); ok {
++		iConn = pc.Raw()
++	}
++	switch c := iConn.(type) {
++	case *net.TCPConn:
++		return c.CloseWrite()
++	case *net.UnixConn:
++		return c.CloseWrite()
++	case *internet.UnixConnWrapper:
++		return c.CloseWrite()
++	}
++	return nil
++}
++
++// NewHalfClosingWriter is buf.NewWriter(conn) whose Close passes the end of
++// the stream on as conn's FIN (see CloseWriteRAW), as closing a pipe writer
++// ends its reader's stream. The peer reads its EOF while it may still send.
++func NewHalfClosingWriter(conn net.Conn) buf.Writer {
++	return &halfClosingWriter{Writer: buf.NewWriter(conn), conn: conn}
++}
++
++type halfClosingWriter struct {
++	buf.Writer
++	conn net.Conn
++}
++
++func (w *halfClosingWriter) Close() error {
++	return CloseWriteRAW(w.conn)
++}
+diff --git a/proxy/socks/server.go b/proxy/socks/server.go
+index d68e5c43..f383c4c5 100644
+--- a/proxy/socks/server.go
++++ b/proxy/socks/server.go
+@@ -157,7 +157,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
+ 		if err := dispatcher.DispatchLink(
+ 			ctx, dest, &transport.Link{
+ 				Reader: reader,
+-				Writer: buf.NewWriter(conn),
++				Writer: proxy.NewHalfClosingWriter(conn),
+ 			},
+ 		); err != nil {
+ 			return errors.New("failed to dispatch request").Base(err)
+diff --git a/testing/scenarios/halfclose_test.go b/testing/scenarios/halfclose_test.go
+new file mode 100644
+index 00000000..004e21a9
+--- /dev/null
++++ b/testing/scenarios/halfclose_test.go
+@@ -0,0 +1,221 @@
++package scenarios
++
++import (
++	"bufio"
++	"fmt"
++	"io"
++	gonet "net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/http"
++	"github.com/xtls/xray-core/proxy/socks"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	xproxy "golang.org/x/net/proxy"
++)
++
++// halfCloseTarget answers a request in one of two ways:
++//
++//   - "close": it replies and closes, ending a close-delimited answer;
++//   - "after-eof": it reads until the client's FIN, then replies and closes.
++type halfCloseTarget struct {
++	ln   gonet.Listener
++	mode string
++}
++
++func startHalfCloseTarget(t *testing.T, mode string) *halfCloseTarget {
++	t.Helper()
++	ln, err := gonet.Listen("tcp4", "127.0.0.1:0")
++	common.Must(err)
++	target := &halfCloseTarget{ln: ln, mode: mode}
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go target.serve(conn)
++		}
++	}()
++	t.Cleanup(func() { ln.Close() })
++	return target
++}
++
++func (s *halfCloseTarget) serve(conn gonet.Conn) {
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(10 * time.Second))
++	switch s.mode {
++	case "close":
++		buf := make([]byte, 64)
++		conn.Read(buf)
++		conn.Write([]byte("reply"))
++	case "after-eof":
++		io.Copy(io.Discard, conn)
++		conn.Write([]byte("reply after eof"))
++	}
++}
++
++func (s *halfCloseTarget) port() net.Port {
++	return net.Port(s.ln.Addr().(*gonet.TCPAddr).Port)
++}
++
++// halfCloseProxy runs one Xray with a SOCKS, an HTTP and a dokodemo-door
++// inbound, all to freedom.
++func halfCloseProxy(t *testing.T, dokodemoTarget net.Port) (socksPort, httpPort, dokodemoPort net.Port) {
++	t.Helper()
++	socksPort, httpPort, dokodemoPort = tcp.PickPort(), tcp.PickPort(), tcp.PickPort()
++	receiver := func(port net.Port) *serial.TypedMessage {
++		return serial.ToTypedMessage(&proxyman.ReceiverConfig{
++			PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(port)}},
++			Listen:   net.NewIPOrDomain(net.LocalHostIP),
++		})
++	}
++	config := &core.Config{
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				ReceiverSettings: receiver(socksPort),
++				ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{
++					AuthType: socks.AuthType_NO_AUTH,
++					Address:  net.NewIPOrDomain(net.LocalHostIP),
++				}),
++			},
++			{
++				ReceiverSettings: receiver(httpPort),
++				ProxySettings:    serial.ToTypedMessage(&http.ServerConfig{}),
++			},
++			{
++				ReceiverSettings: receiver(dokodemoPort),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(net.LocalHostIP),
++					RewritePort:     uint32(dokodemoTarget),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{
++			{
++				ProxySettings: serial.ToTypedMessage(&freedom.Config{
++					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++				}),
++			},
++		},
++	}
++	servers, err := InitializeServerConfigs(config)
++	common.Must(err)
++	t.Cleanup(func() { CloseAllServers(servers) })
++	return
++}
++
++type halfCloseDialer func(target net.Port) (*gonet.TCPConn, error)
++
++func halfCloseDialers(socksPort, httpPort, dokodemoPort net.Port) map[string]halfCloseDialer {
++	return map[string]halfCloseDialer{
++		"socks": func(target net.Port) (*gonet.TCPConn, error) {
++			dialer, err := xproxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), nil, xproxy.Direct)
++			if err != nil {
++				return nil, err
++			}
++			conn, err := dialer.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", target))
++			if err != nil {
++				return nil, err
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++		"http connect": func(target net.Port) (*gonet.TCPConn, error) {
++			conn, err := gonet.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
++			if err != nil {
++				return nil, err
++			}
++			fmt.Fprintf(conn, "CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", target, target)
++			// Read the status line and headers byte by byte, so nothing of the
++			// tunneled stream is left in a buffer.
++			var header strings.Builder
++			b := make([]byte, 1)
++			for !strings.HasSuffix(header.String(), "\r\n\r\n") {
++				if _, err := conn.Read(b); err != nil {
++					conn.Close()
++					return nil, err
++				}
++				header.WriteByte(b[0])
++			}
++			status, _ := bufio.NewReader(strings.NewReader(header.String())).ReadString('\n')
++			if !strings.Contains(status, " 200 ") {
++				conn.Close()
++				return nil, fmt.Errorf("CONNECT: %q", status)
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++		"dokodemo": func(net.Port) (*gonet.TCPConn, error) {
++			conn, err := gonet.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dokodemoPort))
++			if err != nil {
++				return nil, err
++			}
++			return conn.(*gonet.TCPConn), nil
++		},
++	}
++}
++
++// When the target closes after its answer, the client reads the end of the
++// answer as the target sent it, not once the inbound's uplinkOnly timer
++// (1 s by default) has run out on the client's idle upload.
++func TestHalfCloseTargetEndReachesTheClient(t *testing.T) {
++	target := startHalfCloseTarget(t, "close")
++	socksPort, httpPort, dokodemoPort := halfCloseProxy(t, target.port())
++	for name, dial := range halfCloseDialers(socksPort, httpPort, dokodemoPort) {
++		t.Run(name, func(t *testing.T) {
++			conn, err := dial(target.port())
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(5 * time.Second))
++			start := time.Now()
++			if _, err := conn.Write([]byte("request")); err != nil {
++				t.Fatal(err)
++			}
++			got, err := io.ReadAll(conn)
++			elapsed := time.Since(start)
++			if err != nil || string(got) != "reply" {
++				t.Fatalf("read %q, %v; want the reply and EOF", got, err)
++			}
++			if elapsed > 500*time.Millisecond {
++				t.Fatalf("EOF arrived after %v; the target closed at once", elapsed.Round(time.Millisecond))
++			}
++		})
++	}
++}
++
++// A client that half-closes after its request reaches a target that answers
++// only on EOF: the FIN is passed on, and the answer comes back.
++func TestHalfCloseClientEndReachesTheTarget(t *testing.T) {
++	target := startHalfCloseTarget(t, "after-eof")
++	socksPort, httpPort, dokodemoPort := halfCloseProxy(t, target.port())
++	for name, dial := range halfCloseDialers(socksPort, httpPort, dokodemoPort) {
++		t.Run(name, func(t *testing.T) {
++			conn, err := dial(target.port())
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(5 * time.Second))
++			if _, err := conn.Write([]byte("request")); err != nil {
++				t.Fatal(err)
++			}
++			if err := conn.CloseWrite(); err != nil {
++				t.Fatal(err)
++			}
++			got, err := io.ReadAll(conn)
++			if err != nil || string(got) != "reply after eof" {
++				t.Fatalf("read %q, %v; want the target's answer to the client's FIN", got, err)
++			}
++		})
++	}
++}
+diff --git a/transport/internet/httpupgrade/dialer.go b/transport/internet/httpupgrade/dialer.go
+index cf244b38..f232ec33 100644
+--- a/transport/internet/httpupgrade/dialer.go
++++ b/transport/internet/httpupgrade/dialer.go
+@@ -68,10 +68,16 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
+ 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
+ 			conn = tls.UClient(pconn, tlsConfig, fingerprint)
+ 			if err := conn.(*tls.UConn).WebsocketHandshakeContext(ctx); err != nil {
++				conn.Close()
+ 				return nil, err
+ 			}
+ 		} else {
+-			conn = tls.Client(pconn, tlsConfig)
++			tlsConn := tls.Client(pconn, tlsConfig).(*tls.Conn)
++			if err := tlsConn.HandshakeContext(ctx); err != nil {
++				tlsConn.Close()
++				return nil, err
++			}
++			conn = tlsConn
+ 		}
+ 		requestURL.Scheme = "https"
+ 	} else {
+diff --git a/transport/internet/reality/reality.go b/transport/internet/reality/reality.go
+index e1d1c955..719c3939 100644
+--- a/transport/internet/reality/reality.go
++++ b/transport/internet/reality/reality.go
+@@ -157,6 +157,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
+ 	uConn.ServerName = utlsConfig.ServerName
+ 	fingerprint := tls.GetFingerprint(config.Fingerprint)
+ 	if fingerprint == nil {
++		c.Close()
+ 		return nil, errors.New("REALITY: failed to get fingerprint")
+ 	}
+ 	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+@@ -180,6 +181,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
+ 		}
+ 		publicKey, err := ecdh.X25519().NewPublicKey(config.PublicKey)
+ 		if err != nil {
++			c.Close()
+ 			return nil, errors.New("REALITY: nil publicKey").Base(err)
+ 		}
+ 		ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
+@@ -187,12 +189,15 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
+ 			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
+ 		}
+ 		if ecdhe == nil {
++			c.Close()
+ 			return nil, errors.New("Current fingerprint ", uConn.ClientHelloID.Client, uConn.ClientHelloID.Version, " does not support TLS 1.3, REALITY handshake cannot establish.")
+ 		}
+ 		if uConn.AuthKey, err = ecdhe.ECDH(publicKey); err != nil {
++			c.Close()
+ 			return nil, errors.New("REALITY: nil sharedKey").Base(err)
+ 		}
+ 		if uConn.AuthKey, err = hkdf.Key(sha256.New, uConn.AuthKey, hello.Random[:20], "REALITY", 32); err != nil {
++			c.Close()
+ 			return nil, errors.New("REALITY: nil authKey").Base(err)
+ 		}
+ 		aead := crypto.NewAesGcm(uConn.AuthKey)
+@@ -203,6 +208,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
+ 		copy(hello.Raw[39:], hello.SessionId)
+ 	}
+ 	if err := uConn.HandshakeContext(ctx); err != nil {
++		uConn.Close()
+ 		return nil, err
+ 	}
+ 	if config.Show {
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index 7393758b..f3eb0ba6 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -138,6 +138,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 			if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+ 				conn = tls.UClient(conn, gotlsConfig, fingerprint)
+ 				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
++					conn.Close()
+ 					return nil, err
+ 				}
+ 			} else {
+diff --git a/transport/internet/tcp/dialer.go b/transport/internet/tcp/dialer.go
+index 47779c74..8d7bcb2b 100644
+--- a/transport/internet/tcp/dialer.go
++++ b/transport/internet/tcp/dialer.go
+@@ -82,6 +82,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
+ 			err = conn.(*tls.Conn).HandshakeContext(ctx)
+ 		}
+ 		if err != nil {
++			conn.Close()
+ 			if isFromMitmVerify {
+ 				return nil, errors.New("MITM freedom RAW TLS: failed to verify Domain Fronting certificate from " + mitmServerName).Base(err)
+ 			}
+diff --git a/transport/internet/tcp/handshake_close_test.go b/transport/internet/tcp/handshake_close_test.go
+new file mode 100644
+index 00000000..92f9d9d9
+--- /dev/null
++++ b/transport/internet/tcp/handshake_close_test.go
+@@ -0,0 +1,135 @@
++package tcp_test
++
++import (
++	"context"
++	"crypto/ecdh"
++	"crypto/rand"
++	"io"
++	gonet "net"
++	"runtime/debug"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/httpupgrade"
++	"github.com/xtls/xray-core/transport/internet/reality"
++	"github.com/xtls/xray-core/transport/internet/splithttp"
++	"github.com/xtls/xray-core/transport/internet/tcp"
++	"github.com/xtls/xray-core/transport/internet/tls"
++	"github.com/xtls/xray-core/transport/internet/websocket"
++)
++
++// fakeServer accepts connections, takes the ClientHello and answers with
++// reply, or nothing. It reports when the client closes a connection.
++func fakeServer(t *testing.T, reply string) (net.Port, <-chan struct{}) {
++	t.Helper()
++	ln, err := gonet.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { ln.Close() })
++	closed := make(chan struct{}, 8)
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go func() {
++				defer c.Close()
++				if reply != "" {
++					c.Read(make([]byte, 4096))
++					c.Write([]byte(reply))
++				}
++				io.Copy(io.Discard, c) // until the client closes
++				closed <- struct{}{}
++			}()
++		}
++	}()
++	return net.Port(ln.Addr().(*gonet.TCPAddr).Port), closed
++}
++
++// A dial whose TLS or REALITY handshake fails closes its connection instead
++// of leaving it to the garbage collector, also when the server answers with
++// something other than TLS, as a block page does.
++func TestDialClosesTheConnectionOfAFailedHandshake(t *testing.T) {
++	// Keep the finalizers of a lost connection from closing it for the test.
++	defer debug.SetGCPercent(debug.SetGCPercent(-1))
++
++	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
++	key, err := ecdh.X25519().GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	securities := []struct {
++		name     string
++		typ      string
++		settings any
++	}{
++		{"uTLS", "tls", &tls.Config{
++			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
++			PinnedPeerCertSha256: [][]byte{ctHash[:]},
++		}},
++		{"crypto/tls", "tls", &tls.Config{
++			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
++			PinnedPeerCertSha256: [][]byte{ctHash[:]},
++			Fingerprint:          "unsafe",
++		}},
++		{"REALITY", "reality", &reality.Config{
++			ServerName:  "example.com",
++			PublicKey:   key.PublicKey().Bytes(),
++			Fingerprint: "chrome",
++		}},
++	}
++	transports := []struct {
++		name     string
++		settings any
++		reality  bool
++	}{
++		{"tcp", &tcp.Config{}, true},
++		{"websocket", &websocket.Config{}, false},
++		{"httpupgrade", &httpupgrade.Config{}, false},
++		{"splithttp", &splithttp.Config{Path: "x"}, true},
++	}
++	answers := []struct{ name, reply string }{
++		{"no answer", ""},
++		{"HTTP instead", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"},
++	}
++	for _, transport := range transports {
++		for _, security := range securities {
++			if security.typ == "reality" && !transport.reality {
++				continue
++			}
++			for _, answer := range answers {
++				t.Run(transport.name+", "+security.name+", "+answer.name, func(t *testing.T) {
++					port, closed := fakeServer(t, answer.reply)
++					streamSettings := &internet.MemoryStreamConfig{
++						ProtocolName:     transport.name,
++						ProtocolSettings: transport.settings,
++						SecurityType:     security.typ,
++						SecuritySettings: security.settings,
++					}
++					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
++					defer cancel()
++					conn, err := internet.Dial(ctx, net.TCPDestination(net.DomainAddress("localhost"), port), streamSettings)
++					if err == nil {
++						// XHTTP dials lazily: its handshake runs on the first read.
++						conn.SetReadDeadline(time.Now().Add(time.Second))
++						_, err = conn.Read(make([]byte, 1))
++						conn.Close()
++						if err == nil {
++							t.Fatal("read through a failed handshake succeeded")
++						}
++					}
++					select {
++					case <-closed:
++					case <-time.After(2 * time.Second):
++						t.Fatalf("the connection of the failed handshake is still open: %v", err)
++					}
++				})
++			}
++		}
++	}
++}
+diff --git a/transport/internet/websocket/dialer.go b/transport/internet/websocket/dialer.go
+index 0e04505b..46c3d456 100644
+--- a/transport/internet/websocket/dialer.go
++++ b/transport/internet/websocket/dialer.go
+@@ -89,6 +89,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
+ 				// TLS and apply the handshake
+ 				cn := tls.UClient(pconn, tlsConfig, fingerprint).(*tls.UConn)
+ 				if err := cn.WebsocketHandshakeContext(ctx); err != nil {
++					cn.Close()
+ 					errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+ 					return nil, err
+ 				}

@@ -78,7 +78,9 @@ ARG REALITY_X25519=required
 # шифры ECDSA CBC и группы FFDHE, от которых Firefox отказался, и не слал
 # session_ticket и psk_key_exchange_modes); расширения Chrome перемешиваются
 # равномерно (раньше ALPN был первым в 11% хелло вместо 5,9%); Firefox
-# доводит рукопожатие, если сервер выбрал P-256 (refraction-networking/utls#402).
+# доводит рукопожатие, если сервер выбрал P-256 (refraction-networking/utls#402);
+# "randomized" и "randomizednoalpn" всегда шлют ключ X25519MLKEM768 и без P-256
+# (раньше примерно половина запусков слала хелло, которое отклоняет REALITY).
 # required — патч обязан лечь; off — без него.
 ARG UTLS=required
 
@@ -260,6 +262,7 @@ RUN set -eu; \
     go mod edit -replace github.com/refraction-networking/utls=./third_party/utls; \
     grep -q 'HelloFirefox_Auto = HelloFirefox_156' third_party/utls/u_common.go \
       && grep -q 'rand.Shuffle(len(movable), swap)' third_party/utls/u_parrots.go \
+      && grep -q 'func FixRandomizedHello' transport/internet/tls/tls.go \
       || { echo "uTLS hooks are missing after patching" >&2; exit 1; }; \
     echo "uTLS: included"
 

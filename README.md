@@ -73,6 +73,7 @@ Xray is started with `/etc/xray/` as a multi-file config directory, so additiona
 | `QUIC_DROP` | `false` | `true` adds an Xray routing rule that blocks UDP/443. |
 | `HY2_HOP_INTERVAL` | `30` | Seconds between remote port changes when a Hysteria2 link asks for port hopping (`mport` or a port range). Must be at least 5. |
 | `XRAY_XHTTP_FLOW` | empty | `on` enables the HTTP/2 window governor for XHTTP over TCP: the download window follows what is actually read instead of a fixed 4 MiB per stream. Off by default. A link can also turn it on or off for itself with `"h2Flow": {"enabled": true}` in its XHTTP `extra`. It helps toward servers without the governor, where it keeps the queue short itself. Toward a server with `h2Flow` it sees the server govern, shows it the real window and leaves the downloads to it, so it can stay on either way (from the ka-29 patches on). |
+| `XRAY_REALITY_BROWSER` | empty | `auto` turns on REALITY `browser` mode for REALITY links that do not set it themselves: the client resumes sessions with tickets the way the browser of its fingerprint does (`chrome`, `edge`, `firefox`), and XHTTP over HTTP/2 starts a connection the way that browser does. A link sets it for itself with `browser=auto` (or `browser=off`), a VMess link with a `"browser"` field. It takes effect only when the server also has `"browser": "auto"` in `realitySettings` and runs a build with this mode (Medium1992/Xray-core-fork h2Flow-7 or later); toward any other server connections go as before. Off by default. |
 
 ## 🛠 RouterOS Install
 

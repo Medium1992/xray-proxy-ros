@@ -333,11 +333,251 @@ index 00000000..004e21a9
 +		})
 +	}
 +}
+diff --git a/transport/internet/httpupgrade/dial_failure_close_test.go b/transport/internet/httpupgrade/dial_failure_close_test.go
+new file mode 100644
+index 00000000..a26e73c9
+--- /dev/null
++++ b/transport/internet/httpupgrade/dial_failure_close_test.go
+@@ -0,0 +1,234 @@
++package httpupgrade_test
++
++import (
++	"bufio"
++	"context"
++	gotls "crypto/tls"
++	"errors"
++	"fmt"
++	"io"
++	stdnet "net"
++	"net/http"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	"github.com/xtls/xray-core/transport/internet"
++	. "github.com/xtls/xray-core/transport/internet/httpupgrade"
++	"github.com/xtls/xray-core/transport/internet/tls"
++)
++
++// peerCloseWait bounds how long the peer waits for the client to close the
++// connection of a failed dial. The client has nothing left to wait for once
++// the dial returns, so it should close at once.
++const peerCloseWait = 3 * time.Second
++
++var errStillOpen = errors.New("the client kept the connection open")
++
++// waitForEnd reads r until the client ends the connection and reports how it
++// ended: "EOF" or "RST", or errStillOpen once the read deadline passes.
++func waitForEnd(r io.Reader) (string, error) {
++	_, err := io.Copy(io.Discard, r)
++	var netErr stdnet.Error
++	switch {
++	case err == nil:
++		return "EOF", nil
++	case errors.Is(err, syscall.ECONNRESET):
++		return "RST", nil
++	case errors.As(err, &netErr) && netErr.Timeout():
++		return "", errStillOpen
++	}
++	return "", err
++}
++
++type peerEnd struct {
++	how string
++	err error
++}
++
++// dialFailingPeer dials a peer that runs serve on its one connection and
++// fails the test unless the dial fails and the client then closes that
++// connection. serve returns the reader the peer watches for the end of the
++// connection: the TLS connection, whose end needs close_notify or a TCP end,
++// or the TCP connection itself.
++func dialFailingPeer(t *testing.T, tlsSettings *tls.Config, serve func(stdnet.Conn) (io.Reader, error)) {
++	t.Helper()
++	listener, err := stdnet.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { listener.Close() })
++
++	ended := make(chan peerEnd, 1)
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			ended <- peerEnd{err: fmt.Errorf("accept: %w", err)}
++			return
++		}
++		defer conn.Close()
++		if err := conn.SetDeadline(time.Now().Add(2 * peerCloseWait)); err != nil {
++			ended <- peerEnd{err: fmt.Errorf("set deadline: %w", err)}
++			return
++		}
++		reader, err := serve(conn)
++		if err != nil {
++			ended <- peerEnd{err: fmt.Errorf("serve: %w", err)}
++			return
++		}
++		if err := conn.SetReadDeadline(time.Now().Add(peerCloseWait)); err != nil {
++			ended <- peerEnd{err: fmt.Errorf("set read deadline: %w", err)}
++			return
++		}
++		how, err := waitForEnd(reader)
++		if err == nil && reader != io.Reader(conn) {
++			// close_notify alone leaves the TCP connection open.
++			var tcpHow string
++			tcpHow, err = waitForEnd(conn)
++			how += ", then TCP " + tcpHow
++		}
++		ended <- peerEnd{how: how, err: err}
++	}()
++
++	streamSettings := &internet.MemoryStreamConfig{
++		ProtocolName:     "httpupgrade",
++		ProtocolSettings: &Config{Path: "httpupgrade"},
++	}
++	if tlsSettings != nil {
++		streamSettings.SecurityType = "tls"
++		streamSettings.SecuritySettings = tlsSettings
++	}
++	port := net.Port(listener.Addr().(*stdnet.TCPAddr).Port)
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	conn, err := Dial(ctx, net.TCPDestination(net.LocalHostIP, port), streamSettings)
++	if err == nil {
++		conn.Close()
++		t.Fatal("the dial succeeded")
++	}
++	t.Logf("the dial failed: %v", err)
++
++	select {
++	case end := <-ended:
++		if errors.Is(end.err, errStillOpen) {
++			t.Fatalf("the connection of the failed dial is still open %v after the dial failed", peerCloseWait)
++		}
++		if end.err != nil {
++			t.Fatalf("the peer failed: %v", end.err)
++		}
++		t.Logf("the peer saw the connection end with %s", end.how)
++	case <-time.After(4 * peerCloseWait):
++		t.Fatal("the peer did not finish")
++	}
++}
++
++func generateServerCertificate(t *testing.T) (gotls.Certificate, []byte) {
++	t.Helper()
++	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
++	certPEM, keyPEM := ct.ToPEM()
++	pair, err := gotls.X509KeyPair(certPEM, keyPEM)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return pair, ctHash[:]
++}
++
++func clientTLSSettings(fingerprint string, ctHash []byte) *tls.Config {
++	return &tls.Config{
++		ServerName:           "localhost",
++		PinnedPeerCertSha256: [][]byte{ctHash},
++		Fingerprint:          fingerprint,
++	}
++}
++
++// rejectUpgrade reads the upgrade request and answers it with 404.
++func rejectUpgrade(conn stdnet.Conn) (io.Reader, error) {
++	if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
++		return nil, err
++	}
++	if _, err := conn.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")); err != nil {
++		return nil, err
++	}
++	return conn, nil
++}
++
++// The server rejects the upgrade request: the dial fails reading the reply.
++func TestDialClosesTheConnectionOfARejectedUpgrade(t *testing.T) {
++	t.Run("none", func(t *testing.T) {
++		dialFailingPeer(t, nil, rejectUpgrade)
++	})
++	pair, ctHash := generateServerCertificate(t)
++	for _, fingerprint := range []string{"unsafe", "chrome"} {
++		t.Run(fingerprint, func(t *testing.T) {
++			dialFailingPeer(t, clientTLSSettings(fingerprint, ctHash), func(conn stdnet.Conn) (io.Reader, error) {
++				return rejectUpgrade(gotls.Server(conn, &gotls.Config{Certificates: []gotls.Certificate{pair}}))
++			})
++		})
++	}
++}
++
++var errInjected = errors.New("injected failure")
++
++// countingConn fails its writes or its reads and counts its closes.
++type countingConn struct {
++	failWrite bool
++	closes    atomic.Int32
++}
++
++func (c *countingConn) Write(b []byte) (int, error) {
++	if c.failWrite {
++		return 0, errInjected
++	}
++	return len(b), nil
++}
++func (c *countingConn) Read([]byte) (int, error)         { return 0, errInjected }
++func (c *countingConn) Close() error                     { c.closes.Add(1); return nil }
++func (c *countingConn) LocalAddr() stdnet.Addr           { return &stdnet.TCPAddr{} }
++func (c *countingConn) RemoteAddr() stdnet.Addr          { return &stdnet.TCPAddr{} }
++func (c *countingConn) SetDeadline(time.Time) error      { return nil }
++func (c *countingConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *countingConn) SetWriteDeadline(time.Time) error { return nil }
++
++type connDialer struct{ conn stdnet.Conn }
++
++func (d connDialer) Dial(context.Context, net.Address, net.Destination, *internet.SocketConfig) (stdnet.Conn, error) {
++	return d.conn, nil
++}
++func (connDialer) DestIpAddress() stdnet.IP { return nil }
++
++// Each failure after the connection exists closes it exactly once, whatever
++// the TLS layer does before the request is written.
++func TestDialClosesTheConnectionOfAFailedDialOnce(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		failWrite bool
++	}{
++		{name: "request write fails", failWrite: true},
++		{name: "reply read fails"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			conn := &countingConn{failWrite: tc.failWrite}
++			internet.UseAlternativeSystemDialer(connDialer{conn})
++			t.Cleanup(func() { internet.UseAlternativeSystemDialer(nil) })
++
++			streamSettings := &internet.MemoryStreamConfig{
++				ProtocolName:     "httpupgrade",
++				ProtocolSettings: &Config{Path: "httpupgrade"},
++			}
++			dialed, err := Dial(context.Background(), net.TCPDestination(net.LocalHostIP, 1), streamSettings)
++			if err == nil {
++				dialed.Close()
++				t.Fatal("the dial succeeded")
++			}
++			if !errors.Is(err, errInjected) {
++				t.Fatalf("the dial failed with %v, want the injected failure", err)
++			}
++			if closes := conn.closes.Load(); closes != 1 {
++				t.Fatalf("the connection of the failed dial was closed %d times, want 1", closes)
++			}
++		})
++	}
++}
 diff --git a/transport/internet/httpupgrade/dialer.go b/transport/internet/httpupgrade/dialer.go
-index cf244b38..f232ec33 100644
+index cf244b38..aa2acbd1 100644
 --- a/transport/internet/httpupgrade/dialer.go
 +++ b/transport/internet/httpupgrade/dialer.go
-@@ -68,10 +68,16 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
+@@ -68,10 +68,17 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
  		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
  			conn = tls.UClient(pconn, tlsConfig, fingerprint)
  			if err := conn.(*tls.UConn).WebsocketHandshakeContext(ctx); err != nil {
@@ -346,6 +586,7 @@ index cf244b38..f232ec33 100644
  			}
  		} else {
 -			conn = tls.Client(pconn, tlsConfig)
++			// crypto/tls would run the handshake on the first write, outside ctx.
 +			tlsConn := tls.Client(pconn, tlsConfig).(*tls.Conn)
 +			if err := tlsConn.HandshakeContext(ctx); err != nil {
 +				tlsConn.Close()
@@ -355,6 +596,246 @@ index cf244b38..f232ec33 100644
  		}
  		requestURL.Scheme = "https"
  	} else {
+@@ -111,6 +118,7 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
+ 
+ 	err = req.Write(conn)
+ 	if err != nil {
++		conn.Close()
+ 		return nil, err
+ 	}
+ 
+@@ -123,6 +131,7 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
+ 	if transportConfiguration.Ed == 0 {
+ 		_, err = connRF.Read([]byte{})
+ 		if err != nil {
++			conn.Close()
+ 			return nil, err
+ 		}
+ 	}
+diff --git a/transport/internet/httpupgrade/handshake_bound_test.go b/transport/internet/httpupgrade/handshake_bound_test.go
+new file mode 100644
+index 00000000..58ae729e
+--- /dev/null
++++ b/transport/internet/httpupgrade/handshake_bound_test.go
+@@ -0,0 +1,218 @@
++package httpupgrade_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	stdnet "net"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/transport/internet"
++	. "github.com/xtls/xray-core/transport/internet/httpupgrade"
++	"github.com/xtls/xray-core/transport/internet/stat"
++	"github.com/xtls/xray-core/transport/internet/tls"
++)
++
++// failingServer listens for one connection, runs serve on it, and then
++// reads it to the client's close. hello reports a ClientHello's first byte,
++// closed a close by the client. Its cleanup closes the accepted connection
++// and waits for the server goroutine, so a failing test leaves nothing
++// behind.
++type failingServer struct {
++	port    net.Port
++	hello   chan struct{}
++	closed  chan struct{}
++	release func()
++}
++
++func newFailingServer(t *testing.T, serve func(stdnet.Conn) bool) *failingServer {
++	t.Helper()
++	listener, err := stdnet.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	s := &failingServer{
++		port:   net.Port(listener.Addr().(*stdnet.TCPAddr).Port),
++		hello:  make(chan struct{}),
++		closed: make(chan struct{}),
++	}
++	accepted := make(chan stdnet.Conn, 1)
++	served := make(chan struct{})
++	var once sync.Once
++	s.release = func() {
++		once.Do(func() {
++			listener.Close()
++			select {
++			case conn := <-accepted:
++				conn.Close()
++			default:
++			}
++		})
++	}
++	t.Cleanup(func() {
++		s.release()
++		<-served
++	})
++	go func() {
++		defer close(served)
++		conn, err := listener.Accept()
++		if err != nil {
++			return
++		}
++		accepted <- conn
++		first := make([]byte, 1)
++		if _, err := io.ReadFull(conn, first); err != nil || first[0] != 0x16 {
++			return
++		}
++		close(s.hello)
++		if !serve(conn) {
++			return
++		}
++		if _, err := io.Copy(io.Discard, conn); err == nil {
++			close(s.closed)
++		}
++	}()
++	return s
++}
++
++func tlsSettings(fingerprint string) *internet.MemoryStreamConfig {
++	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
++	return &internet.MemoryStreamConfig{
++		ProtocolName:     "httpupgrade",
++		ProtocolSettings: &Config{Path: "httpupgrades"},
++		SecurityType:     "tls",
++		SecuritySettings: &tls.Config{
++			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
++			PinnedPeerCertSha256: [][]byte{ctHash[:]},
++			Fingerprint:          fingerprint,
++		},
++	}
++}
++
++// dialAsync dials the server in a goroutine. Its cleanup releases the
++// server's connection, which ends a dial that ignores its context, and waits
++// for the goroutine.
++func dialAsync(t *testing.T, ctx context.Context, server *failingServer, streamSettings *internet.MemoryStreamConfig) <-chan error {
++	port := server.port
++	done := make(chan error, 1)
++	finished := make(chan struct{})
++	t.Cleanup(func() {
++		server.release()
++		<-finished
++	})
++	go func() {
++		defer close(finished)
++		conn, err := Dial(ctx, net.TCPDestination(net.DomainAddress("localhost"), port), streamSettings)
++		if err == nil {
++			conn.Close()
++		}
++		done <- err
++	}()
++	return done
++}
++
++// With "unsafe" the dialer takes crypto/tls, whose handshake would wait for
++// the first write and run outside the dial's context. A server that takes the
++// ClientHello and answers nothing must still end the dial with its context,
++// and the connection must be closed.
++func TestDialUnsafeFingerprintEndsWithTheContext(t *testing.T) {
++	server := newFailingServer(t, func(stdnet.Conn) bool { return true })
++	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
++	defer cancel()
++
++	start := time.Now()
++	select {
++	case err := <-dialAsync(t, ctx, server, tlsSettings("unsafe")):
++		if err == nil {
++			t.Fatal("dial through a silent TLS server succeeded")
++		}
++		select {
++		case <-server.hello:
++		default:
++			t.Fatalf("dial failed before its ClientHello reached the server: %v", err)
++		}
++		if elapsed := time.Since(start); elapsed < 450*time.Millisecond || !errors.Is(err, context.DeadlineExceeded) {
++			t.Fatalf("dial failed after %v with %v; want it ended by its 500ms context", elapsed.Round(time.Millisecond), err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("dial still runs 5s after its 500ms context ended")
++	}
++	select {
++	case <-server.closed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("the connection of the failed handshake is still open")
++	}
++}
++
++// A server that answers the ClientHello with plaintext HTTP fails the
++// handshake, not by the context: the client must close the connection at
++// once rather than leave it to the garbage collector.
++func TestDialClosesTheConnectionAfterAnHTTPAnswer(t *testing.T) {
++	for _, fingerprint := range []string{"unsafe", "chrome"} {
++		t.Run(fingerprint, func(t *testing.T) {
++			server := newFailingServer(t, func(conn stdnet.Conn) bool {
++				conn.Read(make([]byte, 4096))
++				_, err := conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
++				return err == nil
++			})
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			select {
++			case err := <-dialAsync(t, ctx, server, tlsSettings(fingerprint)):
++				if err == nil {
++					t.Fatal("dial through an HTTP answer to the ClientHello succeeded")
++				}
++				if errors.Is(err, context.DeadlineExceeded) {
++					t.Fatalf("dial ended by its context: %v", err)
++				}
++			case <-time.After(5 * time.Second):
++				t.Fatal("dial still runs 5s after the server answered HTTP")
++			}
++			select {
++			case <-server.closed:
++			case <-time.After(3 * time.Second):
++				t.Fatal("the connection is still open 3s after the dial failed")
++			}
++		})
++	}
++}
++
++// The handshake run in the dial still upgrades through a working server.
++func TestDialUnsafeFingerprintUpgrades(t *testing.T) {
++	streamSettings := tlsSettings("unsafe")
++	listenPort := tcp.PickPort()
++	listen, err := ListenHTTPUpgrade(context.Background(), net.LocalHostIP, listenPort, streamSettings, func(conn stat.Connection) {
++		go func() {
++			defer conn.Close()
++			b := make([]byte, 4)
++			if _, err := io.ReadFull(conn, b); err == nil {
++				conn.Write(b)
++			}
++		}()
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listen.Close()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	conn, err := Dial(ctx, net.TCPDestination(net.DomainAddress("localhost"), listenPort), streamSettings)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if _, err := conn.Write([]byte("ping")); err != nil {
++		t.Fatal(err)
++	}
++	b := make([]byte, 4)
++	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	if _, err := io.ReadFull(conn, b); err != nil || string(b) != "ping" {
++		t.Fatalf("read %q, %v; want the echo", b, err)
++	}
++}
 diff --git a/transport/internet/reality/reality.go b/transport/internet/reality/reality.go
 index e1d1c955..719c3939 100644
 --- a/transport/internet/reality/reality.go
@@ -400,17 +881,163 @@ index e1d1c955..719c3939 100644
  	}
  	if config.Show {
 diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
-index 7393758b..f3eb0ba6 100644
+index 7393758b..211043ec 100644
 --- a/transport/internet/splithttp/dialer.go
 +++ b/transport/internet/splithttp/dialer.go
-@@ -138,6 +138,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+@@ -97,6 +97,11 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
+ 	return "2"
+ }
+ 
++// handshakeTimeout bounds a client's TLS or REALITY handshake: one
++// blackholed after ClientHello would hold every request queued behind its
++// dial.
++const handshakeTimeout = 10 * time.Second
++
+ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
+ 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+@@ -126,25 +131,37 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 			return nil, err
+ 		}
+ 
+-		// a handshake blackholed after ClientHello would hold every request queued behind this dial
+-		ctxInner, cancel := context.WithTimeout(ctxInner, 10*time.Second)
++		ctxInner, cancel := context.WithTimeout(ctxInner, handshakeTimeout)
+ 		defer cancel()
++		// name the handshake and its bound in the log, which otherwise reads
++		// only "context deadline exceeded"
++		handshakeError := func(err error) error {
++			if ctxInner.Err() == context.DeadlineExceeded {
++				return errors.New("XHTTP: TLS handshake did not finish in ", handshakeTimeout).Base(err)
++			}
++			return err
++		}
+ 
+ 		if realityConfig != nil {
+-			return reality.UClient(conn, realityConfig, ctxInner, dest)
++			uConn, err := reality.UClient(conn, realityConfig, ctxInner, dest)
++			if err != nil {
++				return nil, handshakeError(err)
++			}
++			return uConn, nil
+ 		}
+ 
+ 		if gotlsConfig != nil {
  			if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
  				conn = tls.UClient(conn, gotlsConfig, fingerprint)
  				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
+-					return nil, err
 +					conn.Close()
- 					return nil, err
++					return nil, handshakeError(err)
  				}
  			} else {
+ 				tlsConn := tls.Client(conn, gotlsConfig).(*tls.Conn)
+ 				if err := tlsConn.HandshakeContext(ctxInner); err != nil {
+ 					tlsConn.Close()
+-					return nil, err
++					return nil, handshakeError(err)
+ 				}
+ 				conn = tlsConn
+ 			}
+diff --git a/transport/internet/splithttp/splithttp_test.go b/transport/internet/splithttp/splithttp_test.go
+index 81004076..3b982425 100644
+--- a/transport/internet/splithttp/splithttp_test.go
++++ b/transport/internet/splithttp/splithttp_test.go
+@@ -3,6 +3,7 @@ package splithttp_test
+ import (
+ 	"bytes"
+ 	"context"
++	"crypto/ecdh"
+ 	"crypto/rand"
+ 	"fmt"
+ 	"io"
+@@ -20,9 +21,11 @@ import (
+ 	"github.com/xtls/xray-core/testing/servers/tcp"
+ 	"github.com/xtls/xray-core/testing/servers/udp"
+ 	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/reality"
+ 	. "github.com/xtls/xray-core/transport/internet/splithttp"
+ 	"github.com/xtls/xray-core/transport/internet/stat"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ func Test_ListenXHAndDial(t *testing.T) {
+@@ -177,6 +180,7 @@ func testListenXHAndDialTLS(t *testing.T, fingerprint string) {
+ 
+ 	conn, err := Dial(context.Background(), net.TCPDestination(net.DomainAddress("localhost"), listenPort), streamSettings)
+ 	common.Must(err)
++	defer conn.Close()
+ 
+ 	_, err = conn.Write([]byte("Test connection 1"))
+ 	common.Must(err)
+@@ -611,16 +615,42 @@ func Test_ServerMaxHeaderBytes(t *testing.T) {
+ }
+ 
+ func Test_DialBlackholedHandshake(t *testing.T) {
++	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
++	tlsSettings := func(fingerprint string) *tls.Config {
++		return &tls.Config{
++			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
++			PinnedPeerCertSha256: [][]byte{ctHash[:]},
++			Fingerprint:          fingerprint,
++		}
++	}
++	realityKey, err := ecdh.X25519().GenerateKey(rand.Reader)
++	common.Must(err)
+ 	// "" takes the default uTLS fingerprint; "unsafe" takes Go's crypto/tls,
+-	// whose handshake would otherwise wait for the first write.
+-	for _, fingerprint := range []string{"", "unsafe"} {
+-		t.Run("fingerprint "+strconv.Quote(fingerprint), func(t *testing.T) {
+-			testDialBlackholedHandshake(t, fingerprint)
++	// whose handshake would otherwise wait for the first write; REALITY
++	// hands the bound to reality.UClient.
++	for _, security := range []struct {
++		name     string
++		kind     string
++		settings proto.Message
++	}{
++		{`tls fingerprint ""`, "tls", tlsSettings("")},
++		{`tls fingerprint "unsafe"`, "tls", tlsSettings("unsafe")},
++		{"reality", "reality", &reality.Config{
++			ServerName:  "localhost",
++			Fingerprint: "chrome",
++			PublicKey:   realityKey.PublicKey().Bytes(),
++			ShortId:     make([]byte, 8),
++			SpiderY:     make([]int64, 10),
++		}},
++	} {
++		t.Run(security.name, func(t *testing.T) {
++			t.Parallel()
++			testDialBlackholedHandshake(t, security.kind, security.settings)
+ 		})
+ 	}
+ }
+ 
+-func testDialBlackholedHandshake(t *testing.T, fingerprint string) {
++func testDialBlackholedHandshake(t *testing.T, securityType string, securitySettings proto.Message) {
+ 	listener, err := net.Listen("tcp", "127.0.0.1:0")
+ 	common.Must(err)
+ 	defer listener.Close()
+@@ -644,16 +674,11 @@ func testDialBlackholedHandshake(t *testing.T, fingerprint string) {
+ 		}
+ 	}()
+ 
+-	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
+ 	streamSettings := &internet.MemoryStreamConfig{
+ 		ProtocolName:     "splithttp",
+ 		ProtocolSettings: &Config{Path: "shs"},
+-		SecurityType:     "tls",
+-		SecuritySettings: &tls.Config{
+-			Certificate:          []*tls.Certificate{tls.ParseCertificate(ct)},
+-			PinnedPeerCertSha256: [][]byte{ctHash[:]},
+-			Fingerprint:          fingerprint,
+-		},
++		SecurityType:     securityType,
++		SecuritySettings: securitySettings,
+ 	}
+ 	port := net.Port(listener.Addr().(*net.TCPAddr).Port)
+ 
 diff --git a/transport/internet/tcp/dialer.go b/transport/internet/tcp/dialer.go
 index 47779c74..8d7bcb2b 100644
 --- a/transport/internet/tcp/dialer.go
@@ -564,6 +1191,219 @@ index 00000000..92f9d9d9
 +		}
 +	}
 +}
+diff --git a/transport/internet/tls/config.go b/transport/internet/tls/config.go
+index 71bd6cec..7da03170 100644
+--- a/transport/internet/tls/config.go
++++ b/transport/internet/tls/config.go
+@@ -11,6 +11,7 @@ import (
+ 	"slices"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -46,13 +47,68 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
+ 	return root, nil
+ }
+ 
+-// BuildCertificates builds a list of TLS certificates from proto definition.
++type certificateStore struct {
++	certificates atomic.Pointer[[]*tls.Certificate]
++}
++
++func newCertificateStore(certificates []*tls.Certificate) *certificateStore {
++	store := new(certificateStore)
++	store.certificates.Store(&certificates)
++	return store
++}
++
++func (s *certificateStore) snapshot() []*tls.Certificate {
++	certificates := s.certificates.Load()
++	if certificates == nil {
++		return nil
++	}
++	return *certificates
++}
++
++func (s *certificateStore) replace(index int, certificate *tls.Certificate) {
++	for {
++		current := s.certificates.Load()
++		if current == nil || index < 0 || index >= len(*current) {
++			return
++		}
++		updated := slices.Clone(*current)
++		updated[index] = certificate
++		if s.certificates.CompareAndSwap(current, &updated) {
++			return
++		}
++	}
++}
++
++type certificateRefresh struct {
++	entry          *Certificate
++	index          int
++	getX509KeyPair func() *tls.Certificate
++}
++
++// BuildCertificates builds an immutable point-in-time list of TLS certificates
++// from the protobuf definition. GetTLSConfig uses buildCertificateStore so hot
++// reloads can publish replacement certificates atomically.
+ func (c *Config) BuildCertificates() []*tls.Certificate {
+-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+-	for _, entry := range c.Certificate {
+-		if entry.Usage != Certificate_ENCIPHERMENT {
++	return c.buildCertificateStore(false).snapshot()
++}
++
++func (c *Config) buildCertificateStore(refresh bool) *certificateStore {
++	certificates := make([]*tls.Certificate, 0, len(c.Certificate))
++	refreshes := make([]certificateRefresh, 0, len(c.Certificate))
++	for _, configured := range c.Certificate {
++		if configured.Usage != Certificate_ENCIPHERMENT {
+ 			continue
+ 		}
++		entry := &Certificate{
++			Certificate:     slices.Clone(configured.Certificate),
++			Key:             slices.Clone(configured.Key),
++			Usage:           configured.Usage,
++			OcspStapling:    configured.OcspStapling,
++			CertificatePath: configured.CertificatePath,
++			KeyPath:         configured.KeyPath,
++			OneTimeLoading:  configured.OneTimeLoading,
++			BuildChain:      configured.BuildChain,
++		}
+ 		getX509KeyPair := func() *tls.Certificate {
+ 			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+ 			if err != nil {
+@@ -66,32 +122,46 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
+ 			}
+ 			return &keyPair
+ 		}
+-		if keyPair := getX509KeyPair(); keyPair != nil {
+-			certs = append(certs, keyPair)
+-		} else {
++		keyPair := getX509KeyPair()
++		if keyPair == nil {
+ 			continue
+ 		}
+-		index := len(certs) - 1
+-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+-			cert := certs[index]
++		certificates = append(certificates, keyPair)
++		refreshes = append(refreshes, certificateRefresh{
++			entry:          entry,
++			index:          len(certificates) - 1,
++			getX509KeyPair: getX509KeyPair,
++		})
++	}
++
++	store := newCertificateStore(certificates)
++	if !refresh {
++		return store
++	}
++	for _, refresh := range refreshes {
++		setupOcspTicker(refresh.entry, func(isReloaded, isOcspstapling bool) {
++			certificate := store.snapshot()[refresh.index]
+ 			if isReloaded {
+-				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
+-					cert = newKeyPair
+-				} else {
++				certificate = refresh.getX509KeyPair()
++				if certificate == nil {
+ 					return
+ 				}
++			} else {
++				copy := *certificate
++				certificate = &copy
+ 			}
+ 			if isOcspstapling {
+-				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
++				newOCSPData, err := ocsp.GetOCSPForCert(certificate.Certificate)
++				if err != nil {
+ 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
+-				} else if string(newOCSPData) != string(cert.OCSPStaple) {
+-					cert.OCSPStaple = newOCSPData
++				} else if string(newOCSPData) != string(certificate.OCSPStaple) {
++					certificate.OCSPStaple = newOCSPData
+ 				}
+ 			}
+-			certs[index] = cert
++			store.replace(refresh.index, certificate)
+ 		})
+ 	}
+-	return certs
++	return store
+ }
+ 
+ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+@@ -244,8 +314,9 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
+ 	}
+ }
+ 
+-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
++func getNewGetCertificateFunc(certificates *certificateStore, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+ 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
++		certs := certificates.snapshot()
+ 		if len(certs) == 0 {
+ 			return nil, errNoCertificates
+ 		}
+@@ -412,7 +483,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
+ 	if len(caCerts) > 0 {
+ 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
+ 	} else {
+-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
++		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateStore(true), c.RejectUnknownSni)
+ 	}
+ 
+ 	if sn := c.parseServerName(); len(sn) > 0 {
+diff --git a/transport/internet/tls/config_test.go b/transport/internet/tls/config_test.go
+index 7265ed27..0699d5bb 100644
+--- a/transport/internet/tls/config_test.go
++++ b/transport/internet/tls/config_test.go
+@@ -3,6 +3,7 @@ package tls_test
+ import (
+ 	gotls "crypto/tls"
+ 	"crypto/x509"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -64,6 +65,34 @@ func TestExpiredCertificate(t *testing.T) {
+ 	}
+ }
+ 
++func TestCertificateRefreshConcurrentSelection(t *testing.T) {
++	generated, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
++	certificate := ParseCertificate(generated)
++	certificate.OcspStapling = 1
++
++	tlsConfig := (&Config{Certificate: []*Certificate{certificate}}).GetTLSConfig()
++	hello := &gotls.ClientHelloInfo{ServerName: "localhost"}
++	deadline := time.Now().Add(1500 * time.Millisecond)
++
++	var readers sync.WaitGroup
++	for range 8 {
++		readers.Go(func() {
++			for time.Now().Before(deadline) {
++				selected, err := tlsConfig.GetCertificate(hello)
++				if err != nil {
++					t.Errorf("GetCertificate() failed: %v", err)
++					return
++				}
++				if selected == nil {
++					t.Error("GetCertificate() returned nil")
++					return
++				}
++			}
++		})
++	}
++	readers.Wait()
++}
++
+ func TestInsecureCertificates(t *testing.T) {
+ 	c := &Config{}
+ 
 diff --git a/transport/internet/websocket/dialer.go b/transport/internet/websocket/dialer.go
 index 0e04505b..46c3d456 100644
 --- a/transport/internet/websocket/dialer.go

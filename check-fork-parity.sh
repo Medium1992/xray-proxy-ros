@@ -35,16 +35,16 @@ step() {
     | sed "s#/patches/$1#$here/patches/$1#g")
   [ -n "$cmd" ] || { echo "no Dockerfile-release step for patches/$1" >&2; exit 1; }
   env XHTTP_FLOW=required XHTTP_MUX=required REALITY_X25519=required UTLS=required \
-    SNIFF=required HALF_CLOSE=required BACKUP_CONNECT=required sh -c "$cmd" >/dev/null \
+    SNIFF=required HALF_CLOSE=required BACKUP_CONNECT=required BROWSER=required sh -c "$cmd" >/dev/null \
     || { echo "the Dockerfile-release step for patches/$1 fails" >&2; exit 1; }
 }
-for series in xhttp-flow xhttp-mux reality utls sniff close connect; do
+for series in xhttp-flow xhttp-mux reality utls sniff close connect browser; do
   step "$series"
 done
 
 unexpected=$(diff -rq "$work/ros" "$work/fork" -x .git -x resources 2>&1 \
   | sed -e "s#$work/ros/##g" -e "s#$work/fork/##g" \
-  | grep -v -e '_test\.go' -e 'testing/' -e '\.github' -e 'third_party/utls' -e 'third_party: utls' \
+  | grep -v -e '_test\.go' -e 'testing/' -e 'Only in testing: ' -e '\.github' -e 'third_party/utls' -e 'third_party: utls' \
             -e 'go\.mod' -e 'go\.sum' -e 'core/core\.go' -e 'features/policy/policy\.go' \
             -e 'testdata' || true)
 if [ -n "$unexpected" ]; then

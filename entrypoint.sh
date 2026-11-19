@@ -452,6 +452,7 @@ parse() {
     REALITY_PASSWORD=""
     REALITY_SPIDER_X=""
     REALITY_MLDSA65_VERIFY=""
+    REALITY_BROWSER=""
     REALITY_USED=false
 
 
@@ -563,6 +564,7 @@ parse() {
         REALITY_SHORT_ID="$(printf '%s' "$JSON" | jq -r '.sid // empty' 2>/dev/null || true)"
         REALITY_SPIDER_X="$(printf '%s' "$JSON" | jq -r '.spx // empty' 2>/dev/null || true)"
         REALITY_MLDSA65_VERIFY="$(printf '%s' "$JSON" | jq -r '.pqv // .mldsa65Verify // empty' 2>/dev/null || true)"
+        REALITY_BROWSER="$(printf '%s' "$JSON" | jq -r '.browser // empty' 2>/dev/null || true)"
 
         VMESS_MODE="$(printf '%s' "$JSON" | jq -r '.mode // empty' 2>/dev/null || true)"
         VMESS_EXTRA="$(printf '%s' "$JSON" | jq -c '.extra // empty' 2>/dev/null || true)"
@@ -936,6 +938,9 @@ parse() {
                 REALITY_MLDSA65_VERIFY="$(urldecode "$val")"
                 REALITY_USED=true
                 ;;
+            browser)
+                REALITY_BROWSER="$(urldecode "$val")"
+                ;;
             fragment)
                 DECODED_FRAGMENT="$(urldecode "$val")"
                 append_fragment_finalmask "$DECODED_FRAGMENT"
@@ -1105,6 +1110,7 @@ parse() {
       --arg reality_password "$REALITY_PASSWORD" \
       --arg reality_spider_x "$REALITY_SPIDER_X" \
       --arg reality_mldsa65_verify "$REALITY_MLDSA65_VERIFY" \
+      --arg reality_browser "${REALITY_BROWSER:-${XRAY_REALITY_BROWSER:-}}" \
       --arg mux_xudp_proxy_udp443 "$MUX_XUDPPROXYUDP443" \
       --arg tls_alpn "$TLS_ALPN" \
       --arg tls_verify_names "$TLS_VERIFY_NAMES" \
@@ -1196,7 +1202,8 @@ parse() {
             | putstr("shortId"; $reality_short_id)
             | putstr("password"; $reality_password)
             | putstr("mldsa65Verify"; $reality_mldsa65_verify)
-            | putstr("spiderX"; $reality_spider_x));
+            | putstr("spiderX"; $reality_spider_x)
+            | putstr("browser"; $reality_browser));
       def finalmask_settings:
         (($finalmask // {})
           | if nonempty($hy2_realm_url) then

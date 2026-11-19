@@ -29,7 +29,7 @@ module_copy() {
   go mod edit -replace "$1=./third_party/$2"
 }
 
-for series in xhttp-flow xhttp-mux reality utls sniff close connect; do
+for series in xhttp-flow xhttp-mux reality utls sniff close connect browser; do
   case $series in
     reality) module_copy github.com/xtls/reality reality ;;
     utls) module_copy github.com/refraction-networking/utls utls ;;
@@ -51,7 +51,7 @@ for series in xhttp-flow xhttp-mux reality utls sniff close connect; do
   commit "$series"
 done
 
-for series in xhttp-flow xhttp-mux reality utls sniff close connect; do
+for series in xhttp-flow xhttp-mux reality utls sniff close connect browser; do
   rm "$here/patches/$series"/*.patch
   cp "$work/$series.patch" "$here/patches/$series/0001-$series.patch"
 done

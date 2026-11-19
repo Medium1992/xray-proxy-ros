@@ -32,7 +32,7 @@ index e423484a..3a7e55d9 100644
  		return nil, errors.New("tls: missing ECDHE private key")
  	}
 diff --git a/third_party/utls/u_common.go b/third_party/utls/u_common.go
-index 79015835..2b363c2c 100644
+index 79015835..02406a21 100644
 --- a/third_party/utls/u_common.go
 +++ b/third_party/utls/u_common.go
 @@ -603,7 +603,7 @@ var (
@@ -52,11 +52,51 @@ index 79015835..2b363c2c 100644
  
  	HelloChrome_Auto        = HelloChrome_155
  	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}
+@@ -658,9 +659,10 @@ var (
+ 
+ 	HelloAndroid_11_OkHttp = ClientHelloID{helloAndroid, "11", nil, nil}
+ 
+-	HelloEdge_Auto = HelloEdge_85 // HelloEdge_106 seems to be incompatible with this library
++	HelloEdge_Auto = HelloEdge_157
+ 	HelloEdge_85   = ClientHelloID{helloEdge, "85", nil, nil}
+ 	HelloEdge_106  = ClientHelloID{helloEdge, "106", nil, nil}
++	HelloEdge_157  = ClientHelloID{helloEdge, "157", nil, nil}
+ 
+ 	HelloSafari_Auto = HelloSafari_26_3
+ 	HelloSafari_16_0 = ClientHelloID{helloSafari, "16.0", nil, nil}
 diff --git a/third_party/utls/u_parrots.go b/third_party/utls/u_parrots.go
-index fe17382a..1fc9b582 100644
+index fe17382a..4dd021c3 100644
 --- a/third_party/utls/u_parrots.go
 +++ b/third_party/utls/u_parrots.go
-@@ -1667,6 +1667,133 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+@@ -13,7 +13,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
+-	"math"
+ 	"math/big"
+ 	"math/rand"
+ 	"sort"
+@@ -964,6 +963,19 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+ 				&UtlsGREASEExtension{},
+ 			}),
+ 		}, nil
++	case HelloEdge_157:
++		spec, err := utlsIdToSpec(HelloChrome_155)
++		if err != nil {
++			return spec, err
++		}
++		extensions := spec.Extensions[:0]
++		for _, extension := range spec.Extensions {
++			if _, ok := extension.(*TrustAnchorsExtension); !ok {
++				extensions = append(extensions, extension)
++			}
++		}
++		spec.Extensions = extensions
++		return spec, nil
+ 	case HelloChrome_155:
+ 		return ClientHelloSpec{
+ 			CipherSuites: []uint16{
+@@ -1667,6 +1679,133 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
  				},
  			},
  		}, nil
@@ -190,7 +230,7 @@ index fe17382a..1fc9b582 100644
  	case HelloIOS_11_1:
  		return ClientHelloSpec{
  			TLSVersMax: VersionTLS12,
-@@ -3020,35 +3147,29 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+@@ -3020,35 +3159,35 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
  //
  // This feature was first introduced by Chrome 106.
  func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
@@ -200,8 +240,9 @@ index fe17382a..1fc9b582 100644
 -		switch exts[idx].(type) {
 +	// GREASE, padding and pre_shared_key keep their places; the rest are
 +	// permuted uniformly among themselves, as BoringSSL does. Skipping the
-+	// swaps that touch a fixed extension instead would leave the extensions
-+	// next to them in place twice as often as the others.
++	// swaps that touch a fixed extension instead left each extension in its
++	// source slot in about 11% of hellos (SNI first in 11% of Chrome hellos
++	// against the uniform 5.9%).
 +	var movable []int
 +	for i, ext := range exts {
 +		switch ext.(type) {
@@ -217,29 +258,39 @@ index fe17382a..1fc9b582 100644
 +	}
  
 -	// Shuffle other extensions
- 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
- 	if err != nil {
- 		// warning: random could be deterministic
+-	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+-	if err != nil {
+-		// warning: random could be deterministic
 -		rand.Shuffle(len(exts), func(i, j int) {
 -			if skipShuf(i, exts) || skipShuf(j, exts) {
 -				return // do not shuffle some of the extensions
 -			}
 -			exts[i], exts[j] = exts[j], exts[i]
 -		})
-+		rand.Shuffle(len(movable), swap)
- 		fmt.Println("Warning: failed to use a cryptographically secure random number generator. The shuffle can be deterministic.")
- 	} else {
+-		fmt.Println("Warning: failed to use a cryptographically secure random number generator. The shuffle can be deterministic.")
+-	} else {
 -		rand.New(rand.NewSource(randInt64.Int64())).Shuffle(len(exts), func(i, j int) {
 -			if skipShuf(i, exts) || skipShuf(j, exts) {
 -				return // do not shuffle some of the extensions
 -			}
 -			exts[i], exts[j] = exts[j], exts[i]
 -		})
-+		rand.New(rand.NewSource(randInt64.Int64())).Shuffle(len(movable), swap)
++	// Fisher-Yates with every swap index drawn from crypto/rand, as
++	// BoringSSL draws an independent value for each swap. One seed for a
++	// math/rand source would reach at most 2^31-1 of the orders.
++	for i := len(movable) - 1; i > 0; i-- {
++		j, err := crand.Int(crand.Reader, big.NewInt(int64(i+1)))
++		if err != nil {
++			// warning: random could be deterministic
++			rand.Shuffle(i+1, swap)
++			fmt.Println("Warning: failed to use a cryptographically secure random number generator. The shuffle can be deterministic.")
++			break
++		}
++		swap(i, int(j.Int64()))
  	}
  
  	return exts
-@@ -3297,6 +3418,8 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
+@@ -3297,6 +3436,8 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
  							// only do this once for the first non-grease curve
  							uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = reusedKey
  							preferredCurveIsSet = true
@@ -248,7 +299,7 @@ index fe17382a..1fc9b582 100644
  						}
  						continue
  					}
-@@ -3312,6 +3435,9 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
+@@ -3312,6 +3453,9 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
  						// only do this once for the first non-grease curve
  						uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
  						preferredCurveIsSet = true

@@ -80,7 +80,10 @@ ARG REALITY_X25519=required
 # равномерно (раньше ALPN был первым в 11% хелло вместо 5,9%); Firefox
 # доводит рукопожатие, если сервер выбрал P-256 (refraction-networking/utls#402);
 # "randomized" и "randomizednoalpn" всегда шлют ключ X25519MLKEM768 и без P-256
-# (раньше примерно половина запусков слала хелло, которое отклоняет REALITY).
+# (раньше примерно половина запусков слала хелло, которое отклоняет REALITY);
+# "edge" — Edge 157 вместо Edge 85 из 2020 года (тот слал TLS 1.0–1.3 без
+# X25519MLKEM768, и REALITY его не принимал); каждая перестановка расширений
+# Chrome берётся из crypto/rand, как в BoringSSL.
 # required — патч обязан лечь; off — без него.
 ARG UTLS=required
 
@@ -88,7 +91,9 @@ ARG UTLS=required
 # "protocol": ["stun"] (звонки WebRTC, WhatsApp, Telegram, FaceTime),
 # IP discovery голоса Discord для "discordrtc", DHT и UDP-трекеры,
 # HTTP-запросы к трекерам, LSD и рукопожатие в uTP для "bittorrent",
-# ClientHello в нескольких TLS-записях.
+# ClientHello в нескольких TLS-записях. Сниффер, которому нужно больше данных,
+# чем лежит в кэше, заканчивает сниффинг, а не кэширует загрузку клиента до
+# конца бюджета сниффинга.
 # required — патчи обязаны лечь; off — без них.
 ARG SNIFF=required
 
@@ -97,7 +102,9 @@ ARG SNIFF=required
 # через uplinkOnly (1 с). Только для голых TCP- и Unix-сокетов. Там же: при
 # ошибке рукопожатия TLS/REALITY (например, вместо TLS пришла HTTP-заглушка)
 # соединение закрывается, а не ждёт сборщика мусора; httpupgrade с "unsafe"
-# больше не висит вечно на сервере, который молчит.
+# больше не висит вечно на сервере, который молчит, и закрывает сокет, если
+# апгрейд не удался; лог XHTTP называет предел рукопожатия («TLS handshake did
+# not finish in 10s»); обновление сертификата и OCSP не гоняется с рукопожатием.
 # required — патч обязан лечь; off — без него.
 ARG HALF_CLOSE=required
 
@@ -109,6 +116,16 @@ ARG HALF_CLOSE=required
 # резолвит сам Go.
 # required — патч обязан лечь; off — без него.
 ARG BACKUP_CONNECT=required
+
+# Режим REALITY "browser" (patches/browser): с "browser": "auto" в
+# realitySettings клиент возобновляет сессии по тикетам, как браузер его
+# отпечатка (chrome, edge, firefox), а сервер выдаёт тикеты и отвечает на них,
+# как его target; XHTTP по HTTP/2 начинает соединение, как браузер. Работает,
+# только если режим включён на обеих сторонах и сервер — сборка с этим режимом
+# (h2Flow-7 и новее). Без "browser" в конфиге всё как раньше.
+# required — патч обязан лечь, и все серии выше должны быть required: патч
+# ложится поверх них; off — без него.
+ARG BROWSER=required
 
 # GOTOOLCHAIN=local запрещает Go молча подтянуть себе другой тулчейн: собираем
 # ровно тем, что в образе, а несовместимость с go.mod апстрима всплывает
@@ -263,7 +280,8 @@ RUN set -eu; \
     done; \
     go mod edit -replace github.com/refraction-networking/utls=./third_party/utls; \
     grep -q 'HelloFirefox_Auto = HelloFirefox_156' third_party/utls/u_common.go \
-      && grep -q 'rand.Shuffle(len(movable), swap)' third_party/utls/u_parrots.go \
+      && grep -q 'crand.Int(crand.Reader, big.NewInt(int64(i+1)))' third_party/utls/u_parrots.go \
+      && grep -q 'HelloEdge_Auto = HelloEdge_157' third_party/utls/u_common.go \
       && grep -q 'func FixRandomizedHello' transport/internet/tls/tls.go \
       || { echo "uTLS hooks are missing after patching" >&2; exit 1; }; \
     echo "uTLS: included"
@@ -319,6 +337,28 @@ RUN set -eu; \
       && grep -q 'func connectWithBackup' transport/internet/dial_backup.go \
       || { echo "Backup connect hooks are missing after patching" >&2; exit 1; }; \
     echo "Backup connect: included"
+
+COPY patches/browser /patches/browser
+RUN set -eu; \
+    case "$BROWSER" in \
+      off) echo "REALITY browser mode: off"; exit 0 ;; \
+      required) ;; \
+      *) echo "BROWSER must be required or off, got '$BROWSER'" >&2; exit 1 ;; \
+    esac; \
+    for v in XHTTP_FLOW XHTTP_MUX REALITY_X25519 UTLS SNIFF HALF_CLOSE BACKUP_CONNECT; do \
+      [ "$(eval echo "\$$v")" = required ] \
+        || { echo "BROWSER=required needs $v=required" >&2; exit 1; }; \
+    done; \
+    for p in /patches/browser/*.patch; do \
+      git apply "$p" \
+        || { echo "REALITY browser patch $(basename "$p") no longer applies" >&2; exit 1; }; \
+    done; \
+    grep -q 'string browser = 101' transport/internet/reality/config.proto \
+      && grep -q 'func NewUClient' transport/internet/tls/uclient.go \
+      && grep -q 'shapeStartup' transport/internet/splithttp/h2flow.go \
+      && grep -q 'Browser' infra/conf/transport_security.go \
+      || { echo "REALITY browser hooks are missing after patching" >&2; exit 1; }; \
+    echo "REALITY browser mode: included"
 
 # С Go 1.27 x/net/http2 стал обёрткой над stdlib, и frameScratchBufferLen
 # работает из копии в $GOROOT/src/net/http/internal/http2. Stdlib собирается

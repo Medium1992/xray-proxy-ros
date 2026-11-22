@@ -311,8 +311,12 @@ RUN set -eu; \
       required) ;; \
       *) echo "HALF_CLOSE must be required or off, got '$HALF_CLOSE'" >&2; exit 1 ;; \
     esac; \
+    # --3way: upstream takes hunks of this series (XTLS/Xray-core#7395); a
+    # hunk already upstream merges as is, so one patch serves the release
+    # and main. git add first: --3way checks files against the index.
+    git add -A; \
     for p in /patches/close/*.patch; do \
-      git apply "$p" \
+      git apply --3way "$p" \
         || { echo "Half-close patch $(basename "$p") no longer applies" >&2; exit 1; }; \
     done; \
     grep -q 'proxy.CloseWriteRAW(conn)' proxy/freedom/freedom.go \
